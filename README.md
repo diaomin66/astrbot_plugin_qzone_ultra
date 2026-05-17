@@ -31,6 +31,8 @@ pip install -r requirements.txt
 
 插件会在首次使用时按需启动本地 daemon。daemon 默认使用 `18999` 端口并只监听 `127.0.0.1`，用于隔离 QQ 空间请求、Cookie 管理和渲染逻辑。除非端口被占用，不建议修改默认端口；如果系统防火墙或安全软件拦截本地连接，请放行本插件的 `18999` 端口。
 
+浏览器打开 `http://127.0.0.1:18999/` 或 `/health` 时只返回最小公开健康信息，用于确认端口可达；完整 daemon 状态和登录信息仍必须通过插件命令或携带 `X-Qzone-Secret` 的本地请求获取。
+
 ## Cookie 绑定
 
 推荐在 OneBot v11 / aiocqhttp 环境使用自动绑定：
@@ -142,6 +144,7 @@ pip install -r requirements.txt
 
 - `/qzone status` 显示未绑定：先执行 `/qzone autobind`，失败后使用 `/qzone bind <cookie>`。
 - daemon 无法启动：确认默认 `18999` 端口没有被占用，防火墙或安全软件已放行本地连接，并检查 AstrBot 日志。
+- 浏览器访问 `127.0.0.1:18999`：看到 `ok: true` 代表本地 daemon 端口可达；如果需要 Cookie、QQ 号或完整状态，请使用 `/qzone status`。
 - 自动绑定失败：确认 AstrBot 使用的是 OneBot v11 / aiocqhttp，且适配器允许获取 Cookie。
 - 图片发布失败：确认图片可被 AstrBot 正常读取，远程图片地址可访问。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。

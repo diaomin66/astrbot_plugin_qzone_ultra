@@ -42,6 +42,9 @@ log = get_logger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
+PUBLIC_HEALTH_METHODS = {"GET", "HEAD"}
+PUBLIC_HEALTH_PATHS = {"/", "/health"}
+AUTHENTICATED_REQUEST_KEY = "qzone_authenticated_request"
 LATEST_FEED_REFERENCES = {
     "latest",
     "newest",
@@ -140,8 +143,15 @@ class QzoneDaemonService:
     def touch(self) -> None:
         self.state.runtime.last_seen_at = now_iso()
 
+    def _session_missing_credentials(self) -> bool:
+        session = self.state.session
+        return not bool(session.cookies and session.uin)
+
+    def _session_needs_rebind(self) -> bool:
+        return bool(self.state.session.needs_rebind or self._session_missing_credentials())
+
     def _ensure_session_ready(self) -> None:
-        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+        if self._session_needs_rebind():
             raise QzoneNeedsRebind()
 
     def _schedule_save(self) -> None:
@@ -161,10 +171,11 @@ class QzoneDaemonService:
         self._save_task = asyncio.create_task(runner())
 
     def _set_success(self, *, defer_save: bool = False) -> None:
-        self.health_state = "ready" if self.state.session.cookies else "needs_rebind"
+        missing_credentials = self._session_missing_credentials()
+        self.health_state = "needs_rebind" if missing_credentials else "ready"
         self.state.session.last_ok_at = now_iso()
         self.state.session.last_error = None
-        self.state.session.needs_rebind = not bool(self.state.session.cookies)
+        self.state.session.needs_rebind = missing_credentials
         self.touch()
         if defer_save:
             self._schedule_save()
@@ -201,17 +212,10 @@ class QzoneDaemonService:
 
     def public_snapshot(self) -> dict[str, Any]:
         runtime = self.state.runtime
-        session = self.state.session
-        needs_rebind = session.needs_rebind or not bool(session.cookies)
         return {
             "daemon_state": self.health_state,
             "daemon_port": runtime.daemon_port,
             "daemon_version": runtime.version,
-            "started_at": runtime.started_at,
-            "last_seen_at": runtime.last_seen_at,
-            "uptime_seconds": self._uptime_seconds(),
-            "login_bound": bool(session.uin and session.cookies and not needs_rebind),
-            "needs_rebind": needs_rebind,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -229,7 +233,7 @@ class QzoneDaemonService:
             "session_source": session.source,
             "cookie_summary": self.client.cookie_summary(),
             "cookie_count": self.client.cookie_count,
-            "needs_rebind": session.needs_rebind or not bool(session.cookies),
+            "needs_rebind": self._session_needs_rebind(),
             "last_ok_at": session.last_ok_at,
             "last_error": session.last_error,
             "qzonetoken_hosts": sorted(int(k) for k in session.qzonetokens.keys() if str(k).isdigit()),
@@ -855,7 +859,7 @@ class QzoneDaemonService:
         return result
 
     async def health(self) -> dict[str, Any]:
-        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+        if self._session_needs_rebind():
             if self.health_state != "needs_rebind":
                 self.health_state = "needs_rebind"
                 self.save()
@@ -873,12 +877,7 @@ class QzoneDaemonService:
             await asyncio.sleep(self.keepalive_interval)
             if self._closing:
                 break
-            if self.state.session.needs_rebind:
-                if self.health_state != "needs_rebind":
-                    self.health_state = "needs_rebind"
-                    self.save()
-                continue
-            if not self.state.session.cookies or not self.state.session.uin:
+            if self._session_needs_rebind():
                 if self.health_state != "needs_rebind":
                     self.health_state = "needs_rebind"
                     self.save()
@@ -915,8 +914,6 @@ def _error_detail(exc: QzoneBridgeError):
 
 SERVICE_APP_KEY = web.AppKey("qzone_service", QzoneDaemonService)
 SHUTDOWN_EVENT_APP_KEY = web.AppKey("qzone_shutdown_event", asyncio.Event)
-AUTHENTICATED_REQUEST_APP_KEY = web.AppKey("qzone_authenticated_request", bool)
-PUBLIC_HEALTH_PATHS = {"/", "/health"}
 
 
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
@@ -927,10 +924,14 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
-        secret = request.headers.get(SECRET_HEADER) or ""
-        authenticated = bool(secret and secret == service.state.runtime.secret)
-        request[AUTHENTICATED_REQUEST_APP_KEY] = authenticated
-        if request.method == "GET" and request.path in PUBLIC_HEALTH_PATHS and not secret:
+        supplied_secret = request.headers.get(SECRET_HEADER)
+        authenticated = bool(supplied_secret and supplied_secret == service.state.runtime.secret)
+        request[AUTHENTICATED_REQUEST_KEY] = authenticated
+        if (
+            supplied_secret is None
+            and request.method in PUBLIC_HEALTH_METHODS
+            and request.path in PUBLIC_HEALTH_PATHS
+        ):
             return await handler(request)
         if not authenticated:
             return fail("UNAUTHORIZED", "secret 不正确", status=401)
@@ -939,12 +940,16 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     app.middlewares.append(auth_middleware)
 
     async def health(request: web.Request) -> web.Response:
-        service.touch()
-        if request.get(AUTHENTICATED_REQUEST_APP_KEY, False):
+        if request.get(AUTHENTICATED_REQUEST_KEY, False):
+            service.touch()
             return ok(service.snapshot())
         return ok(
             service.public_snapshot(),
-            meta={"authenticated": False, "full_status_requires": SECRET_HEADER},
+            meta={
+                "authenticated": False,
+                "public": True,
+                "full_status_requires": SECRET_HEADER,
+            },
         )
 
     async def status(request: web.Request) -> web.Response:
