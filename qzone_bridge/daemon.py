@@ -192,13 +192,31 @@ class QzoneDaemonService:
         self.touch()
         self.save()
 
+    def _uptime_seconds(self) -> int:
+        runtime = self.state.runtime
+        started_at = from_iso(runtime.started_at)
+        if started_at:
+            return int((datetime.now(timezone.utc) - started_at).total_seconds())
+        return 0
+
+    def public_snapshot(self) -> dict[str, Any]:
+        runtime = self.state.runtime
+        session = self.state.session
+        needs_rebind = session.needs_rebind or not bool(session.cookies)
+        return {
+            "daemon_state": self.health_state,
+            "daemon_port": runtime.daemon_port,
+            "daemon_version": runtime.version,
+            "started_at": runtime.started_at,
+            "last_seen_at": runtime.last_seen_at,
+            "uptime_seconds": self._uptime_seconds(),
+            "login_bound": bool(session.uin and session.cookies and not needs_rebind),
+            "needs_rebind": needs_rebind,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         runtime = self.state.runtime
         session = self.state.session
-        started_at = from_iso(runtime.started_at)
-        uptime = 0
-        if started_at:
-            uptime = int((datetime.now(timezone.utc) - started_at).total_seconds())
         return {
             "daemon_state": self.health_state,
             "daemon_pid": runtime.daemon_pid,
@@ -206,7 +224,7 @@ class QzoneDaemonService:
             "daemon_version": runtime.version,
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
-            "uptime_seconds": uptime,
+            "uptime_seconds": self._uptime_seconds(),
             "login_uin": session.uin,
             "session_source": session.source,
             "cookie_summary": self.client.cookie_summary(),
@@ -897,6 +915,7 @@ def _error_detail(exc: QzoneBridgeError):
 
 SERVICE_APP_KEY = web.AppKey("qzone_service", QzoneDaemonService)
 SHUTDOWN_EVENT_APP_KEY = web.AppKey("qzone_shutdown_event", asyncio.Event)
+AUTHENTICATED_REQUEST_APP_KEY = web.AppKey("qzone_authenticated_request", bool)
 
 
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
@@ -908,7 +927,11 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
         secret = request.headers.get(SECRET_HEADER) or ""
-        if secret != service.state.runtime.secret:
+        authenticated = bool(secret and secret == service.state.runtime.secret)
+        request[AUTHENTICATED_REQUEST_APP_KEY] = authenticated
+        if request.method == "GET" and request.path == "/health" and not secret:
+            return await handler(request)
+        if not authenticated:
             return fail("UNAUTHORIZED", "secret 不正确", status=401)
         return await handler(request)
 
@@ -916,7 +939,12 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
 
     async def health(request: web.Request) -> web.Response:
         service.touch()
-        return ok(service.snapshot())
+        if request.get(AUTHENTICATED_REQUEST_APP_KEY, False):
+            return ok(service.snapshot())
+        return ok(
+            service.public_snapshot(),
+            meta={"authenticated": False, "full_status_requires": SECRET_HEADER},
+        )
 
     async def status(request: web.Request) -> web.Response:
         service.touch()
