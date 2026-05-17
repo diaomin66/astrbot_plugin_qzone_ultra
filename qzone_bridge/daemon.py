@@ -916,6 +916,7 @@ def _error_detail(exc: QzoneBridgeError):
 SERVICE_APP_KEY = web.AppKey("qzone_service", QzoneDaemonService)
 SHUTDOWN_EVENT_APP_KEY = web.AppKey("qzone_shutdown_event", asyncio.Event)
 AUTHENTICATED_REQUEST_APP_KEY = web.AppKey("qzone_authenticated_request", bool)
+PUBLIC_HEALTH_PATHS = {"/", "/health"}
 
 
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
@@ -929,7 +930,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
         secret = request.headers.get(SECRET_HEADER) or ""
         authenticated = bool(secret and secret == service.state.runtime.secret)
         request[AUTHENTICATED_REQUEST_APP_KEY] = authenticated
-        if request.method == "GET" and request.path == "/health" and not secret:
+        if request.method == "GET" and request.path in PUBLIC_HEALTH_PATHS and not secret:
             return await handler(request)
         if not authenticated:
             return fail("UNAUTHORIZED", "secret 不正确", status=401)
@@ -1080,6 +1081,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             asyncio.get_running_loop().call_later(0.1, event.set)
         return ok({"stopping": True})
 
+    app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/status", status)
     app.router.add_post("/bind", bind)
