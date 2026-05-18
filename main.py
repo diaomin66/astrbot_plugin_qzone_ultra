@@ -25,6 +25,7 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026051803
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -424,14 +425,58 @@ def _verify_local_qzone_bridge_module(name: str, package_root: Path) -> None:
         raise RuntimeError(f"{name} resolved outside plugin directory: {package_path}")
 
 
+def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
+    package = sys.modules.get("qzone_bridge")
+    if package is None:
+        return False
+    _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+    try:
+        if int(getattr(package, "BRIDGE_API_VERSION", 0) or 0) < REQUIRED_QZONE_BRIDGE_API_VERSION:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    contract_methods = {
+        "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
+        "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
+        "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
+    }
+    for module_name, classes in contract_methods.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, methods in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            for method_name in methods:
+                if not callable(getattr(cls, method_name, None)):
+                    return False
+    return True
+
+
+def _evict_local_qzone_bridge_modules(package_root: Path) -> None:
+    names = [
+        name
+        for name in sys.modules
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    ]
+    for name in sorted(names, key=lambda item: item.count("."), reverse=True):
+        _verify_local_qzone_bridge_module(name, package_root)
+        sys.modules.pop(name, None)
+
+
 def _load_local_qzone_bridge_package() -> None:
     package_root = _local_qzone_bridge_root()
     for name in tuple(sys.modules):
         if name == "qzone_bridge" or name.startswith("qzone_bridge."):
             _verify_local_qzone_bridge_module(name, package_root)
 
-    if "qzone_bridge" in sys.modules:
+    if "qzone_bridge" in sys.modules and _qzone_bridge_contract_is_current(package_root):
         return
+    if "qzone_bridge" in sys.modules:
+        _evict_local_qzone_bridge_modules(package_root)
 
     package_init = package_root / "__init__.py"
     spec = importlib.util.spec_from_file_location(
