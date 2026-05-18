@@ -150,6 +150,11 @@ class QzoneDaemonService:
     def _session_needs_rebind(self) -> bool:
         return bool(self.state.session.needs_rebind or self._session_missing_credentials())
 
+    def _public_daemon_state(self) -> str:
+        if self._closing or self.health_state == "stopping":
+            return "stopping"
+        return "online"
+
     def _ensure_session_ready(self) -> None:
         if self._session_needs_rebind():
             raise QzoneNeedsRebind()
@@ -190,7 +195,7 @@ class QzoneDaemonService:
             self.client.feed_cache.clear()
             self.recent_feed_entries.clear()
         elif isinstance(exc, QzoneRequestError) and exc.status_code is not None and 400 <= exc.status_code < 500:
-            if self.state.session.cookies and not self.state.session.needs_rebind:
+            if not self._session_needs_rebind():
                 self.health_state = "ready"
             else:
                 self.health_state = "needs_rebind"
@@ -213,7 +218,7 @@ class QzoneDaemonService:
     def public_snapshot(self) -> dict[str, Any]:
         runtime = self.state.runtime
         return {
-            "daemon_state": self.health_state,
+            "daemon_state": self._public_daemon_state(),
             "daemon_port": runtime.daemon_port,
             "daemon_version": runtime.version,
         }
@@ -253,6 +258,7 @@ class QzoneDaemonService:
 
     async def close(self) -> None:
         self._closing = True
+        self.health_state = "stopping"
         if self._warmup_task:
             self._warmup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1079,6 +1085,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
         )
 
     async def shutdown(request: web.Request) -> web.Response:
+        service.health_state = "stopping"
         service.touch()
         service.save()
         event = request.app.get(SHUTDOWN_EVENT_APP_KEY)

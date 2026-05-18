@@ -378,6 +378,7 @@ class QzoneDaemonController:
 
     def _status_from_state(self, state, *, daemon_state: str) -> dict[str, Any]:
         runtime = state.runtime
+        needs_rebind = self._session_needs_rebind(state.session)
         return {
             "daemon_state": daemon_state,
             "daemon_pid": runtime.daemon_pid,
@@ -389,13 +390,17 @@ class QzoneDaemonController:
             "session_source": state.session.source,
             "cookie_summary": self.cookie_summary(state.session.cookies),
             "cookie_count": len(state.session.cookies),
-            "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
+            "needs_rebind": needs_rebind,
             "last_ok_at": state.session.last_ok_at,
             "last_error": state.session.last_error,
             "qzonetoken_hosts": sorted(int(k) for k in state.session.qzonetokens.keys() if str(k).isdigit()),
             "feed_cache_size": 0,
             "session_revision": state.session.revision,
         }
+
+    @staticmethod
+    def _session_needs_rebind(session) -> bool:
+        return bool(session.needs_rebind or not (session.cookies and session.uin))
 
     async def _available_daemon_port(self, port: int) -> int:
         if await _port_is_free_async(port):
@@ -559,10 +564,11 @@ class QzoneDaemonController:
     async def get_status(self, *, probe_daemon: bool = True) -> dict[str, Any]:
         state = self.store.read()
         runtime = state.runtime
+        needs_rebind = self._session_needs_rebind(state.session)
         daemon_state = "offline"
         if probe_daemon and runtime.daemon_port and await self._probe_health(runtime.daemon_port):
-            daemon_state = "ready"
-        elif state.session.cookies:
+            daemon_state = "needs_rebind" if needs_rebind else "ready"
+        elif state.session.cookies and state.session.uin:
             daemon_state = "degraded"
         return self._status_from_state(state, daemon_state=daemon_state)
 
