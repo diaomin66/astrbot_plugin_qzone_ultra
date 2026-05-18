@@ -95,7 +95,7 @@ class QzonePostService:
             post = post_from_entry(entry, detail=detail_payload.get("raw"), local_id=1)
             post.comments = self._comments_from_detail(detail_payload)
             post.comment_count = max(post.comment_count, len(post.comments))
-            self.post_store.upsert(post)
+            await self.post_store.upsert_async(post)
             return post
 
         post = QzonePost(
@@ -104,7 +104,7 @@ class QzonePostService:
             appid=selection.appid,
             local_id=1,
         )
-        self.post_store.upsert(post)
+        await self.post_store.upsert_async(post)
         return post
 
     async def resolve_posts(
@@ -149,7 +149,7 @@ class QzonePostService:
                 continue
             if no_commented and login_uin and any(comment.uin == login_uin for comment in post.comments):
                 continue
-            self.post_store.upsert(post)
+            await self.post_store.upsert_async(post)
             posts.append(post)
         return posts
 

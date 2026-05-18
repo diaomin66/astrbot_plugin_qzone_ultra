@@ -43,25 +43,36 @@ async def _port_is_free_async(port: int) -> bool:
     return await asyncio.to_thread(_port_is_free, port)
 
 
-def _run_quiet(args: list[str], *, timeout: float = 5.0) -> subprocess.CompletedProcess:
+async def _run_quiet(args: list[str], *, timeout: float = 5.0) -> tuple[str, str, int]:
     kwargs: dict[str, Any] = {
-        "capture_output": True,
-        "text": True,
-        "timeout": timeout,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    return subprocess.run(args, **kwargs)
+    process = await asyncio.create_subprocess_exec(*args, **kwargs)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+        raise subprocess.TimeoutExpired(args, timeout) from exc
+    return (
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+        int(process.returncode or 0),
+    )
 
 
-def _port_owner_pids(port: int) -> set[int]:
+async def _port_owner_pids(port: int) -> set[int]:
     pids: set[int] = set()
     if port <= 0:
         return pids
     if os.name == "nt":
         with contextlib.suppress(Exception):
-            result = _run_quiet(["netstat", "-ano", "-p", "tcp"], timeout=8.0)
-            for line in result.stdout.splitlines():
+            stdout, _, _ = await _run_quiet(["netstat", "-ano", "-p", "tcp"], timeout=8.0)
+            for line in stdout.splitlines():
                 parts = line.split()
                 if len(parts) < 5 or parts[0].upper() != "TCP":
                     continue
@@ -77,46 +88,48 @@ def _port_owner_pids(port: int) -> set[int]:
         return pids
 
     with contextlib.suppress(Exception):
-        result = _run_quiet(
+        stdout, _, _ = await _run_quiet(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
             timeout=5.0,
         )
-        for line in result.stdout.splitlines():
+        for line in stdout.splitlines():
             with contextlib.suppress(ValueError):
                 pids.add(int(line.strip()))
     if pids:
         return pids
 
     with contextlib.suppress(Exception):
-        result = _run_quiet(["fuser", f"{port}/tcp"], timeout=5.0)
-        for token in (result.stdout + " " + result.stderr).split():
+        stdout, stderr, _ = await _run_quiet(["fuser", f"{port}/tcp"], timeout=5.0)
+        for token in (stdout + " " + stderr).split():
             token = token.strip()
             if token.isdigit():
                 pids.add(int(token))
     return pids
 
 
-def _pid_command_line(pid: int) -> str:
+async def _pid_command_line(pid: int) -> str:
     if pid <= 0:
         return ""
     if os.name == "nt":
         script = f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
         with contextlib.suppress(Exception):
-            result = _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=5.0)
-            return result.stdout.strip()
+            stdout, _, _ = await _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=5.0)
+            return stdout.strip()
         return ""
 
     proc_cmdline = Path("/proc") / str(pid) / "cmdline"
     with contextlib.suppress(Exception):
-        return proc_cmdline.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").strip()
+        return (
+            await asyncio.to_thread(proc_cmdline.read_text, encoding="utf-8", errors="ignore")
+        ).replace("\x00", " ").strip()
     with contextlib.suppress(Exception):
-        result = _run_quiet(["ps", "-p", str(pid), "-o", "command="], timeout=5.0)
-        return result.stdout.strip()
+        stdout, _, _ = await _run_quiet(["ps", "-p", str(pid), "-o", "command="], timeout=5.0)
+        return stdout.strip()
     return ""
 
 
-def _is_plugin_daemon_pid(pid: int, plugin_root: Path) -> bool:
-    command_line = _pid_command_line(pid).lower()
+async def _is_plugin_daemon_pid(pid: int, plugin_root: Path) -> bool:
+    command_line = (await _pid_command_line(pid)).lower()
     if not command_line:
         return False
     root = str(plugin_root).lower()
@@ -181,7 +194,7 @@ def _redact_detail_for_log(value: Any) -> Any:
     return value
 
 
-def _terminate_pid_tree(pid: int, *, force: bool = False) -> None:
+async def _terminate_pid_tree(pid: int, *, force: bool = False) -> None:
     if pid <= 0 or pid == os.getpid():
         return
     if os.name == "nt":
@@ -189,7 +202,7 @@ def _terminate_pid_tree(pid: int, *, force: bool = False) -> None:
         if force:
             args.append("/F")
         with contextlib.suppress(Exception):
-            _run_quiet(args, timeout=8.0)
+            await _run_quiet(args, timeout=8.0)
         return
 
     with contextlib.suppress(ProcessLookupError):
@@ -568,8 +581,8 @@ class QzoneDaemonController:
         daemon_state = "offline"
         if probe_daemon and runtime.daemon_port and await self._probe_health(runtime.daemon_port):
             daemon_state = "needs_rebind" if needs_rebind else "ready"
-        elif state.session.cookies and state.session.uin:
-            daemon_state = "degraded"
+        elif state.session.cookies:
+            daemon_state = "needs_rebind" if needs_rebind else "degraded"
         return self._status_from_state(state, daemon_state=daemon_state)
 
     @staticmethod
@@ -825,20 +838,20 @@ class QzoneDaemonController:
         trusted_by_secret: bool,
     ) -> set[int]:
         killed: set[int] = set()
-        owners = await asyncio.to_thread(_port_owner_pids, port)
+        owners = await _port_owner_pids(port)
         for pid in owners:
             if pid <= 0 or pid == os.getpid():
                 continue
             is_expected = pid in expected_pids
-            is_plugin_daemon = await asyncio.to_thread(_is_plugin_daemon_pid, pid, self.plugin_root)
+            is_plugin_daemon = await _is_plugin_daemon_pid(pid, self.plugin_root)
             if not (trusted_by_secret or is_expected or is_plugin_daemon):
                 continue
-            await asyncio.to_thread(_terminate_pid_tree, pid, force=False)
+            await _terminate_pid_tree(pid, force=False)
             killed.add(pid)
 
         if killed and not await self._wait_for_port_release(port, 2.0):
             for pid in killed:
-                await asyncio.to_thread(_terminate_pid_tree, pid, force=True)
+                await _terminate_pid_tree(pid, force=True)
         return killed
 
     def _clear_runtime_process_state(self) -> None:
