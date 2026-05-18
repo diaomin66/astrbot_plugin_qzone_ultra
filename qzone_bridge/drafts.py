@@ -152,24 +152,17 @@ class DraftStore:
         media: list[dict[str, Any]] | None = None,
         anonymous: bool = False,
     ) -> DraftPost:
-        def update(payload: dict[str, Any]) -> DraftPost:
-            draft_id = int(payload.get("next_id") or 1)
-            draft = DraftPost(
-                id=draft_id,
+        return self._store.transact(
+            lambda payload: self._add_to_payload(
+                payload,
                 author_uin=author_uin,
                 author_name=author_name,
                 group_id=group_id,
                 content=content,
-                media=list(media or []),
+                media=media,
                 anonymous=anonymous,
             )
-            items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
-            items.append(draft.to_dict())
-            payload["items"] = items
-            payload["next_id"] = draft_id + 1
-            return draft
-
-        return self._store.transact(update)
+        )
 
     async def add_async(
         self,
@@ -222,25 +215,7 @@ class DraftStore:
 
     def save(self, draft: DraftPost) -> DraftPost:
         draft.updated_at = now_iso()
-
-        def update(payload: dict[str, Any]) -> DraftPost:
-            items: list[dict[str, Any]] = []
-            found = False
-            for item in payload.get("items") or []:
-                if not isinstance(item, dict):
-                    continue
-                if int(item.get("id") or 0) == draft.id:
-                    items.append(draft.to_dict())
-                    found = True
-                else:
-                    items.append(item)
-            if not found:
-                items.append(draft.to_dict())
-            payload["items"] = items
-            payload["next_id"] = max(int(payload.get("next_id") or 1), draft.id + 1)
-            return draft
-
-        return self._store.transact(update)
+        return self._store.transact(lambda payload: self._save_to_payload(payload, draft))
 
     async def save_async(self, draft: DraftPost) -> DraftPost:
         draft.updated_at = now_iso()
@@ -264,31 +239,10 @@ class DraftStore:
         return draft
 
     def update(self, draft_id: int, mutator: Callable[[DraftPost], None]) -> DraftPost | None:
-        try:
-            target_id = int(draft_id or 0)
-        except (TypeError, ValueError):
-            return None
+        target_id = self._normalize_id(draft_id)
         if target_id <= 0:
             return None
-
-        def update_payload(payload: dict[str, Any]) -> DraftPost | None:
-            items: list[dict[str, Any]] = []
-            updated: DraftPost | None = None
-            for item in payload.get("items") or []:
-                if not isinstance(item, dict):
-                    continue
-                if int(item.get("id") or 0) == target_id:
-                    draft = DraftPost.from_dict(item)
-                    mutator(draft)
-                    draft.updated_at = now_iso()
-                    updated = draft
-                    items.append(draft.to_dict())
-                else:
-                    items.append(item)
-            payload["items"] = items
-            return updated
-
-        return self._store.transact(update_payload)
+        return self._store.transact(lambda payload: self._update_payload(payload, target_id, mutator))
 
     async def update_async(self, draft_id: int, mutator: Callable[[DraftPost], None]) -> DraftPost | None:
         target_id = self._normalize_id(draft_id)

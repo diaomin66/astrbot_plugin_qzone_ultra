@@ -1,14 +1,17 @@
 """AstrBot entry point for the QQ 空间 bridge."""
 
+# ruff: noqa: E402
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import inspect
 import json
 import random
 import re
 import shutil
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -401,18 +404,55 @@ def _standard_data_dir(plugin_root: Path) -> Path:
     return data_dir
 
 
-def _verify_local_qzone_bridge_package(package_file: str | None) -> None:
-    if not package_file:
-        raise RuntimeError("qzone_bridge package file is unavailable")
-    package_path = Path(package_file).resolve(strict=False)
-    expected_root = PLUGIN_ROOT / "qzone_bridge"
-    if not _path_contains(expected_root, package_path):
-        raise RuntimeError(f"qzone_bridge resolved outside plugin directory: {package_path}")
+def _local_qzone_bridge_root() -> Path:
+    package_root = (PLUGIN_ROOT / "qzone_bridge").resolve(strict=False)
+    package_init = package_root / "__init__.py"
+    if not package_init.is_file():
+        raise RuntimeError(f"qzone_bridge package is missing: {package_init}")
+    return package_root
 
 
-import qzone_bridge as _qzone_bridge_package
+def _verify_local_qzone_bridge_module(name: str, package_root: Path) -> None:
+    module = sys.modules.get(name)
+    if module is None:
+        return
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise RuntimeError(f"{name} is already loaded without a file path")
+    package_path = Path(module_file).resolve(strict=False)
+    if not _path_contains(package_root, package_path):
+        raise RuntimeError(f"{name} resolved outside plugin directory: {package_path}")
 
-_verify_local_qzone_bridge_package(getattr(_qzone_bridge_package, "__file__", None))
+
+def _load_local_qzone_bridge_package() -> None:
+    package_root = _local_qzone_bridge_root()
+    for name in tuple(sys.modules):
+        if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+            _verify_local_qzone_bridge_module(name, package_root)
+
+    if "qzone_bridge" in sys.modules:
+        return
+
+    package_init = package_root / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "qzone_bridge",
+        package_init,
+        submodule_search_locations=[str(package_root)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load qzone_bridge package from {package_init}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["qzone_bridge"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if sys.modules.get("qzone_bridge") is module:
+            sys.modules.pop("qzone_bridge", None)
+        raise
+    _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+
+
+_load_local_qzone_bridge_package()
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
@@ -1964,10 +2004,10 @@ class QzoneStablePlugin(Star):
     def qzone(self):
         pass
 
-    @filter.on_platform_loaded()
-    async def qzone_on_platform_loaded(self, event: Any):
+    @filter.on_astrbot_loaded()
+    async def qzone_on_astrbot_loaded(self):
         self._start_scheduled_tasks()
-        await self._bootstrap_auto_bind("platform load")
+        await self._bootstrap_auto_bind("astrbot load")
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
@@ -2245,11 +2285,13 @@ class QzoneStablePlugin(Star):
         if draft_id <= 0:
             yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
             return
+        sender_id = self._sender_id(event)
+        is_admin = self._is_admin(event)
         draft = await self.drafts.get_async(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
-        if draft.author_uin != self._sender_id(event) and not self._is_admin(event):
+        if draft.author_uin != sender_id and not is_admin:
             yield self._command_result(event, "只能撤回自己的投稿。")
             return
         if draft.status != "pending":
@@ -2259,7 +2301,7 @@ class QzoneStablePlugin(Star):
 
         def recall(current: DraftPost) -> None:
             nonlocal failure
-            if current.author_uin != self._sender_id(event) and not self._is_admin(event):
+            if current.author_uin != sender_id and not is_admin:
                 failure = "permission"
                 return
             if current.status != "pending":

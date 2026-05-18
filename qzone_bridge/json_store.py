@@ -15,7 +15,6 @@ T = TypeVar("T")
 
 _LOCKS: dict[Path, threading.RLock] = {}
 _LOCKS_LOCK = threading.RLock()
-_ASYNC_LOCKS: dict[Path, asyncio.Lock] = {}
 
 
 def _default_payload() -> dict[str, Any]:
@@ -39,21 +38,10 @@ def _lock_for(path: Path) -> threading.RLock:
         return lock
 
 
-def _async_lock_for(path: Path) -> asyncio.Lock:
-    key = path.resolve(strict=False)
-    with _LOCKS_LOCK:
-        lock = _ASYNC_LOCKS.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _ASYNC_LOCKS[key] = lock
-        return lock
-
-
 class AtomicItemStoreFile:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._lock = _lock_for(self.path)
-        self._async_lock = _async_lock_for(self.path)
 
     def read(self) -> dict[str, Any]:
         with self._lock:
@@ -71,16 +59,13 @@ class AtomicItemStoreFile:
             return result
 
     async def read_async(self) -> dict[str, Any]:
-        async with self._async_lock:
-            return await asyncio.to_thread(self.read)
+        return await asyncio.to_thread(self.read)
 
     async def write_async(self, payload: dict[str, Any]) -> None:
-        async with self._async_lock:
-            await asyncio.to_thread(self.write, payload)
+        await asyncio.to_thread(self.write, payload)
 
     async def transact_async(self, updater: Callable[[dict[str, Any]], T]) -> T:
-        async with self._async_lock:
-            return await asyncio.to_thread(self.transact, updater)
+        return await asyncio.to_thread(self.transact, updater)
 
     def _read_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():

@@ -22,6 +22,7 @@ _LEVEL_VALUES = {
     "INFO": 20,
     "WARNING": 30,
     "ERROR": 40,
+    "CRITICAL": 50,
 }
 
 
@@ -75,9 +76,24 @@ class _StandaloneLogger:
     def error(self, message: object, *args: Any, **kwargs: Any) -> None:
         self._write("ERROR", message, *args, **kwargs)
 
+    def critical(self, message: object, *args: Any, **kwargs: Any) -> None:
+        self._write("CRITICAL", message, *args, **kwargs)
+
+    fatal = critical
+
     def exception(self, message: object, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("exc_info", True)
         self._write("ERROR", message, *args, **kwargs)
+
+    def log(self, level: int, message: object, *args: Any, **kwargs: Any) -> None:
+        for level_name, level_value in sorted(_LEVEL_VALUES.items(), key=lambda item: item[1]):
+            if level <= level_value:
+                self._write(level_name, message, *args, **kwargs)
+                return
+        self._write("CRITICAL", message, *args, **kwargs)
+
+    def isEnabledFor(self, level: int) -> bool:
+        return int(level) >= self._threshold()
 
 
 def get_logger(name: str = "qzone_bridge"):
