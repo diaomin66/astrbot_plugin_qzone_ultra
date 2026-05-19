@@ -144,7 +144,7 @@
         "description": "自动评论后反馈管理员",
         "type": "bool",
         "default": false,
-        "hint": "预留兼容项。"
+        "hint": "开启后，定时/概率自动评论会向管理群或管理员私聊发送评论结果和目标说说渲染图。"
       },
       "like_when_comment": {
         "description": "评论时同时点赞",
@@ -249,6 +249,16 @@
     "type": "int",
     "default": 900,
     "hint": "发布结果渲染图宽度。"
+  },
+  "render_feed_card_limit": {
+    "description": "Feed card render limit",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 20
+    },
+    "hint": "看/读/评/赞说说时单次最多渲染的说说卡片数量，避免范围过大拖慢响应。"
   },
   "render_remote_timeout": {
     "description": "Publish result remote image timeout",

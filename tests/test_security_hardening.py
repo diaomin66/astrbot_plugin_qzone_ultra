@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+from pathlib import Path
 import sys
 import types
 
@@ -12,6 +13,7 @@ from qzone_bridge.client import QzoneClient
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import QzoneParseError, QzoneRequestError
 from qzone_bridge.models import SessionState
+from qzone_bridge.settings import PluginSettings
 from qzone_bridge import source_policy
 
 
@@ -192,3 +194,122 @@ def test_cookie_backed_read_and_write_entrypoints_require_admin(monkeypatch: pyt
     for name in methods:
         source = inspect.getsource(getattr(main.QzoneStablePlugin, name))
         assert "if not self._is_admin(event)" in source, name
+
+
+def test_qzone_post_card_result_uses_publish_renderer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "card.png"
+        path.write_bytes(b"png")
+        captured["post"] = post
+        captured["profile"] = profile
+        captured["result"] = result
+        captured["width"] = width
+        captured["remote_timeout"] = remote_timeout
+        return path
+
+    class _Event:
+        stopped = False
+
+        def stop_event(self):
+            self.stopped = True
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+        max_feed_limit=20,
+    )
+    plugin.data_dir = tmp_path
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+
+    post = main.QzonePost(
+        hostuin=12345,
+        fid="fid-1",
+        summary="今天的风很轻。",
+        nickname="小明",
+        created_at=1_700_000_000,
+        images=["https://example.test/a.png"],
+        local_id=2,
+    )
+    event = _Event()
+    results = asyncio.run(plugin._post_card_results(event, [post], "fallback"))
+
+    assert event.stopped
+    assert results == [{"type": "image", "path": str(tmp_path / "rendered_posts" / "card.png")}]
+    rendered_post = captured["post"]
+    profile = captured["profile"]
+    assert rendered_post.content == "今天的风很轻。"
+    assert rendered_post.media[0].source == "https://example.test/a.png"
+    assert profile.nickname == "2. 小明"
+    assert profile.user_id == "12345"
+    assert captured["width"] == 720
+    assert captured["remote_timeout"] == 0.01
+
+
+def test_qzone_commands_render_post_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    expected_helpers = {
+        "view_feed": "_yield_post_card_results",
+        "comment_feed": "_yield_post_card_results",
+        "like_feed": "_yield_post_card_results",
+        "qzone_feed": "_yield_post_card_results",
+        "qzone_detail": "_yield_post_card_results",
+        "qzone_comment": "_yield_post_card_results",
+        "qzone_like": "_yield_post_card_results",
+    }
+    for method_name, helper in expected_helpers.items():
+        source = inspect.getsource(getattr(main.QzoneStablePlugin, method_name))
+        assert helper in source, method_name
+
+    like_source = inspect.getsource(main.QzoneStablePlugin.like_feed)
+    assert 'with_detail=True' in like_source
+
+
+def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        def __init__(self):
+            self.sent: list[dict[str, object]] = []
+
+        def send_group_msg(self, *, group_id: int, message):
+            self.sent.append({"group_id": group_id, "message": message})
+
+    async def fake_render_card(self, post):
+        path = tmp_path / "auto-card.png"
+        path.write_bytes(b"png")
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(send_admin=True, manage_group=123456, admin_uins=[])
+    plugin._onebot_client = _Bot()
+    plugin._context = None
+    monkeypatch.setattr(main.QzoneStablePlugin, "_render_qzone_post_card", fake_render_card)
+
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="一条自动评论目标说说", nickname="小明")
+    asyncio.run(plugin._notify_admin_post_card(None, post, "定时自动评论完成"))
+
+    assert plugin._onebot_client.sent
+    message = plugin._onebot_client.sent[0]["message"]
+    assert plugin._onebot_client.sent[0]["group_id"] == 123456
+    assert message[0]["type"] == "text"
+    assert "定时自动评论完成" in message[0]["data"]["text"]
+    assert message[1]["type"] == "image"
+    assert message[1]["data"]["file"].startswith("file:///")
+
+
+def test_render_feed_card_limit_is_loaded_from_config() -> None:
+    settings = PluginSettings.from_mapping({"render_feed_card_limit": 3})
+    assert settings.render_feed_card_limit == 3

@@ -94,6 +94,7 @@ class PluginSettings:
     user_agent: str = DEFAULT_USER_AGENT
     render_publish_result: bool = True
     render_result_width: int = 900
+    render_feed_card_limit: int = 5
     render_remote_timeout: float = 0.35
     manage_group: int = 0
     pillowmd_style_dir: str = ""
@@ -143,6 +144,7 @@ class PluginSettings:
             user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
             render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
             render_result_width=int(_pick(mapping, "render_result_width", 900) or 900),
+            render_feed_card_limit=int(_pick(mapping, "render_feed_card_limit", 5) or 5),
             render_remote_timeout=float(_pick(mapping, "render_remote_timeout", 0.35) or 0.35),
             manage_group=int(_pick(mapping, "manage_group", 0) or 0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),

@@ -535,7 +535,7 @@ from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
 from qzone_bridge.llm import QzoneLLM
-from qzone_bridge.media import PostPayload, collect_post_payload, normalize_media_list
+from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
@@ -905,6 +905,170 @@ class QzoneStablePlugin(Star):
             return image_result(str(image_path))
         self._stop_event(event)
         return event.plain_result(f"{text}\n图片路径: {image_path}")
+
+    def _post_render_limit(self) -> int:
+        limit = int(getattr(self.settings, "render_feed_card_limit", 5) or 5)
+        return max(1, min(limit, self.settings.max_feed_limit))
+
+    @staticmethod
+    def _post_time_text(post: QzonePost) -> str:
+        created_at = int(post.created_at or 0)
+        if created_at <= 0:
+            return datetime.now().strftime("%H:%M")
+        try:
+            created = datetime.fromtimestamp(created_at)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now().strftime("%H:%M")
+        if created.date() == datetime.now().date():
+            return created.strftime("%H:%M")
+        return created.strftime("%m-%d %H:%M")
+
+    def _post_render_profile(self, post: QzonePost) -> RenderProfile:
+        user_id = str(post.hostuin or "")
+        nickname = post.nickname or user_id or "QQ Space"
+        if post.local_id:
+            nickname = f"{post.local_id}. {nickname}"
+        return RenderProfile(
+            nickname=nickname,
+            user_id=user_id,
+            avatar_source=self._qlogo_url(post.hostuin, 640) if post.hostuin else "",
+            time_text=self._post_time_text(post),
+        )
+
+    @staticmethod
+    def _post_render_payload(post: QzonePost) -> PostPayload:
+        media = [
+            PostMedia(kind="image", source=str(source), name=source_name(str(source)))
+            for source in post.images[:9]
+            if str(source or "").strip()
+        ]
+        return PostPayload(content=(post.summary or "(空)").strip(), media=media)
+
+    async def _render_qzone_post_card(self, post: QzonePost) -> Path | None:
+        if not self.settings.render_publish_result:
+            return None
+        try:
+            return await asyncio.to_thread(
+                render_publish_result_image,
+                self._post_render_payload(post),
+                self.data_dir / "rendered_posts",
+                profile=self._post_render_profile(post),
+                result={"ok": True, "tool": "qzone_post_card", "fid": post.fid},
+                width=self.settings.render_result_width,
+                remote_timeout=self.settings.render_remote_timeout,
+            )
+        except Exception as exc:
+            logger.exception("qzone post card render failed: %s", exc)
+            return None
+
+    async def _post_card_results(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        fallback_text: str,
+        *,
+        subdir: str = "posts",
+        fallback_when_unrendered: bool = True,
+    ) -> list[Any]:
+        if not posts:
+            return [self._command_result(event, fallback_text)] if fallback_when_unrendered else []
+        image_result = getattr(event, "image_result", None)
+        if not self.settings.render_publish_result or not callable(image_result):
+            if fallback_when_unrendered:
+                return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+            return []
+
+        results: list[Any] = []
+        limit = self._post_render_limit()
+        for post in posts[:limit]:
+            image_path = await self._render_qzone_post_card(post)
+            if image_path is None:
+                continue
+            self._stop_event(event)
+            results.append(image_result(str(image_path)))
+
+        if not results and fallback_when_unrendered:
+            return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+        if len(posts) > limit:
+            results.append(self._command_result(event, f"已渲染前 {limit} 条说说，其余内容请缩小范围后查看。"))
+        return results
+
+    async def _yield_post_card_results(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        fallback_text: str,
+        *,
+        subdir: str = "posts",
+        fallback_when_unrendered: bool = True,
+    ):
+        for result in await self._post_card_results(
+            event,
+            posts,
+            fallback_text,
+            subdir=subdir,
+            fallback_when_unrendered=fallback_when_unrendered,
+        ):
+            yield result
+
+    async def _post_from_detail_target(self, hostuin: int, fid: str, appid: int = 311) -> QzonePost | None:
+        try:
+            detail_payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+            entry_data = detail_payload.get("entry")
+            entry = (
+                FeedEntry(**entry_data)
+                if isinstance(entry_data, dict)
+                else FeedEntry(hostuin=hostuin, fid=fid, appid=appid, summary="")
+            )
+            post = post_from_entry(entry, detail=detail_payload.get("raw"), local_id=1)
+            if detail_payload.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                        created_at=int(item.get("created_at") or item.get("date") or 0),
+                        parent_id=str(item.get("parent_id") or ""),
+                    )
+                    for item in detail_payload.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+                post.comment_count = max(post.comment_count, len(post.comments))
+            return post
+        except Exception as exc:
+            logger.debug("qzone detail fetch for post card failed: %s", exc)
+            return None
+
+    async def _notify_admin_post_card(
+        self,
+        event: AstrMessageEvent | None,
+        post: QzonePost,
+        message: str,
+    ) -> None:
+        if not self.settings.send_admin:
+            return
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            return
+        image_path = await self._render_qzone_post_card(post)
+        outgoing: Any = message
+        if image_path is not None:
+            outgoing = [
+                {"type": "text", "data": {"text": f"{message}\n"}},
+                {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+            ]
+        try:
+            if self.settings.manage_group and hasattr(bot, "send_group_msg"):
+                result = bot.send_group_msg(group_id=self.settings.manage_group, message=outgoing)
+                await self._maybe_await(result)
+                return
+            if hasattr(bot, "send_private_msg"):
+                for admin in self.settings.admin_uins:
+                    result = bot.send_private_msg(user_id=admin, message=outgoing)
+                    await self._maybe_await(result)
+        except Exception as exc:
+            logger.debug("qzone auto post-card notification failed: %s", exc)
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
@@ -1921,6 +2085,7 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, text.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
+            await self._notify_admin_post_card(None, post, f"定时自动评论了 {post.nickname or post.hostuin} 的说说：{truncate(text, 60)}")
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
             break
@@ -2106,6 +2271,7 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
+            await self._notify_admin_post_card(event, post, f"已自动评论 {post.nickname or post.hostuin} 的说说：{truncate(content, 60)}")
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 
@@ -2134,7 +2300,8 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield await self._markdown_result(event, self._format_posts(posts, detail=True), subdir="posts")
+        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("评说说", alias={"评论说说", "读说说"})
@@ -2168,7 +2335,14 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield await self._markdown_result(event, "\n".join(lines), subdir="posts")
+        yield self._command_result(event, "\n".join(lines))
+        async for result in self._yield_post_card_results(
+            event,
+            posts,
+            self._format_posts(posts, detail=True),
+            fallback_when_unrendered=False,
+        ):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("赞说说")
@@ -2179,7 +2353,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            posts = await self._posts_for_event(event, ("赞说说",))
+            posts = await self._posts_for_event(event, ("赞说说",), with_detail=True)
             if not posts:
                 yield self._command_result(event, "没有找到可点赞的说说。")
                 return
@@ -2190,7 +2364,14 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield await self._markdown_result(event, "\n".join(lines), subdir="posts")
+        yield self._command_result(event, "\n".join(lines))
+        async for result in self._yield_post_card_results(
+            event,
+            posts,
+            self._format_posts(posts, detail=True),
+            fallback_when_unrendered=False,
+        ):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("发说说")
@@ -2649,7 +2830,9 @@ class QzoneStablePlugin(Star):
             return
         entries = self._to_feed_entries(payload)
         text = format_feed_list(entries, cursor=str(payload.get("cursor") or ""), has_more=bool(payload.get("has_more")))
-        yield self._command_result(event, text)
+        posts = [post_from_entry(entry, local_id=index) for index, entry in enumerate(entries, 1)]
+        async for result in self._yield_post_card_results(event, posts, text):
+            yield result
 
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
@@ -2663,7 +2846,29 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield self._command_result(event, self._render_detail(payload))
+        entry_data = payload.get("entry")
+        post = None
+        if isinstance(entry_data, dict):
+            entry = FeedEntry(**entry_data)
+            post = post_from_entry(entry, detail=payload.get("raw"), local_id=1)
+            if payload.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                        created_at=int(item.get("created_at") or item.get("date") or 0),
+                        parent_id=str(item.get("parent_id") or ""),
+                    )
+                    for item in payload.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+        if post is None:
+            yield self._command_result(event, self._render_detail(payload))
+            return
+        async for result in self._yield_post_card_results(event, [post], self._render_detail(payload)):
+            yield result
 
     @qzone.command("post")
     async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
@@ -2701,11 +2906,20 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
+            post = await self._post_from_detail_target(hostuin, fid, 311)
             payload = await self.controller.comment_post(hostuin=hostuin, fid=fid, content=content)
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
         yield self._command_result(event, format_action_result("评论结果", payload))
+        if post is not None:
+            async for result in self._yield_post_card_results(
+                event,
+                [post],
+                post.detail_text(1),
+                fallback_when_unrendered=False,
+            ):
+                yield result
 
     @qzone.command("like")
     async def qzone_like(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
@@ -2715,11 +2929,20 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
+            post = await self._post_from_detail_target(hostuin, fid, appid)
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
         yield self._command_result(event, format_like_result(payload))
+        if post is not None:
+            async for result in self._yield_post_card_results(
+                event,
+                [post],
+                post.detail_text(1),
+                fallback_when_unrendered=False,
+            ):
+                yield result
 
     @filter.llm_tool()
     async def llm_view_feed(
