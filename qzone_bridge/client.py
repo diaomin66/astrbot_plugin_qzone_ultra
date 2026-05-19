@@ -30,6 +30,7 @@ from .parser import (
     unwrap_payload,
 )
 from .render import cookie_summary
+from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
 from .utils import extract_callback_json, json_loads, now_iso
 
 log = get_logger(__name__)
@@ -659,6 +660,8 @@ class QzoneClient:
         filename = item.name or source_name(source) or "image.jpg"
         mime_type = item.mime_type
         parsed = urlparse(source)
+        if parsed.scheme.lower() in {"http", "https"} and not is_remote_media_url_allowed(source):
+            raise QzoneParseError("图片 URL 不安全，仅允许 http/https 公网地址", detail={"url": source})
         cached = self._cached_image_source(source) if parsed.scheme.lower() in {"http", "https"} else None
         if cached is not None:
             cached_data, cached_mime = cached
@@ -684,42 +687,60 @@ class QzoneClient:
 
         if parsed.scheme.lower() in {"http", "https"}:
             try:
-                async with self._client.stream(
-                    "GET",
-                    source,
-                    headers=self._headers(referer=f"https://user.qzone.qq.com/{self.login_uin}"),
-                    follow_redirects=True,
-                ) as response:
-                    self._persist_cookie_response(response)
-                    if response.status_code >= 400:
-                        text = (await response.aread()).decode("utf-8", errors="ignore")
-                        raise QzoneRequestError(
-                            f"图片下载失败 HTTP {response.status_code}",
-                            status_code=response.status_code,
-                            detail={"url": source, "text": text[:500]},
-                        )
-                    length = response.headers.get("content-length")
-                    try:
-                        if length and int(length) > MAX_UPLOAD_IMAGE_BYTES:
-                            raise QzoneParseError("图片大小超过限制", detail={"url": source})
-                    except ValueError:
-                        pass
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
+                current_url = source
+                for redirect_count in range(4):
+                    async with self._client.stream(
+                        "GET",
+                        current_url,
+                        headers=self._headers(referer=f"https://user.qzone.qq.com/{self.login_uin}"),
+                        follow_redirects=False,
+                    ) as response:
+                        self._persist_cookie_response(response)
+                        if response.status_code in QZONE_REDIRECT_STATUS_CODES:
+                            if redirect_count >= 3:
+                                raise QzoneRequestError("图片跳转次数过多", detail={"url": source})
+                            redirected = resolve_remote_media_redirect(
+                                current_url,
+                                response.headers.get("location", ""),
+                            )
+                            if not redirected:
+                                raise QzoneParseError("图片跳转地址不安全", detail={"url": current_url})
+                            current_url = redirected
                             continue
-                        total += len(chunk)
-                        if total > MAX_UPLOAD_IMAGE_BYTES:
-                            raise QzoneParseError("图片大小超过限制", detail={"url": source})
-                        chunks.append(chunk)
+                        if response.status_code >= 400:
+                            text = (await response.aread()).decode("utf-8", errors="ignore")
+                            raise QzoneRequestError(
+                                f"图片下载失败 HTTP {response.status_code}",
+                                status_code=response.status_code,
+                                detail={"url": current_url, "text": text[:500]},
+                            )
+                        length = response.headers.get("content-length")
+                        try:
+                            if length and int(length) > MAX_UPLOAD_IMAGE_BYTES:
+                                raise QzoneParseError("图片大小超过限制", detail={"url": current_url})
+                        except ValueError:
+                            pass
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > MAX_UPLOAD_IMAGE_BYTES:
+                                raise QzoneParseError("图片大小超过限制", detail={"url": current_url})
+                            chunks.append(chunk)
+                        content_type = response.headers.get("content-type", "").split(";", 1)[0]
+                        data = b"".join(chunks)
+                        self._store_image_source_cache(source, data, content_type)
+                        return data, filename, mime_type or content_type
             except httpx.HTTPError as exc:
                 raise QzoneRequestError("图片下载失败", detail={"url": source}) from exc
-            content_type = response.headers.get("content-type", "").split(";", 1)[0]
-            data = b"".join(chunks)
-            self._store_image_source_cache(source, data, content_type)
-            return data, filename, mime_type or content_type
+            raise QzoneRequestError("图片下载失败", detail={"url": source})
 
+        if parsed.scheme and not is_windows_drive_path(source):
+            raise QzoneParseError("图片来源协议不支持，仅允许 http/https/base64/data 或消息附件缓存")
+        if not item.trusted_local:
+            raise QzoneParseError("本地图片路径只允许来自 AstrBot 消息附件缓存", detail={"name": filename})
         path = Path(source)
         def read_local_image() -> bytes:
             if not path.exists() or not path.is_file():

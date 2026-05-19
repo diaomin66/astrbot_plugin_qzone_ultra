@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
+from .source_policy import is_windows_drive_path
+
 
 QZONE_MAX_IMAGES = 9
 QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -57,6 +59,7 @@ class PostMedia:
     mime_type: str = ""
     size: int = 0
     raw_type: str = ""
+    trusted_local: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +85,25 @@ def _is_url(value: str) -> bool:
 
 def _is_base64_source(value: str) -> bool:
     return value.startswith("base64://") or value.startswith("data:")
+
+
+def _is_local_source(value: str) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(value)
+    if parsed.scheme.lower() in {"http", "https"} or _is_base64_source(value):
+        return False
+    if parsed.scheme and not is_windows_drive_path(value):
+        return False
+    return True
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _looks_like_path(value: str) -> bool:
@@ -148,10 +170,20 @@ def is_supported_image(media: PostMedia | dict[str, Any]) -> bool:
     return suffix in QZONE_IMAGE_SUFFIXES
 
 
-def normalize_media_item(item: Any, *, default_kind: str = "file") -> PostMedia | None:
+def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local: bool = False) -> PostMedia | None:
     if item is None:
         return None
     if isinstance(item, PostMedia):
+        if trusted_local and _is_local_source(item.source) and not item.trusted_local:
+            return PostMedia(
+                kind=item.kind,
+                source=item.source,
+                name=item.name,
+                mime_type=item.mime_type,
+                size=item.size,
+                raw_type=item.raw_type,
+                trusted_local=True,
+            )
         return item
     if isinstance(item, str):
         source = normalize_source(item)
@@ -163,6 +195,7 @@ def normalize_media_item(item: Any, *, default_kind: str = "file") -> PostMedia 
             source=source,
             name=name,
             mime_type=guess_mime_type(name or source),
+            trusted_local=trusted_local and _is_local_source(source),
         )
         if is_supported_image(media):
             media.kind = "image"
@@ -181,19 +214,35 @@ def normalize_media_item(item: Any, *, default_kind: str = "file") -> PostMedia 
             size = int(size_value or 0)
         except (TypeError, ValueError):
             size = 0
-        media = PostMedia(kind=kind, source=source, name=name, mime_type=mime_type, size=size, raw_type=kind)
+        item_trusted_local = trusted_local or _bool_value(
+            item.get("trusted_local") or item.get("trusted_local_source") or item.get("from_message")
+        )
+        media = PostMedia(
+            kind=kind,
+            source=source,
+            name=name,
+            mime_type=mime_type,
+            size=size,
+            raw_type=kind,
+            trusted_local=item_trusted_local and _is_local_source(source),
+        )
         if is_supported_image(media):
             media.kind = "image"
         return media
     return None
 
 
-def normalize_media_list(items: Iterable[Any] | None, *, default_kind: str = "file") -> list[PostMedia]:
+def normalize_media_list(
+    items: Iterable[Any] | None,
+    *,
+    default_kind: str = "file",
+    trusted_local: bool = False,
+) -> list[PostMedia]:
     if isinstance(items, (str, dict, PostMedia)):
         items = [items]
     media: list[PostMedia] = []
     for item in items or []:
-        normalized = normalize_media_item(item, default_kind=default_kind)
+        normalized = normalize_media_item(item, default_kind=default_kind, trusted_local=trusted_local)
         if normalized:
             media.append(normalized)
     return media
@@ -211,6 +260,7 @@ def split_publishable_images(media: Iterable[PostMedia]) -> tuple[list[PostMedia
                 mime_type=item.mime_type or guess_mime_type(item.name or item.source),
                 size=item.size,
                 raw_type=item.raw_type or item.kind,
+                trusted_local=item.trusted_local,
             )
             images.append(normalized)
         else:
@@ -362,7 +412,15 @@ def _component_media(component: Any, kind: str) -> PostMedia | None:
         size = int(data.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    media = PostMedia(kind=kind, source=source, name=name, mime_type=mime_type, size=size, raw_type=kind)
+    media = PostMedia(
+        kind=kind,
+        source=source,
+        name=name,
+        mime_type=mime_type,
+        size=size,
+        raw_type=kind,
+        trusted_local=_is_local_source(source),
+    )
     if is_supported_image(media):
         media.kind = "image"
     return media
@@ -424,7 +482,7 @@ def _media_from_reference_field(value: Any, *, key: str) -> list[PostMedia]:
         values = value
     else:
         values = [value]
-    return normalize_media_list(values, default_kind=default_kind)
+    return normalize_media_list(values, default_kind=default_kind, trusted_local=True)
 
 
 def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
@@ -649,7 +707,7 @@ def collect_post_payload(
             add_attachment_reference=True,
         )
 
-    for item in normalize_media_list(extra_media):
+    for item in normalize_media_list(extra_media, trusted_local=False):
         _append_collected_media(
             item,
             media=media,
