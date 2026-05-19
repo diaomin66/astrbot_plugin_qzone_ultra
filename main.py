@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026051803
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026051901
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -209,6 +209,38 @@ def _public_error_reason(message: Any) -> str:
     if not text:
         return "现在还没办法继续"
     return truncate(text, 80)
+
+
+def _public_error_detail_parts(detail: Any) -> list[str]:
+    if not isinstance(detail, dict):
+        return []
+    parts: list[str] = []
+    status_code = detail.get("status_code")
+    if status_code is not None:
+        parts.append(f"HTTP {status_code}")
+    returncode = detail.get("returncode")
+    if returncode is not None:
+        parts.append(f"退出码 {returncode}")
+    daemon_port = detail.get("daemon_port")
+    if daemon_port:
+        parts.append(f"daemon 端口 {daemon_port}")
+    location = detail.get("location")
+    if location:
+        parts.append(f"跳转 {_redact_url(str(location))}")
+    url = detail.get("url")
+    if url:
+        parts.append(f"地址 {_redact_url(str(url))}")
+    if detail.get("log_path"):
+        parts.append("daemon 日志可在插件数据目录查看")
+    attempts = detail.get("attempts")
+    if isinstance(attempts, list) and attempts:
+        parts.append(f"启动尝试 {len(attempts)} 次")
+        last_attempt = attempts[-1]
+        if isinstance(last_attempt, dict):
+            parts.extend(_public_error_detail_parts(last_attempt))
+    if detail.get("text") or detail.get("raw") or detail.get("log_tail"):
+        parts.append("响应详情已隐藏")
+    return parts
 
 
 def _chmod_private(path: Path) -> None:
@@ -885,20 +917,10 @@ class QzoneStablePlugin(Star):
     def _error_text(self, exc: QzoneBridgeError) -> str:
         if not exc.detail:
             return exc.message
-        if isinstance(exc.detail, dict):
-            parts: list[str] = []
-            status_code = exc.detail.get("status_code")
-            if status_code is not None:
-                parts.append(f"HTTP {status_code}")
-            location = exc.detail.get("location")
-            if location:
-                parts.append(f"跳转 {location}")
-            url = exc.detail.get("url")
-            if url:
-                parts.append(f"地址 {url}")
-            if parts:
-                return f"{exc.message}（{', '.join(parts)}）"
-        return f"{exc.message}\n{exc.detail}"
+        parts = _public_error_detail_parts(exc.detail)
+        if parts:
+            return f"{exc.message}（{', '.join(dict.fromkeys(parts))}）"
+        return exc.message
 
     def _log_tool_call_result(self, payload: dict[str, Any]) -> None:
         safe_payload = _safe_for_tool_log(payload)
@@ -2099,8 +2121,12 @@ class QzoneStablePlugin(Star):
             return
         yield await self._markdown_result(event, self._format_visitors(payload), subdir="visitors")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("看说说", alias={"查看说说"})
     async def view_feed(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2110,8 +2136,12 @@ class QzoneStablePlugin(Star):
             return
         yield await self._markdown_result(event, self._format_posts(posts, detail=True), subdir="posts")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("评说说", alias={"评论说说", "读说说"})
     async def comment_feed(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以评论。")
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2140,8 +2170,12 @@ class QzoneStablePlugin(Star):
             return
         yield await self._markdown_result(event, "\n".join(lines), subdir="posts")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("赞说说")
     async def like_feed(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以点赞。")
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2230,8 +2264,12 @@ class QzoneStablePlugin(Star):
             return
         yield await self._markdown_result(event, "\n".join(lines), subdir="posts")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("回评", alias={"回复评论"})
     async def reply_comment(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以回评。")
+            return
         raw = self._message_after_command(self._event_text(event), ("回评", "回复评论"))
         parts = raw.split()
         post_id = int(parts[0]) if parts and re.fullmatch(r"-?\d+", parts[0]) else 0
@@ -2595,6 +2633,9 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("feed")
     async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2612,6 +2653,9 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说详情。")
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2691,12 +2735,24 @@ class QzoneStablePlugin(Star):
         新流程中，点赞请优先使用 qzone_like_post；评论请优先使用 qzone_comment_post。
         如果用户原话已经明确要评论或点赞，本兼容工具会直接完成对应动作。
         """
+        wants_comment = bool(reply or self._event_text_has_comment_intent(event))
+        wants_like = bool(like or self._event_text_has_like_intent(event))
+        if not self._is_admin(event):
+            payload = {
+                "ok": False,
+                "tool": "qzone_comment_post" if wants_comment else "qzone_like_post",
+                "public_reason": "没有权限",
+            }
+            self._log_tool_call_result({**payload, "arguments": {"user_id": user_id, "pos": pos}})
+            return await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             hostuin = self._tool_target_uin(event, user_id, fallback=self._sender_id(event))
-            wants_comment = bool(reply or self._event_text_has_comment_intent(event))
-            wants_like = bool(like or self._event_text_has_like_intent(event))
             selection = PostSelection(
                 target_uin=hostuin,
                 start=(pos + 1 if pos >= 0 else -1),
@@ -2840,6 +2896,15 @@ class QzoneStablePlugin(Star):
             scope (string): auto/self/profile。
             hostuin (number): 兼容旧参数，优先级低于 target_uin。
         """
+        if not self._is_admin(event):
+            yield event.plain_result(
+                await self._ask_llm_tool_reply(
+                    event,
+                    {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
+                    self._llm_error_fallback_text("没有权限"),
+                )
+            )
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2866,6 +2931,15 @@ class QzoneStablePlugin(Star):
             fid (string): 说说 fid。
             appid (number): 应用 id，默认 311。
         """
+        if not self._is_admin(event):
+            yield event.plain_result(
+                await self._ask_llm_tool_reply(
+                    event,
+                    {"ok": False, "tool": "qzone_detail_feed", "public_reason": "没有权限"},
+                    self._llm_error_fallback_text("没有权限"),
+                )
+            )
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2896,6 +2970,15 @@ class QzoneStablePlugin(Star):
             fid (string): 兼容旧参数。
             appid (number): 兼容旧参数。
         """
+        if not self._is_admin(event):
+            yield event.plain_result(
+                await self._ask_llm_tool_reply(
+                    event,
+                    {"ok": False, "tool": "qzone_view_post", "public_reason": "没有权限"},
+                    self._llm_error_fallback_text("没有权限"),
+                )
+            )
+            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()

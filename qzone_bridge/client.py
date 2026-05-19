@@ -161,6 +161,22 @@ class QzoneClient:
             total_bytes -= len(evicted_data)
 
     @staticmethod
+    def _decode_upload_image_base64(encoded: str, *, label: str) -> bytes:
+        text = str(encoded or "").strip()
+        # A cheap preflight avoids allocating very large decoded buffers from
+        # data/base64 sources that can be supplied through LLM tool arguments.
+        estimated_size = (len(text) * 3) // 4
+        if estimated_size > MAX_UPLOAD_IMAGE_BYTES + 3:
+            raise QzoneParseError(f"{label}大小超过限制")
+        try:
+            data = base64.b64decode(text, validate=False)
+        except Exception as exc:
+            raise QzoneParseError(f"{label}解码失败") from exc
+        if len(data) > MAX_UPLOAD_IMAGE_BYTES:
+            raise QzoneParseError(f"{label}大小超过限制")
+        return data
+
+    @staticmethod
     def _payload_needs_rebind(code: int, message: str) -> bool:
         if code in AUTH_ERROR_CODES:
             return True
@@ -270,6 +286,12 @@ class QzoneClient:
         if extra:
             headers.update(extra)
         return headers
+
+    def _media_download_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": self.user_agent,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
 
     def _merge_params(self, params: dict[str, Any] | None, *, hostuin: int | None = None, attach_token: bool = False) -> dict[str, Any]:
         merged: dict[str, Any] = dict(params or {})
@@ -660,17 +682,15 @@ class QzoneClient:
         filename = item.name or source_name(source) or "image.jpg"
         mime_type = item.mime_type
         parsed = urlparse(source)
-        if parsed.scheme.lower() in {"http", "https"} and not is_remote_media_url_allowed(source):
+        if parsed.scheme.lower() in {"http", "https"} and not await asyncio.to_thread(is_remote_media_url_allowed, source):
             raise QzoneParseError("图片 URL 不安全，仅允许 http/https 公网地址", detail={"url": source})
         cached = self._cached_image_source(source) if parsed.scheme.lower() in {"http", "https"} else None
         if cached is not None:
             cached_data, cached_mime = cached
             return cached_data, filename, mime_type or cached_mime
         if source.startswith("base64://"):
-            try:
-                return base64.b64decode(source[len("base64://") :], validate=False), filename, mime_type
-            except Exception as exc:
-                raise QzoneParseError("图片 base64 解码失败") from exc
+            data = self._decode_upload_image_base64(source[len("base64://") :], label="图片")
+            return data, filename, mime_type
         if source.startswith("data:"):
             try:
                 header, encoded = source.split(",", 1)
@@ -679,10 +699,7 @@ class QzoneClient:
             header_mime = header[5:].split(";", 1)[0]
             if ";base64" not in header:
                 raise QzoneParseError("data URI 必须使用 base64 编码")
-            try:
-                data = base64.b64decode(encoded, validate=False)
-            except Exception as exc:
-                raise QzoneParseError("图片 data URI 解码失败") from exc
+            data = self._decode_upload_image_base64(encoded, label="图片 data URI")
             return data, filename, mime_type or header_mime
 
         if parsed.scheme.lower() in {"http", "https"}:
@@ -692,10 +709,9 @@ class QzoneClient:
                     async with self._client.stream(
                         "GET",
                         current_url,
-                        headers=self._headers(referer=f"https://user.qzone.qq.com/{self.login_uin}"),
+                        headers=self._media_download_headers(),
                         follow_redirects=False,
                     ) as response:
-                        self._persist_cookie_response(response)
                         if response.status_code in QZONE_REDIRECT_STATUS_CODES:
                             if redirect_count >= 3:
                                 raise QzoneRequestError("图片跳转次数过多", detail={"url": source})

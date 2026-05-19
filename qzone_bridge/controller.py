@@ -314,8 +314,6 @@ class QzoneDaemonController:
             str(self.data_dir),
             "--port",
             str(port),
-            "--secret",
-            runtime.secret,
             "--keepalive-interval",
             str(self.keepalive_interval),
             "--request-timeout",
@@ -330,6 +328,7 @@ class QzoneDaemonController:
             kwargs["start_new_session"] = True
         env = os.environ.copy()
         env["QZONE_BRIDGE_PLUGIN_ROOT"] = str(self.plugin_root)
+        env["QZONE_BRIDGE_SECRET"] = runtime.secret
         kwargs["env"] = env
         log_path = self._daemon_log_path()
         log_file = log_path.open("a", encoding="utf-8", buffering=1)

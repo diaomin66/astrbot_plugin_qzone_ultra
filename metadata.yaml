@@ -7,4 +7,4 @@ repo: https://github.com/diaomin66/astrbot_plugin_qzone_ultra
 entry: main.py
 support_platforms:
   - aiocqhttp
-astrbot_version: ">=4.0.0"
+astrbot_version: ">=4.16,<5"
