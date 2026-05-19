@@ -3364,6 +3364,10 @@ class QzoneStablePlugin(Star):
             self._publisher_profile_preload_task.cancel()
             await asyncio.gather(self._publisher_profile_preload_task, return_exceptions=True)
             self._publisher_profile_preload_task = None
+        if self._daemon_warmup_task is not None:
+            self._daemon_warmup_task.cancel()
+            await asyncio.gather(self._daemon_warmup_task, return_exceptions=True)
+            self._daemon_warmup_task = None
         try:
             await self.controller.close()
         except Exception as exc:

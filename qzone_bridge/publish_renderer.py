@@ -22,6 +22,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from .media import PostMedia, PostPayload, source_name
+from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
 
 
 WHITE = (255, 255, 255)
@@ -125,7 +126,7 @@ def preload_publish_render_assets(
             continue
         seen.add(source)
         preview = _load_image_preview(
-            PostMedia(kind="image", source=source, name="avatar"),
+            PostMedia(kind="image", source=source, name="avatar", trusted_local=True),
             remote_timeout=remote_timeout,
         )
         if preview.image is None:
@@ -282,7 +283,7 @@ def render_publish_result_image(
     preview_targets: list[PostMedia] = []
     avatar_offset = 0
     if profile.avatar_source:
-        preview_targets.append(PostMedia(kind="image", source=profile.avatar_source, name="avatar"))
+        preview_targets.append(PostMedia(kind="image", source=profile.avatar_source, name="avatar", trusted_local=True))
         avatar_offset = 1
     preview_targets.extend(post.media[:9])
     loaded_previews = _load_image_previews(preview_targets, remote_timeout=remote_timeout)
@@ -544,7 +545,12 @@ def _truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Ima
 
 
 def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePreview:
-    data = _read_source_bytes(media.source, max_bytes=SOURCE_IMAGE_MAX_BYTES, remote_timeout=remote_timeout)
+    data = _read_source_bytes(
+        media.source,
+        max_bytes=SOURCE_IMAGE_MAX_BYTES,
+        remote_timeout=remote_timeout,
+        allow_local=media.trusted_local,
+    )
     if not data:
         return _ImagePreview(media=media, image=None, failed=True)
     try:
@@ -583,9 +589,12 @@ def _load_image_previews(items: list[PostMedia], *, remote_timeout: float) -> li
     return previews
 
 
-def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float) -> bytes:
+def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float, allow_local: bool = False) -> bytes:
     source = str(source or "").strip()
     if not source:
+        return b""
+    parsed = urlparse(source)
+    if parsed.scheme.lower() in {"http", "https"} and not is_remote_media_url_allowed(source):
         return b""
     cache_key = _bytes_cache_key(source)
     cached = _get_cached_bytes(cache_key)
@@ -608,39 +617,57 @@ def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float) ->
                 return b""
         return unquote_to_bytes(encoded)[:max_bytes]
 
-    parsed = urlparse(source)
     if parsed.scheme.lower() in {"http", "https"}:
         try:
             client = _thread_http_client()
-            with client.stream(
-                "GET",
-                source,
-                timeout=httpx.Timeout(remote_timeout),
-                follow_redirects=True,
-            ) as response:
-                if response.status_code >= 400:
-                    return b""
-                length = response.headers.get("content-length")
-                if length and int(length) > max_bytes:
-                    return b""
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    if not chunk:
+            current_url = source
+            for redirect_count in range(4):
+                with client.stream(
+                    "GET",
+                    current_url,
+                    timeout=httpx.Timeout(remote_timeout),
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count >= 3:
+                            return b""
+                        redirected = resolve_remote_media_redirect(current_url, response.headers.get("location", ""))
+                        if not redirected:
+                            return b""
+                        current_url = redirected
                         continue
-                    total += len(chunk)
-                    if total > max_bytes:
+                    if response.status_code >= 400:
                         return b""
-                    chunks.append(chunk)
-            data = b"".join(chunks)
+                    length = response.headers.get("content-length")
+                    if length and int(length) > max_bytes:
+                        return b""
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > max_bytes:
+                            return b""
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    break
+            else:
+                return b""
             _store_cached_bytes(cache_key, data)
             return data
         except Exception:
             return b""
 
+    if not allow_local:
+        return b""
+    if parsed.scheme and not source.startswith("file://") and not is_windows_drive_path(source):
+        return b""
     if source.startswith("file://"):
         parsed = urlparse(source)
         source = parsed.path or ""
+        if re.match(r"^/[A-Za-z]:[\\/]", source):
+            source = source[1:]
     path = Path(source)
     try:
         stat = path.stat()
