@@ -20,4 +20,3 @@ dist/
 *.egg-info/
 
 data/
-tests/

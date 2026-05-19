@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
+from functools import lru_cache
 from urllib.parse import urljoin, urlparse
 
 REMOTE_MEDIA_SCHEMES = {"http", "https"}
@@ -22,7 +24,7 @@ def is_remote_media_url_allowed(source: str) -> bool:
     host = parsed.hostname
     if not host:
         return False
-    return not is_unsafe_media_host(host)
+    return not is_unsafe_media_host(host) and remote_media_host_resolves_safely(host)
 
 
 def is_unsafe_media_host(host: str) -> bool:
@@ -41,6 +43,28 @@ def is_unsafe_media_host(host: str) -> bool:
         or address.is_reserved
         or address.is_unspecified
     )
+
+
+@lru_cache(maxsize=512)
+def remote_media_host_resolves_safely(host: str) -> bool:
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if is_unsafe_media_host(normalized):
+        return False
+    try:
+        ipaddress.ip_address(normalized.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return True
+
+    try:
+        infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    addresses = {item[4][0] for item in infos if item and item[4]}
+    if not addresses:
+        return False
+    return not any(is_unsafe_media_host(address) for address in addresses)
 
 
 def resolve_remote_media_redirect(base_url: str, location: str) -> str:

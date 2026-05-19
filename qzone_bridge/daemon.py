@@ -1154,12 +1154,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Qzone daemon")
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--secret", required=True)
+    parser.add_argument("--secret", default=os.getenv("QZONE_BRIDGE_SECRET", ""))
     parser.add_argument("--keepalive-interval", type=int, default=120)
     parser.add_argument("--request-timeout", type=float, default=15.0)
     parser.add_argument("--user-agent", default="")
     parser.add_argument("--version", default="0.1.0")
     args = parser.parse_args()
+    if not args.secret:
+        parser.error("--secret or QZONE_BRIDGE_SECRET is required")
 
     configure_standalone_logging()
     asyncio.run(
