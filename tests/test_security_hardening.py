@@ -119,6 +119,31 @@ def test_main_import_recovers_from_renderer_without_comment_section_contract(
         sys.modules.pop("main", None)
 
 
+def test_main_import_recovers_from_renderer_with_false_comment_section_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.publish_renderer as renderer
+
+    try:
+        monkeypatch.setattr(renderer, "SUPPORTS_COMMENT_RESULT_SECTIONS", False, raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
+        assert getattr(main._publish_renderer, "SUPPORTS_COMMENT_RESULT_SECTIONS", False) is True
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_tolerates_missing_optional_renderer_exports(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -614,6 +639,64 @@ def test_qzone_commands_render_post_cards(monkeypatch: pytest.MonkeyPatch) -> No
 
     like_source = inspect.getsource(main.QzoneStablePlugin.like_feed)
     assert 'with_detail=True' in like_source
+
+
+def test_qzone_comment_renders_card_with_comment_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        def is_admin(self):
+            return True
+
+        def stop_event(self):
+            pass
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _Controller:
+        async def comment_post(self, *, hostuin: int, fid: str, content: str):
+            captured["comment"] = (hostuin, fid, content)
+            return {"ok": True}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=[])
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="原文", nickname="自己", local_id=1)
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_detail(*args, **kwargs):
+        return post
+
+    async def fake_yield_cards(event, selected_posts, fallback_text, **kwargs):
+        captured["cards"] = (selected_posts, fallback_text, kwargs)
+        yield {"type": "image", "path": str(tmp_path / "qzone-comment-card.png")}
+
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._post_from_detail_target = fake_detail
+    plugin._yield_post_card_results = fake_yield_cards
+
+    async def collect_results():
+        results = []
+        async for item in plugin.qzone_comment(_Event(), 12345, "fid-1", "评论内容"):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["comment"] == (12345, "fid-1", "评论内容")
+    assert captured["cards"][0] == [post]
+    assert captured["cards"][2]["comment_texts"] == {id(post): "评论内容"}
+    assert results[0]["type"] == "plain"
+    assert results[1] == {"type": "image", "path": str(tmp_path / "qzone-comment-card.png")}
 
 
 def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

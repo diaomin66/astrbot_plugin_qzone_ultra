@@ -496,7 +496,10 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             continue
         _verify_local_qzone_bridge_module(module_name, package_root)
         for attribute in attributes:
-            if getattr(module, attribute, None) is None:
+            value = getattr(module, attribute, None)
+            if value is None:
+                return False
+            if attribute == "SUPPORTS_COMMENT_RESULT_SECTIONS" and value is not True:
                 return False
 
     contract_class_attributes = {
@@ -3218,6 +3221,7 @@ class QzoneStablePlugin(Star):
                 [post],
                 post.detail_text(1),
                 fallback_when_unrendered=False,
+                comment_texts={id(post): content},
             ):
                 yield result
 
