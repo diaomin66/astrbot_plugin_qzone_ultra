@@ -235,6 +235,7 @@ def test_cookie_backed_read_and_write_entrypoints_require_admin(monkeypatch: pyt
     main = _import_main_with_stubs(monkeypatch)
     methods = [
         "view_feed",
+        "read_feed",
         "comment_feed",
         "like_feed",
         "reply_comment",
@@ -529,6 +530,7 @@ def test_qzone_commands_render_post_cards(monkeypatch: pytest.MonkeyPatch) -> No
     main = _import_main_with_stubs(monkeypatch)
     expected_helpers = {
         "view_feed": "_yield_post_card_results",
+        "read_feed": "_yield_post_card_results",
         "comment_feed": "_yield_post_card_results",
         "like_feed": "_yield_post_card_results",
         "qzone_feed": "_yield_post_card_results",
@@ -583,7 +585,8 @@ def test_render_feed_card_limit_is_loaded_from_config() -> None:
 
 
 def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number() -> None:
-    from qzone_bridge.social import QzonePost, extract_nickname
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import QzoneComment, QzonePost, extract_nickname, post_from_entry
 
     raw = {
         "userinfo": {"uin": 22222, "nickname": "错误昵称"},
@@ -596,6 +599,33 @@ def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number()
     text = post.brief(1)
     assert "12345" not in text
     assert "QQ 空间用户" in text
+
+    nested_owner = {
+        "cell_userinfo": {
+            "12345": {"uin": 12345, "nick": "实际昵称"},
+            "22222": {"uin": 22222, "nick": "别人昵称"},
+        }
+    }
+    assert extract_nickname(nested_owner, hostuin=12345) == "实际昵称"
+    assert extract_nickname({"cellUserInfo": {"12345": {"nick": "驼峰昵称"}}}, hostuin=12345) == "驼峰昵称"
+    assert extract_nickname({"userMap": {"12345": {"nickname": "映射昵称"}}}, hostuin=12345) == "映射昵称"
+    assert extract_nickname({"profileMap": [{"nickname": "评论者"}, {"uin": 12345, "nickname": "主人"}]}, hostuin=12345) == "主人"
+    assert extract_nickname({"users": [{"nickname": "评论者"}, {"uin": 22222, "nickname": "别人"}]}, hostuin=12345) == ""
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-2",
+        appid=311,
+        summary="详情里没有昵称，但列表 raw 里有",
+        nickname="12345",
+        raw=nested_owner,
+    )
+    detailed = post_from_entry(entry, detail={"content": "detail payload without owner nickname"}, local_id=1)
+    assert detailed.nickname == "实际昵称"
+
+    comment_text = QzoneComment(commentid="c1", uin=22334455, nickname="", content="空昵称评论").brief(1)
+    assert "22334455" not in comment_text
+    assert "QQ 空间用户" in comment_text
 
 
 def test_post_render_profile_keeps_nickname_without_social_extractor(
@@ -611,7 +641,7 @@ def test_post_render_profile_keeps_nickname_without_social_extractor(
         hostuin=12345,
         fid="fid-1",
         nickname="12345",
-        raw={"owner": {"uin": 12345, "nickname": "正确昵称"}},
+        raw={"cell_userinfo": {"12345": {"nick": "正确昵称"}}},
         local_id=1,
     )
 
@@ -690,6 +720,122 @@ def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.Mo
     assert captured["post_kwargs"]["with_detail"] is True
     assert captured["comment"] == ("fid-1", "已经看到啦", False)
     assert results == [{"type": "plain", "text": "已评论第 1 条：已经看到啦"}]
+
+
+@pytest.mark.parametrize(
+    ("message_str", "expected_start", "expected_end"),
+    [
+        ("读说说 1~2", 1, 2),
+        ("/读说说：1", 1, 1),
+        ("／读说说 2", 2, 2),
+        ("1~2", 1, 2),
+    ],
+)
+def test_read_feed_command_renders_cards_without_commenting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    message_str: str,
+    expected_start: int,
+    expected_end: int,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = ""
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _PostService:
+        async def comment_post(self, post, content, *, private=False):
+            raise AssertionError("读说说 should not publish comments")
+
+        async def like_post(self, post):
+            raise AssertionError("读说说 should not like posts")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        like_when_comment=True,
+        max_feed_limit=20,
+        render_publish_result=True,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    posts = [
+        main.QzonePost(hostuin=10001, fid="fid-1", summary="第一条", nickname="阿一", local_id=1),
+        main.QzonePost(hostuin=10002, fid="fid-2", summary="第二条", nickname="阿二", local_id=2),
+    ]
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        captured["selection"] = selection
+        captured["post_kwargs"] = kwargs
+        return posts
+
+    async def fake_yield_cards(event, selected_posts, fallback_text, **kwargs):
+        captured["cards"] = (selected_posts, fallback_text, kwargs)
+        yield {"type": "image", "path": str(tmp_path / "read-cards.png")}
+
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+    plugin._post_service = lambda: _PostService()
+    plugin._yield_post_card_results = fake_yield_cards
+
+    async def collect_results():
+        results = []
+        event = _Event()
+        event.message_str = message_str
+        async for item in plugin.read_feed(event):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    selection = captured["selection"]
+    assert selection.start == expected_start
+    assert selection.end == expected_end
+    assert captured["post_kwargs"]["no_commented"] is False
+    assert captured["post_kwargs"]["no_self"] is False
+    assert captured["post_kwargs"]["with_detail"] is True
+    assert captured["cards"][0] == posts
+    assert captured["cards"][2] == {}
+    assert results == [{"type": "image", "path": str(tmp_path / "read-cards.png")}]
+
+
+def test_read_feed_requires_admin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Event:
+        message_str = "读说说 1"
+
+        def is_admin(self):
+            return False
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=[])
+    plugin.data_dir = tmp_path
+
+    async def collect_results():
+        results = []
+        async for item in plugin.read_feed(_Event()):
+            results.append(item)
+        return results
+
+    assert asyncio.run(collect_results()) == [{"type": "plain", "text": "只有管理员可以查看说说。"}]
 
 
 def test_empty_manual_comment_feed_keeps_auto_comment_safety_filters(

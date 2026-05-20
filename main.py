@@ -2543,7 +2543,30 @@ class QzoneStablePlugin(Star):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("评说说", alias={"评论说说", "读说说"})
+    @filter.command("读说说")
+    async def read_feed(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = self._selection_for_event(event, ("读说说",))
+            posts = await self._posts_for_selection(
+                selection,
+                with_detail=True,
+                no_commented=False,
+                no_self=False,
+                login_uin=self._self_id(event),
+            )
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("评说说", alias={"评论说说"})
     async def comment_feed(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以评论。")
@@ -2551,7 +2574,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            selection = self._selection_for_event(event, ("评说说", "评论说说", "读说说"))
+            selection = self._selection_for_event(event, ("评说说", "评论说说"))
             use_safety_filters = not _selection_has_explicit_input(selection)
             posts = await self._posts_for_selection(
                 selection,
@@ -2956,7 +2979,8 @@ class QzoneStablePlugin(Star):
                 "序号从 1 开始；最新/0 表示最新一条，支持 1~3、@用户 2。",
                 "查看访客",
                 "看说说/查看说说 [@用户] [序号/范围]",
-                "评说说/评论说说/读说说 [@用户] [序号/范围] [评论内容]",
+                "读说说 [@用户] [序号/范围]",
+                "评说说/评论说说 [@用户] [序号/范围] [评论内容]",
                 "赞说说 [@用户] [序号/范围]",
                 "发说说 <内容> [图片]",
                 "写说说/写稿 <主题> [图片]",

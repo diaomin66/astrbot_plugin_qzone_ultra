@@ -35,6 +35,15 @@ NICKNAME_CONTAINER_KEYS = (
     "profile",
     "blogInfo",
     "cell_userinfo",
+    "cellUserInfo",
+)
+NICKNAME_COLLECTION_KEYS = (
+    "users",
+    "userlist",
+    "userList",
+    "userMap",
+    "uinMap",
+    "profileMap",
 )
 USER_ID_KEYS = ("uin", "hostuin", "hostUin", "user_id", "userId", "qq", "uinnum")
 NESTED_NICKNAME_PATHS = (
@@ -42,11 +51,23 @@ NESTED_NICKNAME_PATHS = (
     ("data", "userInfo"),
     ("data", "user"),
     ("data", "owner"),
+    ("data", "cell_userinfo"),
+    ("data", "cellUserInfo"),
     ("data", "feed", "userinfo"),
+    ("data", "feed", "user"),
+    ("data", "feed", "owner"),
+    ("data", "feed", "cell_userinfo"),
+    ("data", "feed", "cellUserInfo"),
     ("feed", "userinfo"),
     ("feed", "user"),
+    ("feed", "owner"),
+    ("feed", "cell_userinfo"),
+    ("feed", "cellUserInfo"),
     ("entry", "userinfo"),
     ("entry", "user"),
+    ("entry", "owner"),
+    ("entry", "cell_userinfo"),
+    ("entry", "cellUserInfo"),
 )
 
 
@@ -92,6 +113,30 @@ def _iter_mappings(value: Any):
                 yield item
 
 
+def _iter_nickname_mappings(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for key, item in value.items():
+            if isinstance(item, dict):
+                candidate = item
+                key_text = str(key)
+                if key_text.isdigit() and not _mapping_uin(candidate):
+                    candidate = dict(item)
+                    candidate["uin"] = int(key_text)
+                if key_text.isdigit() or any(
+                    marker in candidate for marker in (*NICKNAME_KEYS, *USER_ID_KEYS, *NICKNAME_CONTAINER_KEYS)
+                ):
+                    yield candidate
+            elif isinstance(item, list):
+                for nested in item:
+                    if isinstance(nested, dict):
+                        yield nested
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+
+
 def _nested_mapping(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
     current: Any = raw
     for key in keys:
@@ -101,13 +146,33 @@ def _nested_mapping(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
     return current if isinstance(current, dict) else {}
 
 
-def _first_nickname(raw: dict[str, Any], *, hostuin: int = 0) -> str:
+def _first_nickname(
+    raw: dict[str, Any],
+    *,
+    hostuin: int = 0,
+    depth: int = 2,
+    require_owner: bool = False,
+) -> str:
+    if require_owner and hostuin and not _mapping_uin(raw):
+        return ""
     if not _owner_matches(raw, hostuin=hostuin):
         return ""
     for key in NICKNAME_KEYS:
         nickname = clean_nickname(raw.get(key), hostuin=hostuin)
         if nickname:
             return nickname
+    if depth <= 0:
+        return ""
+    for key in NICKNAME_CONTAINER_KEYS:
+        for item in _iter_nickname_mappings(raw.get(key)):
+            nickname = _first_nickname(item, hostuin=hostuin, depth=depth - 1)
+            if nickname:
+                return nickname
+    for key in NICKNAME_COLLECTION_KEYS:
+        for item in _iter_nickname_mappings(raw.get(key)):
+            nickname = _first_nickname(item, hostuin=hostuin, depth=depth - 1, require_owner=True)
+            if nickname:
+                return nickname
     return ""
 
 
@@ -115,14 +180,21 @@ def fallback_extract_nickname(raw: dict[str, Any] | None, *, hostuin: int = 0) -
     if not isinstance(raw, dict):
         return ""
     for key in NICKNAME_CONTAINER_KEYS:
-        for item in _iter_mappings(raw.get(key)):
+        for item in _iter_nickname_mappings(raw.get(key)):
             nickname = _first_nickname(item, hostuin=hostuin)
             if nickname:
                 return nickname
+    for key in NICKNAME_COLLECTION_KEYS:
+        for item in _iter_nickname_mappings(raw.get(key)):
+            nickname = _first_nickname(item, hostuin=hostuin, require_owner=True)
+            if nickname:
+                return nickname
     for path in NESTED_NICKNAME_PATHS:
-        nickname = _first_nickname(_nested_mapping(raw, *path), hostuin=hostuin)
-        if nickname:
-            return nickname
+        require_owner = path[-1] in NICKNAME_COLLECTION_KEYS
+        for item in _iter_nickname_mappings(_nested_mapping(raw, *path)):
+            nickname = _first_nickname(item, hostuin=hostuin, require_owner=require_owner)
+            if nickname:
+                return nickname
     return _first_nickname(raw, hostuin=hostuin)
 
 
