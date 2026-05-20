@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -560,7 +561,7 @@ from qzone_bridge.render import (
 from qzone_bridge.scheduler import cron_delay_seconds
 from qzone_bridge.selection import PostSelection, parse_post_selection, selection_from_tool_args
 from qzone_bridge.settings import PluginSettings
-from qzone_bridge.social import QzoneComment, QzonePost, post_from_entry
+from qzone_bridge.social import QzoneComment, QzonePost, extract_nickname, post_from_entry
 from qzone_bridge.utils import truncate
 
 
@@ -911,6 +912,14 @@ class QzoneStablePlugin(Star):
         return max(1, min(limit, self.settings.max_feed_limit))
 
     @staticmethod
+    def _post_display_nickname(post: QzonePost) -> str:
+        hostuin = int(post.hostuin or 0)
+        nickname = extract_nickname({"nickname": post.nickname}, hostuin=hostuin)
+        if not nickname:
+            nickname = extract_nickname(post.raw, hostuin=hostuin)
+        return nickname or "QQ 空间用户"
+
+    @staticmethod
     def _post_time_text(post: QzonePost) -> str:
         created_at = int(post.created_at or 0)
         if created_at <= 0:
@@ -925,11 +934,8 @@ class QzoneStablePlugin(Star):
 
     def _post_render_profile(self, post: QzonePost) -> RenderProfile:
         user_id = str(post.hostuin or "")
-        nickname = post.nickname or user_id or "QQ Space"
-        if post.local_id:
-            nickname = f"{post.local_id}. {nickname}"
         return RenderProfile(
-            nickname=nickname,
+            nickname=self._post_display_nickname(post),
             user_id=user_id,
             avatar_source=self._qlogo_url(post.hostuin, 640) if post.hostuin else "",
             time_text=self._post_time_text(post),
@@ -961,6 +967,65 @@ class QzoneStablePlugin(Star):
             logger.exception("qzone post card render failed: %s", exc)
             return None
 
+    async def _render_qzone_post_cards(self, posts: list[QzonePost]) -> list[Path]:
+        if not posts:
+            return []
+        if len(posts) == 1:
+            path = await self._render_qzone_post_card(posts[0])
+            return [path] if path is not None else []
+
+        semaphore = asyncio.Semaphore(min(3, len(posts)))
+
+        async def render_one(post: QzonePost) -> Path | None:
+            async with semaphore:
+                return await self._render_qzone_post_card(post)
+
+        rendered = await asyncio.gather(*(render_one(post) for post in posts))
+        return [path for path in rendered if path is not None]
+
+    @staticmethod
+    def _combine_qzone_post_card_images(paths: list[Path], output_dir: Path) -> Path | None:
+        if not paths:
+            return None
+        if len(paths) == 1:
+            return paths[0]
+        try:
+            from PIL import Image, UnidentifiedImageError
+        except Exception:
+            return None
+
+        images = []
+        try:
+            for path in paths:
+                try:
+                    with Image.open(path) as opened:
+                        image = opened.convert("RGB")
+                        images.append(image.copy())
+                except (OSError, UnidentifiedImageError):
+                    return None
+            if not images:
+                return None
+            width = max(image.width for image in images)
+            gap = max(12, min(32, width // 40))
+            height = sum(image.height for image in images) + gap * (len(images) - 1)
+            canvas = Image.new("RGB", (width, height), (255, 255, 255))
+            y = 0
+            for image in images:
+                canvas.paste(image, ((width - image.width) // 2, y))
+                y += image.height + gap
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}_cards.png"
+            canvas.save(output_path, "PNG", optimize=False, compress_level=1)
+            return output_path
+        except Exception:
+            return None
+        finally:
+            for image in images:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
     async def _post_card_results(
         self,
         event: AstrMessageEvent,
@@ -980,10 +1045,20 @@ class QzoneStablePlugin(Star):
 
         results: list[Any] = []
         limit = self._post_render_limit()
-        for post in posts[:limit]:
-            image_path = await self._render_qzone_post_card(post)
-            if image_path is None:
-                continue
+        image_paths = await self._render_qzone_post_cards(posts[:limit])
+        if len(image_paths) > 1:
+            try:
+                combined_path = await asyncio.to_thread(
+                    self._combine_qzone_post_card_images,
+                    image_paths,
+                    self.data_dir / "rendered_posts",
+                )
+            except Exception as exc:
+                logger.exception("qzone post card merge failed: %s", exc)
+                combined_path = None
+            if combined_path is not None:
+                image_paths = [combined_path]
+        for image_path in image_paths:
             self._stop_event(event)
             results.append(image_result(str(image_path)))
 
@@ -2085,7 +2160,7 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, text.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
-            await self._notify_admin_post_card(None, post, f"定时自动评论了 {post.nickname or post.hostuin} 的说说：{truncate(text, 60)}")
+            await self._notify_admin_post_card(None, post, f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(text, 60)}")
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
             break
@@ -2271,7 +2346,7 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
-            await self._notify_admin_post_card(event, post, f"已自动评论 {post.nickname or post.hostuin} 的说说：{truncate(content, 60)}")
+            await self._notify_admin_post_card(event, post, f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(content, 60)}")
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 
@@ -2316,12 +2391,12 @@ class QzoneStablePlugin(Star):
             posts = await self._posts_for_selection(
                 selection,
                 with_detail=True,
-                no_commented=True,
-                no_self=True,
+                no_commented=False,
+                no_self=False,
                 login_uin=self._self_id(event),
             )
             if not posts:
-                yield self._command_result(event, "没有找到适合评论的说说。")
+                yield self._command_result(event, "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。")
                 return
             lines: list[str] = []
             for post in posts:
