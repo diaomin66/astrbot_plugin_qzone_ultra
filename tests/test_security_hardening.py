@@ -11,7 +11,7 @@ import pytest
 
 from qzone_bridge.client import QzoneClient
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import QzoneParseError, QzoneRequestError
+from qzone_bridge.errors import QzoneBridgeError, QzoneParseError, QzoneRequestError
 from qzone_bridge.models import SessionState
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge import source_policy
@@ -465,9 +465,23 @@ def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path
 
     with Image.open(base) as base_image, Image.open(commented) as commented_image:
         assert commented_image.height > base_image.height
-        pixels = commented_image.getdata()
-        assert (248, 249, 250) in pixels
-        assert (69, 112, 203) in pixels
+        bg_coords = [
+            (x, y)
+            for y in range(commented_image.height)
+            for x in range(commented_image.width)
+            if commented_image.getpixel((x, y)) == (248, 249, 250)
+        ]
+        accent_coords = [
+            (x, y)
+            for y in range(commented_image.height)
+            for x in range(commented_image.width)
+            if commented_image.getpixel((x, y)) == (69, 112, 203)
+        ]
+        assert bg_coords
+        assert accent_coords
+        assert min(y for _x, y in bg_coords) > base_image.height // 2
+        assert max(y for _x, y in accent_coords) - min(y for _x, y in accent_coords) > 30
+        assert min(x for x, _y in accent_coords) < commented_image.width // 10
 
 
 def test_qzone_post_card_range_combines_when_renderer_combiner_is_missing(
@@ -678,6 +692,27 @@ def test_default_feed_page_owner_context_fills_missing_nickname() -> None:
     assert len(entries) == 1
     assert entries[0].hostuin == 12345
     assert entries[0].nickname == "默认昵称"
+
+
+def test_default_feed_page_skips_numeric_info_nickname_for_owner_context() -> None:
+    from qzone_bridge.parser import extract_feed_page
+
+    payload = {
+        "info": {"uin": 12345, "nickname": "12345"},
+        "ownerInfo": {"uin": 12345, "nickname": "真实昵称"},
+        "feedpage": {
+            "vFeeds": [
+                {
+                    "fid": "fid-default",
+                    "summary": {"summary": "默认读说说不能把 QQ 号当昵称"},
+                }
+            ]
+        },
+    }
+    _feedpage, entries = extract_feed_page(payload, default_hostuin=12345)
+
+    assert len(entries) == 1
+    assert entries[0].nickname == "真实昵称"
 
 
 def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
@@ -893,6 +928,156 @@ def test_manual_comment_feed_renders_card_with_comment_text(
     assert captured["render_result"]["comment"] == "已经看到啦"
     assert results[0] == {"type": "image", "path": str(tmp_path / "rendered_posts" / "comment-card.png")}
     assert results[1] == {"type": "plain", "text": "已评论第 1 条：已经看到啦"}
+
+
+@pytest.mark.parametrize("render_fails", [False, True])
+def test_manual_comment_feed_returns_text_when_card_rendering_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    render_fails: bool,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Event:
+        message_str = "评说说 1 已经看到啦"
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def stop_event(self):
+            pass
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+        if render_fails:
+            def image_result(self, path: str):
+                return {"type": "image", "path": path}
+
+    class _PostService:
+        async def comment_post(self, post, content, *, private=False):
+            return {"ok": True}
+
+        async def like_post(self, post):
+            return {"ok": True}
+
+    def broken_render(*args, **kwargs):
+        raise RuntimeError("render failed")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        like_when_comment=False,
+        max_feed_limit=20,
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="自己的说说", nickname="自己", local_id=1)
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        return [post]
+
+    if render_fails:
+        monkeypatch.setattr(main, "render_publish_result_image", broken_render)
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+    plugin._post_service = lambda: _PostService()
+
+    async def collect_results():
+        results = []
+        async for item in plugin.comment_feed(_Event()):
+            results.append(item)
+        return results
+
+    assert asyncio.run(collect_results()) == [{"type": "plain", "text": "已评论第 1 条：已经看到啦"}]
+
+
+def test_manual_comment_feed_preserves_successful_cards_when_later_comment_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "评说说 1~2 已经看到啦"
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def stop_event(self):
+            pass
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _PostService:
+        async def comment_post(self, post, content, *, private=False):
+            if post.local_id == 2:
+                raise QzoneBridgeError("评论失败")
+            return {"ok": True}
+
+        async def like_post(self, post):
+            return {"ok": True}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        like_when_comment=False,
+        max_feed_limit=20,
+        render_publish_result=True,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    posts = [
+        main.QzonePost(hostuin=12345, fid="fid-1", summary="第一条", nickname="自己", local_id=1),
+        main.QzonePost(hostuin=12345, fid="fid-2", summary="第二条", nickname="自己", local_id=2),
+    ]
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        return posts
+
+    async def fake_yield_cards(event, selected_posts, fallback_text, **kwargs):
+        captured["cards"] = (selected_posts, fallback_text, kwargs)
+        yield {"type": "image", "path": str(tmp_path / "partial-comment-card.png")}
+
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+    plugin._post_service = lambda: _PostService()
+    plugin._yield_post_card_results = fake_yield_cards
+
+    async def collect_results():
+        results = []
+        async for item in plugin.comment_feed(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["cards"][0] == [posts[0]]
+    assert captured["cards"][2]["comment_texts"] == {id(posts[0]): "已经看到啦"}
+    assert results[0] == {"type": "image", "path": str(tmp_path / "partial-comment-card.png")}
+    assert results[1]["type"] == "plain"
+    assert "已评论第 1 条：已经看到啦" in results[1]["text"]
+    assert "第 2 条评论失败：评论失败" in results[1]["text"]
 
 
 @pytest.mark.parametrize(

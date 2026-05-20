@@ -2607,29 +2607,41 @@ class QzoneStablePlugin(Star):
             if not posts:
                 yield self._command_result(event, "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。")
                 return
-            lines: list[str] = []
-            comment_texts: dict[int, str] = {}
-            for post in posts:
-                content = selection.comment_text or await self._generate_comment_text(event, post)
-                if not content.strip():
-                    content = "挺有意思的。"
-                await self._post_service().comment_post(post, content)
-                if self.settings.like_when_comment:
-                    await self._post_service().like_post(post)
-                comment_texts[id(post)] = content
-                lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
+
+        lines: list[str] = []
+        error_lines: list[str] = []
+        comment_texts: dict[int, str] = {}
+        commented_posts: list[QzonePost] = []
+        for post in posts:
+            content = selection.comment_text or await self._generate_comment_text(event, post)
+            if not content.strip():
+                content = "挺有意思的。"
+            try:
+                await self._post_service().comment_post(post, content)
+            except QzoneBridgeError as exc:
+                error_lines.append(f"第 {post.local_id} 条评论失败：{self._error_text(exc)}")
+                continue
+            if self.settings.like_when_comment:
+                try:
+                    await self._post_service().like_post(post)
+                except QzoneBridgeError as exc:
+                    error_lines.append(f"第 {post.local_id} 条已评论，但点赞失败：{self._error_text(exc)}")
+            comment_texts[id(post)] = content
+            commented_posts.append(post)
+            lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
+
         async for result in self._yield_post_card_results(
             event,
-            posts,
-            self._format_posts(posts, detail=True),
+            commented_posts,
+            self._format_posts(commented_posts, detail=True),
             fallback_when_unrendered=False,
             comment_texts=comment_texts,
         ):
             yield result
-        yield self._command_result(event, "\n".join(lines))
+        yield self._command_result(event, "\n".join([*lines, *error_lines]))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("赞说说")
