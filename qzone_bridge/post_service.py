@@ -50,6 +50,7 @@ class QzonePostService:
 
     async def _detail_post(self, entry: FeedEntry, *, local_id: int, required: bool) -> QzonePost:
         detail_payload: dict[str, Any] | None = None
+        feed_entry = entry
         try:
             detail_payload = await self.controller.detail_feed(
                 hostuin=entry.hostuin,
@@ -60,13 +61,20 @@ class QzonePostService:
             if isinstance(entry_data, dict):
                 detail_entry = FeedEntry(**entry_data)
                 if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
+                    if not detail_entry.nickname:
+                        detail_entry.nickname = entry.nickname
                     entry = detail_entry
         except Exception:
             if required:
                 raise
             log.debug("qzone detail fetch for post operation failed", exc_info=True)
 
-        post = post_from_entry(entry, detail=(detail_payload or {}).get("raw"), local_id=local_id)
+        post = post_from_entry(
+            entry,
+            detail=(detail_payload or {}).get("raw"),
+            local_id=local_id,
+            fallback_raw=feed_entry.raw,
+        )
         if detail_payload and detail_payload.get("comments"):
             post.comments = self._comments_from_detail(detail_payload)
             post.comment_count = max(post.comment_count, len(post.comments))

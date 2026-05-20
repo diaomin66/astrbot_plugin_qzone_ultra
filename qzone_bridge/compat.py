@@ -36,6 +36,7 @@ NICKNAME_CONTAINER_KEYS = (
     "blogInfo",
     "cell_userinfo",
     "cellUserInfo",
+    "_feed_raw",
 )
 NICKNAME_COLLECTION_KEYS = (
     "users",

@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from .models import FeedEntry
+from .social import extract_nickname
 from .utils import entire_closing, extract_scripts, firstn, gtk, json_loads, truncate
 
 
@@ -104,6 +105,17 @@ def _bool(value: Any, default: bool = False) -> bool:
         if normalized in {"0", "false", "no", "n", ""}:
             return False
     return bool(value)
+
+
+def _clean_nickname_text(value: Any, *, hostuin: int = 0) -> str:
+    text = _html_to_text(value).strip()
+    if not text:
+        return ""
+    if hostuin and text == str(hostuin):
+        return ""
+    if re.fullmatch(r"\d{5,}", text):
+        return ""
+    return text
 
 
 def parse_cookie_text(cookie_text: str) -> dict[str, str]:
@@ -334,7 +346,33 @@ def extract_summary_text(feed_item: dict[str, Any]) -> str:
     return ""
 
 
-def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -> FeedEntry:
+def _context_owner_nickname(context: Any, *, hostuin: int = 0) -> str:
+    if not isinstance(context, dict):
+        return ""
+    nickname = extract_nickname(context, hostuin=hostuin)
+    if nickname:
+        return nickname
+    for key in ("payload", "feedpage", "data", "main"):
+        value = context.get(key)
+        if isinstance(value, dict):
+            nickname = _context_owner_nickname(value, hostuin=hostuin)
+            if nickname:
+                return nickname
+    for key in ("info", "ownerInfo", "hostInfo", "profileInfo", "profile", "owner"):
+        value = context.get(key)
+        if isinstance(value, dict):
+            nickname = extract_nickname({"owner": value}, hostuin=hostuin)
+            if nickname:
+                return nickname
+    return ""
+
+
+def extract_feed_entry(
+    feed_item: dict[str, Any],
+    *,
+    default_hostuin: int = 0,
+    nickname_context: dict[str, Any] | None = None,
+) -> FeedEntry:
     common = feed_item.get("common") or feed_item.get("cell_comm") or {}
     if not isinstance(common, dict):
         common = {}
@@ -385,12 +423,18 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
         or compute_unikey(appid, hostuin, fid)
     )
     topic = topic_id(appid, hostuin, fid, created_at)
-    nickname = str(
+    direct_nickname = _clean_nickname_text(
         feed_item.get("name")
         or feed_item.get("nickname")
         or userinfo.get("nickname")
         or userinfo.get("name")
-        or ""
+        or "",
+        hostuin=hostuin,
+    )
+    nickname = (
+        extract_nickname(feed_item, hostuin=hostuin)
+        or direct_nickname
+        or _context_owner_nickname(nickname_context, hostuin=hostuin)
     )
     like_count = _int(
         like.get("num")
@@ -499,12 +543,14 @@ def feed_page_cursor(feedpage: dict[str, Any]) -> str:
 
 
 def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> tuple[dict[str, Any], list[FeedEntry]]:
+    source_payload = payload if isinstance(payload, dict) else {}
     feedpage = normalize_feed_page(payload)
     if not isinstance(feedpage, dict):
         return {}, []
+    nickname_context = {"payload": source_payload, "feedpage": feedpage}
     raw_feeds = extract_raw_feeds(feedpage)
     items = [
-        extract_feed_entry(item, default_hostuin=default_hostuin)
+        extract_feed_entry(item, default_hostuin=default_hostuin, nickname_context=nickname_context)
         for item in raw_feeds
         if isinstance(item, dict)
     ]

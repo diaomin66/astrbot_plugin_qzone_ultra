@@ -23,6 +23,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from .media import PostMedia, PostPayload, source_name
 from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
+from .utils import truncate
 
 
 WHITE = (255, 255, 255)
@@ -31,6 +32,8 @@ MUTED = (96, 104, 112)
 LINE = (226, 226, 226)
 ACTION = (24, 24, 24)
 CARD_BG = (250, 250, 250)
+COMMENT_BG = (248, 249, 250)
+COMMENT_ACCENT = (69, 112, 203)
 FILE_COLORS = {
     ".pdf": (216, 74, 64),
     ".doc": (64, 112, 205),
@@ -88,6 +91,22 @@ class _ImagePreview:
     media: PostMedia
     image: Image.Image | None
     failed: bool = False
+
+
+@dataclass(slots=True)
+class _CommentSection:
+    font: ImageFont.ImageFont
+    label_font: ImageFont.ImageFont
+    lines: list[str]
+    height: int
+    box_height: int
+    pad_x: int
+    pad_y: int
+    divider_gap_top: int
+    divider_gap_bottom: int
+    label_gap: int
+    line_height: int
+    label_height: int
 
 
 def preload_static_render_assets() -> None:
@@ -249,6 +268,8 @@ def render_publish_result_image(
     render_scale = RENDER_SCALE
     scratch = ImageDraw.Draw(Image.new("RGB", (1, 1), WHITE))
     content_text = _render_content_text(post)
+    comment_text = _comment_text_from_result(result)
+    layout_text = content_text if not comment_text else f"{content_text}\n评论：{comment_text}"
     requested_width = int(width or 900)
     if fixed_width:
         logical_width = _fixed_logical_width(requested_width)
@@ -257,7 +278,7 @@ def render_publish_result_image(
             post,
             requested_width,
             scratch,
-            content_text,
+            layout_text,
             scale=render_scale,
         )
     width = _scale_px(logical_width, render_scale)
@@ -308,6 +329,15 @@ def render_publish_result_image(
         y += image_height + block_gap
     if attachment_height:
         y += attachment_height + block_gap
+    comment_section = _comment_section_layout(
+        scratch,
+        comment_text,
+        content_width,
+        dense_layout=dense_layout,
+        scale=render_scale,
+    )
+    if comment_section is not None:
+        y += comment_section.height + block_gap
     action_strip = _action_strip(
         _action_strip_render_width(logical_width, dense_layout=dense_layout, scale=render_scale)
     )
@@ -350,6 +380,9 @@ def render_publish_result_image(
             scale=render_scale,
         )
         y += attachment_height + block_gap
+    if comment_section is not None:
+        _draw_comment_section(draw, margin, y, content_width, comment_section, scale=render_scale)
+        y += comment_section.height + block_gap
 
     actions_y = y + action_gap
     _draw_actions(image, width, actions_y, strip=action_strip, scale=render_scale)
@@ -427,6 +460,16 @@ def combine_rendered_post_cards(
 
 def _render_content_text(post: PostPayload) -> str:
     return str(post.content or "").strip()
+
+
+def _comment_text_from_result(result: dict[str, Any] | None) -> str:
+    if not isinstance(result, dict):
+        return ""
+    value = result.get("comment")
+    if value in (None, ""):
+        value = result.get("comment_text")
+    text = str(value or "").strip()
+    return truncate(text, 260) if text else ""
 
 
 def _scale_px(value: int | float, scale: int = RENDER_SCALE) -> int:
@@ -619,6 +662,79 @@ def _truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Ima
             break
         current += char
     return (current.rstrip() + suffix) if current else suffix
+
+
+def _comment_section_layout(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    content_width: int,
+    *,
+    dense_layout: bool,
+    scale: int = RENDER_SCALE,
+) -> _CommentSection | None:
+    text = str(text or "").strip()
+    if not text:
+        return None
+
+    font = _font(_scale_px(22 if dense_layout else 23, scale))
+    label_font = _font(_scale_px(18 if dense_layout else 19, scale), bold=True)
+    pad_x = _scale_px(16 if dense_layout else 18, scale)
+    pad_y = _scale_px(11 if dense_layout else 13, scale)
+    divider_gap_top = _scale_px(4 if dense_layout else 6, scale)
+    divider_gap_bottom = _scale_px(12 if dense_layout else 14, scale)
+    label_gap = _scale_px(7, scale)
+    line_height = _line_height(draw, font, 1.22)
+    label_height = _line_height(draw, label_font, 1.0)
+    lines = _wrap_text(draw, text, font, max(1, content_width - pad_x * 2))
+    body_height = max(line_height, len(lines) * line_height)
+    box_height = pad_y * 2 + label_height + label_gap + body_height
+    height = divider_gap_top + _scale_px(1, scale) + divider_gap_bottom + box_height
+    return _CommentSection(
+        font=font,
+        label_font=label_font,
+        lines=lines,
+        height=height,
+        box_height=box_height,
+        pad_x=pad_x,
+        pad_y=pad_y,
+        divider_gap_top=divider_gap_top,
+        divider_gap_bottom=divider_gap_bottom,
+        label_gap=label_gap,
+        line_height=line_height,
+        label_height=label_height,
+    )
+
+
+def _draw_comment_section(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    section: _CommentSection,
+    *,
+    scale: int = RENDER_SCALE,
+) -> None:
+    divider_y = y + section.divider_gap_top
+    draw.line((x, divider_y, x + width, divider_y), fill=LINE, width=_scale_px(1, scale))
+
+    box_y = divider_y + _scale_px(1, scale) + section.divider_gap_bottom
+    box = (x, box_y, x + width, box_y + section.box_height)
+    draw.rounded_rectangle(box, radius=_scale_px(8, scale), fill=COMMENT_BG, outline=LINE, width=_scale_px(1, scale))
+    accent_width = _scale_px(4, scale)
+    accent_inset_y = _scale_px(1, scale)
+    draw.rounded_rectangle(
+        (x, box_y + accent_inset_y, x + accent_width, box_y + section.box_height - accent_inset_y),
+        radius=max(1, accent_width // 2),
+        fill=COMMENT_ACCENT,
+    )
+
+    text_x = x + section.pad_x
+    text_y = box_y + section.pad_y
+    _safe_text(draw, (text_x, text_y), "评论", section.label_font, MUTED)
+    body_y = text_y + section.label_height + section.label_gap
+    for line in section.lines:
+        _safe_text(draw, (text_x, body_y), line, section.font, TEXT)
+        body_y += section.line_height
 
 
 def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePreview:

@@ -37,6 +37,7 @@ NICKNAME_CONTAINER_KEYS = (
     "blogInfo",
     "cell_userinfo",
     "cellUserInfo",
+    "_feed_raw",
 )
 NICKNAME_COLLECTION_KEYS = (
     "users",
@@ -387,16 +388,27 @@ def extract_images(payload: dict[str, Any]) -> list[str]:
     return images
 
 
-def post_from_entry(entry: FeedEntry, *, detail: dict[str, Any] | None = None, local_id: int = 0) -> QzonePost:
+def post_from_entry(
+    entry: FeedEntry,
+    *,
+    detail: dict[str, Any] | None = None,
+    local_id: int = 0,
+    fallback_raw: dict[str, Any] | None = None,
+) -> QzonePost:
     entry_raw = entry.raw if isinstance(entry.raw, dict) else {}
     detail_raw = detail if isinstance(detail, dict) else {}
+    fallback = fallback_raw if isinstance(fallback_raw, dict) else {}
     raw = detail_raw or entry_raw
     comments = extract_comments(raw or {})
     nickname = (
         _clean_nickname(entry.nickname, hostuin=entry.hostuin)
         or extract_nickname(detail_raw, hostuin=entry.hostuin)
         or extract_nickname(entry_raw, hostuin=entry.hostuin)
+        or extract_nickname(fallback, hostuin=entry.hostuin)
     )
+    post_raw = dict(raw or {})
+    if fallback and fallback is not raw:
+        post_raw.setdefault("_feed_raw", fallback)
     return QzonePost(
         hostuin=entry.hostuin,
         fid=entry.fid,
@@ -411,5 +423,5 @@ def post_from_entry(entry: FeedEntry, *, detail: dict[str, Any] | None = None, l
         comments=comments,
         busi_param=dict(entry.busi_param or {}),
         local_id=local_id,
-        raw=dict(raw or {}),
+        raw=post_raw,
     )

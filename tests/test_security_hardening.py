@@ -439,6 +439,37 @@ def test_publish_renderer_fixed_width_keeps_range_cards_aligned(tmp_path: Path) 
         assert short_image.width == 720 * 3
 
 
+def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from qzone_bridge.media import PostPayload
+    from qzone_bridge.publish_renderer import RenderProfile, render_publish_result_image
+
+    base = render_publish_result_image(
+        PostPayload(content="原始说说内容", media=[]),
+        tmp_path,
+        profile=RenderProfile(nickname="阿一", time_text="12:34"),
+        width=720,
+        remote_timeout=0.01,
+        fixed_width=True,
+    )
+    commented = render_publish_result_image(
+        PostPayload(content="原始说说内容", media=[]),
+        tmp_path,
+        profile=RenderProfile(nickname="阿一", time_text="12:34"),
+        result={"comment": "这是一条和原文分开的评论内容"},
+        width=720,
+        remote_timeout=0.01,
+        fixed_width=True,
+    )
+
+    with Image.open(base) as base_image, Image.open(commented) as commented_image:
+        assert commented_image.height > base_image.height
+        pixels = commented_image.getdata()
+        assert (248, 249, 250) in pixels
+        assert (69, 112, 203) in pixels
+
+
 def test_qzone_post_card_range_combines_when_renderer_combiner_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -628,6 +659,61 @@ def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number()
     assert "QQ 空间用户" in comment_text
 
 
+def test_default_feed_page_owner_context_fills_missing_nickname() -> None:
+    from qzone_bridge.parser import extract_feed_page
+
+    payload = {
+        "info": {"uin": 12345, "nickname": "默认昵称"},
+        "feedpage": {
+            "vFeeds": [
+                {
+                    "fid": "fid-default",
+                    "summary": {"summary": "默认读说说应该有昵称"},
+                }
+            ]
+        },
+    }
+    _feedpage, entries = extract_feed_page(payload, default_hostuin=12345)
+
+    assert len(entries) == 1
+    assert entries[0].hostuin == 12345
+    assert entries[0].nickname == "默认昵称"
+
+
+def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.post_service import QzonePostService
+
+    class _Controller:
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {
+                "entry": {
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "appid": appid,
+                    "summary": "详情内容",
+                    "nickname": "",
+                    "raw": {"summary": "详情内容"},
+                },
+                "raw": {"summary": "详情内容"},
+                "comments": [],
+            }
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-default",
+        appid=311,
+        summary="列表内容",
+        raw={"owner": {"uin": 12345, "nickname": "列表昵称"}},
+    )
+    service = QzonePostService(_Controller(), types.SimpleNamespace(), max_feed_limit=20)
+
+    post = asyncio.run(service._detail_post(entry, local_id=1, required=True))
+
+    assert post.nickname == "列表昵称"
+    assert "QQ 空间用户" not in post.brief(1)
+
+
 def test_post_render_profile_keeps_nickname_without_social_extractor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -720,6 +806,93 @@ def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.Mo
     assert captured["post_kwargs"]["with_detail"] is True
     assert captured["comment"] == ("fid-1", "已经看到啦", False)
     assert results == [{"type": "plain", "text": "已评论第 1 条：已经看到啦"}]
+
+
+def test_manual_comment_feed_renders_card_with_comment_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "评说说 1 已经看到啦"
+        stopped = False
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def stop_event(self):
+            self.stopped = True
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _PostService:
+        async def comment_post(self, post, content, *, private=False):
+            captured["comment"] = (post.fid, content, private)
+            return {"ok": True}
+
+        async def like_post(self, post):
+            captured["liked"] = post.fid
+            return {"ok": True}
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "comment-card.png"
+        path.write_bytes(b"png")
+        captured["render_post"] = post
+        captured["render_result"] = result
+        captured["render_profile"] = profile
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        like_when_comment=False,
+        max_feed_limit=20,
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="自己的说说", nickname="自己", local_id=1)
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        captured["post_kwargs"] = kwargs
+        return [post]
+
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+    plugin._post_service = lambda: _PostService()
+
+    async def collect_results():
+        results = []
+        async for item in plugin.comment_feed(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    rendered_post = captured["render_post"]
+    assert captured["comment"] == ("fid-1", "已经看到啦", False)
+    assert rendered_post.content == "自己的说说"
+    assert captured["render_result"]["comment"] == "已经看到啦"
+    assert results[0] == {"type": "image", "path": str(tmp_path / "rendered_posts" / "comment-card.png")}
+    assert results[1] == {"type": "plain", "text": "已评论第 1 条：已经看到啦"}
 
 
 @pytest.mark.parametrize(

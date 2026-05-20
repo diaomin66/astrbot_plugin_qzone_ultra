@@ -1152,16 +1152,25 @@ class QzoneStablePlugin(Star):
         ]
         return PostPayload(content=(post.summary or "(空)").strip(), media=media)
 
-    async def _render_qzone_post_card(self, post: QzonePost, *, fixed_width: bool = False) -> Path | None:
+    async def _render_qzone_post_card(
+        self,
+        post: QzonePost,
+        *,
+        fixed_width: bool = False,
+        comment_text: str = "",
+    ) -> Path | None:
         if not self.settings.render_publish_result:
             return None
+        result: dict[str, Any] = {"ok": True, "tool": "qzone_post_card", "fid": post.fid}
+        if str(comment_text or "").strip():
+            result["comment"] = truncate(str(comment_text).strip(), 220)
         try:
             return await asyncio.to_thread(
                 _render_publish_result_image,
                 self._post_render_payload(post),
                 self.data_dir / "rendered_posts",
                 profile=self._post_render_profile(post),
-                result={"ok": True, "tool": "qzone_post_card", "fid": post.fid},
+                result=result,
                 width=self.settings.render_result_width,
                 remote_timeout=self.settings.render_remote_timeout,
                 fixed_width=fixed_width,
@@ -1170,18 +1179,27 @@ class QzoneStablePlugin(Star):
             logger.exception("qzone post card render failed: %s", exc)
             return None
 
-    async def _render_qzone_post_cards(self, posts: list[QzonePost]) -> list[Path]:
+    async def _render_qzone_post_cards(
+        self,
+        posts: list[QzonePost],
+        *,
+        comment_texts: dict[int, str] | None = None,
+    ) -> list[Path]:
         if not posts:
             return []
         if len(posts) == 1:
-            path = await self._render_qzone_post_card(posts[0])
+            path = await self._render_qzone_post_card(posts[0], comment_text=(comment_texts or {}).get(id(posts[0]), ""))
             return [path] if path is not None else []
 
         semaphore = asyncio.Semaphore(min(3, len(posts)))
 
         async def render_one(post: QzonePost) -> Path | None:
             async with semaphore:
-                return await self._render_qzone_post_card(post, fixed_width=True)
+                return await self._render_qzone_post_card(
+                    post,
+                    fixed_width=True,
+                    comment_text=(comment_texts or {}).get(id(post), ""),
+                )
 
         rendered = await asyncio.gather(*(render_one(post) for post in posts))
         return [path for path in rendered if path is not None]
@@ -1194,6 +1212,7 @@ class QzoneStablePlugin(Star):
         *,
         subdir: str = "posts",
         fallback_when_unrendered: bool = True,
+        comment_texts: dict[int, str] | None = None,
     ) -> list[Any]:
         if not posts:
             return [self._command_result(event, fallback_text)] if fallback_when_unrendered else []
@@ -1205,7 +1224,7 @@ class QzoneStablePlugin(Star):
 
         results: list[Any] = []
         limit = self._post_render_limit()
-        image_paths = await self._render_qzone_post_cards(posts[:limit])
+        image_paths = await self._render_qzone_post_cards(posts[:limit], comment_texts=comment_texts)
         if len(image_paths) > 1:
             try:
                 combined_path = await asyncio.to_thread(
@@ -1240,6 +1259,7 @@ class QzoneStablePlugin(Star):
         *,
         subdir: str = "posts",
         fallback_when_unrendered: bool = True,
+        comment_texts: dict[int, str] | None = None,
     ):
         for result in await self._post_card_results(
             event,
@@ -1247,6 +1267,7 @@ class QzoneStablePlugin(Star):
             fallback_text,
             subdir=subdir,
             fallback_when_unrendered=fallback_when_unrendered,
+            comment_texts=comment_texts,
         ):
             yield result
 
@@ -2587,6 +2608,7 @@ class QzoneStablePlugin(Star):
                 yield self._command_result(event, "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。")
                 return
             lines: list[str] = []
+            comment_texts: dict[int, str] = {}
             for post in posts:
                 content = selection.comment_text or await self._generate_comment_text(event, post)
                 if not content.strip():
@@ -2594,18 +2616,20 @@ class QzoneStablePlugin(Star):
                 await self._post_service().comment_post(post, content)
                 if self.settings.like_when_comment:
                     await self._post_service().like_post(post)
+                comment_texts[id(post)] = content
                 lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield self._command_result(event, "\n".join(lines))
         async for result in self._yield_post_card_results(
             event,
             posts,
             self._format_posts(posts, detail=True),
             fallback_when_unrendered=False,
+            comment_texts=comment_texts,
         ):
             yield result
+        yield self._command_result(event, "\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("赞说说")
