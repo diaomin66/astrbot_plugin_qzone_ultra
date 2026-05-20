@@ -94,6 +94,31 @@ def test_main_import_recovers_from_stale_renderer_module(monkeypatch: pytest.Mon
         sys.modules.pop("main", None)
 
 
+def test_main_import_recovers_from_renderer_without_comment_section_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.publish_renderer as renderer
+
+    try:
+        monkeypatch.delattr(renderer, "SUPPORTS_COMMENT_RESULT_SECTIONS", raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
+        assert getattr(main._publish_renderer, "SUPPORTS_COMMENT_RESULT_SECTIONS", False) is True
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_tolerates_missing_optional_renderer_exports(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module

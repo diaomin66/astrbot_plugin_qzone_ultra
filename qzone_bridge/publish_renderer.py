@@ -76,6 +76,7 @@ REGULAR_FONT_ASSET = FONT_ASSET_DIR / "AlibabaPuHuiTi-3-55-Regular.ttf"
 BOLD_FONT_ASSET = FONT_ASSET_DIR / "AlibabaPuHuiTi-3-75-SemiBold.ttf"
 _ACTION_STRIP_CACHE: dict[tuple[str, int], Image.Image] = {}
 _AVATAR_MASK_CACHE: dict[tuple[int, int], Image.Image] = {}
+SUPPORTS_COMMENT_RESULT_SECTIONS = True
 
 
 @dataclass(slots=True)
