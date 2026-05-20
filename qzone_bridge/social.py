@@ -37,6 +37,7 @@ NICKNAME_CONTAINER_KEYS = (
     "blogInfo",
     "cell_userinfo",
 )
+USER_ID_KEYS = ("uin", "hostuin", "hostUin", "user_id", "userId", "qq", "uinnum")
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -80,6 +81,8 @@ def _clean_nickname(value: Any, *, hostuin: int = 0) -> str:
 
 
 def _first_nickname(raw: dict[str, Any], *, hostuin: int = 0) -> str:
+    if not _owner_matches(raw, hostuin=hostuin):
+        return ""
     for key in NICKNAME_KEYS:
         nickname = _clean_nickname(raw.get(key), hostuin=hostuin)
         if nickname:
@@ -105,14 +108,24 @@ def _nested_mapping(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
     return current if isinstance(current, dict) else {}
 
 
+def _mapping_uin(raw: dict[str, Any]) -> int:
+    for key in USER_ID_KEYS:
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _to_int(value)
+    return 0
+
+
+def _owner_matches(raw: dict[str, Any], *, hostuin: int = 0) -> bool:
+    owner_uin = _mapping_uin(raw)
+    return not hostuin or not owner_uin or owner_uin == hostuin
+
+
 def extract_nickname(raw: dict[str, Any] | None, *, hostuin: int = 0) -> str:
     """Best-effort owner nickname extraction from common Qzone feed/detail shapes."""
 
     if not isinstance(raw, dict):
         return ""
-    direct = _first_nickname(raw, hostuin=hostuin)
-    if direct:
-        return direct
 
     for key in NICKNAME_CONTAINER_KEYS:
         for item in _iter_mappings(raw.get(key)):
@@ -134,6 +147,10 @@ def extract_nickname(raw: dict[str, Any] | None, *, hostuin: int = 0) -> str:
         nickname = _first_nickname(_nested_mapping(raw, *path), hostuin=hostuin)
         if nickname:
             return nickname
+
+    direct = _first_nickname(raw, hostuin=hostuin)
+    if direct:
+        return direct
 
     return ""
 
@@ -184,9 +201,12 @@ class QzonePost:
         prefix = f"{index}. " if index is not None else ""
         saved = f"稿件 #{self.saved_id} | " if self.saved_id else ""
         liked = "已赞" if self.liked else "未赞"
-        name = self.nickname or str(self.hostuin or "")
+        name = extract_nickname({"nickname": self.nickname}, hostuin=self.hostuin)
+        if not name:
+            name = extract_nickname(self.raw, hostuin=self.hostuin)
+        name = name or "QQ 空间用户"
         return (
-            f"{prefix}{saved}{name}({self.hostuin})\n"
+            f"{prefix}{saved}{name}\n"
             f"{truncate(self.summary, 220)}\n"
             f"{liked} | {self.like_count} 赞 | {self.comment_count} 评论"
         )

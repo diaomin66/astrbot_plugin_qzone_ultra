@@ -13,7 +13,6 @@ import re
 import shutil
 import sys
 import time
-import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -545,6 +544,7 @@ from qzone_bridge.posts import PostStore
 from qzone_bridge.publish_renderer import (
     RenderProfile,
     cached_avatar_source,
+    combine_rendered_post_cards,
     preload_publish_render_assets,
     preload_static_render_assets,
     profile_from_event,
@@ -983,49 +983,6 @@ class QzoneStablePlugin(Star):
         rendered = await asyncio.gather(*(render_one(post) for post in posts))
         return [path for path in rendered if path is not None]
 
-    @staticmethod
-    def _combine_qzone_post_card_images(paths: list[Path], output_dir: Path) -> Path | None:
-        if not paths:
-            return None
-        if len(paths) == 1:
-            return paths[0]
-        try:
-            from PIL import Image, UnidentifiedImageError
-        except Exception:
-            return None
-
-        images = []
-        try:
-            for path in paths:
-                try:
-                    with Image.open(path) as opened:
-                        image = opened.convert("RGB")
-                        images.append(image.copy())
-                except (OSError, UnidentifiedImageError):
-                    return None
-            if not images:
-                return None
-            width = max(image.width for image in images)
-            gap = max(12, min(32, width // 40))
-            height = sum(image.height for image in images) + gap * (len(images) - 1)
-            canvas = Image.new("RGB", (width, height), (255, 255, 255))
-            y = 0
-            for image in images:
-                canvas.paste(image, ((width - image.width) // 2, y))
-                y += image.height + gap
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}_cards.png"
-            canvas.save(output_path, "PNG", optimize=False, compress_level=1)
-            return output_path
-        except Exception:
-            return None
-        finally:
-            for image in images:
-                try:
-                    image.close()
-                except Exception:
-                    pass
-
     async def _post_card_results(
         self,
         event: AstrMessageEvent,
@@ -1049,7 +1006,7 @@ class QzoneStablePlugin(Star):
         if len(image_paths) > 1:
             try:
                 combined_path = await asyncio.to_thread(
-                    self._combine_qzone_post_card_images,
+                    combine_rendered_post_cards,
                     image_paths,
                     self.data_dir / "rendered_posts",
                 )
@@ -1058,6 +1015,10 @@ class QzoneStablePlugin(Star):
                 combined_path = None
             if combined_path is not None:
                 image_paths = [combined_path]
+            elif fallback_when_unrendered:
+                return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+            else:
+                return [self._command_result(event, "说说卡片图片合成失败，请缩小范围后重试。")]
         for image_path in image_paths:
             self._stop_event(event)
             results.append(image_result(str(image_path)))
@@ -2388,11 +2349,12 @@ class QzoneStablePlugin(Star):
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             selection = self._selection_for_event(event, ("评说说", "评论说说", "读说说"))
+            use_safety_filters = not selection.has_explicit_input
             posts = await self._posts_for_selection(
                 selection,
                 with_detail=True,
-                no_commented=False,
-                no_self=False,
+                no_commented=use_safety_filters,
+                no_self=use_safety_filters,
                 login_uin=self._self_id(event),
             )
             if not posts:

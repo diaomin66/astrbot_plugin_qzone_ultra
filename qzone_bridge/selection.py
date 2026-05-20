@@ -32,6 +32,9 @@ class PostSelection:
     fid: str = ""
     appid: int = 311
     comment_text: str = ""
+    explicit_target: bool = False
+    explicit_selector: bool = False
+    explicit_comment_text: bool = False
 
     @property
     def is_fid(self) -> bool:
@@ -46,6 +49,10 @@ class PostSelection:
         if self.is_fid or self.is_last:
             return 1
         return max(self.start, self.end, 1)
+
+    @property
+    def has_explicit_input(self) -> bool:
+        return bool(self.explicit_target or self.explicit_selector or self.is_fid or self.explicit_comment_text)
 
 
 def strip_command_prefix(text: str, command_names: tuple[str, ...] = ()) -> str:
@@ -119,35 +126,47 @@ def parse_post_selection(text: str, command_names: tuple[str, ...] = ()) -> Post
     tokens = raw.split()
 
     target_uin = at_targets[0] if at_targets else 0
+    explicit_target = bool(at_targets)
     if not target_uin and tokens and re.fullmatch(r"\d{5,}", tokens[0]) and not _looks_like_fid(tokens[0]):
         target_uin = int(tokens.pop(0))
+        explicit_target = True
 
     if tokens and _looks_like_fid(tokens[0]):
         fid = tokens.pop(0)
         appid = 311
         if tokens and tokens[0].isdigit():
             appid = int(tokens.pop(0))
+        comment_text = " ".join(tokens).strip()
         return PostSelection(
             target_uin=target_uin,
             fid=fid,
             appid=appid,
             selector="fid",
-            comment_text=" ".join(tokens).strip(),
+            comment_text=comment_text,
+            explicit_target=explicit_target,
+            explicit_selector=True,
+            explicit_comment_text=bool(comment_text),
         )
 
     start, end, selector = 1, 1, "latest"
+    explicit_selector = False
     if tokens:
         parsed = _parse_selector(tokens[0])
         if parsed is not None:
             start, end, selector = parsed
             tokens.pop(0)
+            explicit_selector = True
+    comment_text = " ".join(tokens).strip()
 
     return PostSelection(
         target_uin=target_uin,
         start=start,
         end=end,
         selector=selector,
-        comment_text=" ".join(tokens).strip(),
+        comment_text=comment_text,
+        explicit_target=explicit_target,
+        explicit_selector=explicit_selector,
+        explicit_comment_text=bool(comment_text),
     )
 
 
@@ -168,11 +187,20 @@ def selection_from_tool_args(
             fid=str(fid),
             appid=int(appid or 311),
             selector="fid",
+            explicit_target=bool(effective_target),
+            explicit_selector=True,
         )
     if latest:
-        return PostSelection(target_uin=effective_target, start=1, end=1, selector="latest")
+        return PostSelection(target_uin=effective_target, start=1, end=1, selector="latest", explicit_target=bool(effective_target), explicit_selector=True)
     if index > 0:
-        return PostSelection(target_uin=effective_target, start=int(index), end=int(index), selector="index")
+        return PostSelection(
+            target_uin=effective_target,
+            start=int(index),
+            end=int(index),
+            selector="index",
+            explicit_target=bool(effective_target),
+            explicit_selector=True,
+        )
 
     selector_text = str(selector or "latest")
     if _looks_like_fid(selector_text):
@@ -181,9 +209,18 @@ def selection_from_tool_args(
             fid=selector_text.strip(),
             appid=int(appid or 311),
             selector="fid",
+            explicit_target=bool(effective_target),
+            explicit_selector=True,
         )
     parsed = _parse_selector(selector_text)
     if parsed is None:
         parsed = (1, 1, "latest")
     start, end, mode = parsed
-    return PostSelection(target_uin=effective_target, start=start, end=end, selector=mode)
+    return PostSelection(
+        target_uin=effective_target,
+        start=start,
+        end=end,
+        selector=mode,
+        explicit_target=bool(effective_target),
+        explicit_selector=selector_text.strip().lower() not in {"", "latest"},
+    )

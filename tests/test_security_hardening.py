@@ -291,6 +291,11 @@ def test_qzone_post_card_profile_uses_nickname_not_numeric_fallback(monkeypatch:
 def test_qzone_post_card_range_renders_single_combined_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _import_main_with_stubs(monkeypatch)
     rendered_names: set[str] = set()
+    sizes = {
+        "第一条": (80, 20, (255, 0, 0)),
+        "第二条": (60, 20, (0, 255, 0)),
+        "第三条": (70, 20, (0, 0, 255)),
+    }
 
     def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5):
         from PIL import Image
@@ -298,7 +303,8 @@ def test_qzone_post_card_range_renders_single_combined_image(monkeypatch: pytest
         output_dir.mkdir(parents=True, exist_ok=True)
         rendered_names.add(profile.nickname)
         path = output_dir / f"{post.content}.png"
-        Image.new("RGB", (80, 20), (250, 250, 250)).save(path)
+        image_width, image_height, color = sizes[post.content]
+        Image.new("RGB", (image_width, image_height), color).save(path)
         return path
 
     class _Event:
@@ -342,6 +348,9 @@ def test_qzone_post_card_range_renders_single_combined_image(monkeypatch: pytest
     with Image.open(results[0]["path"]) as combined:
         assert combined.width == 80
         assert combined.height > 60
+        assert combined.getpixel((0, 0)) == (255, 0, 0)
+        assert combined.getpixel((0, 32)) == (0, 255, 0)
+        assert combined.getpixel((0, 64)) == (0, 0, 255)
 
 
 def test_qzone_commands_render_post_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,6 +408,22 @@ def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.Mon
 def test_render_feed_card_limit_is_loaded_from_config() -> None:
     settings = PluginSettings.from_mapping({"render_feed_card_limit": 3})
     assert settings.render_feed_card_limit == 3
+
+
+def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number() -> None:
+    from qzone_bridge.social import QzonePost, extract_nickname
+
+    raw = {
+        "userinfo": {"uin": 22222, "nickname": "错误昵称"},
+        "owner": {"uin": 12345, "nickname": "正确昵称"},
+        "name": "泛字段昵称",
+    }
+    assert extract_nickname(raw, hostuin=12345) == "正确昵称"
+
+    post = QzonePost(hostuin=12345, fid="fid-1", summary="没有昵称时不要露出 QQ 号", nickname="12345")
+    text = post.brief(1)
+    assert "12345" not in text
+    assert "QQ 空间用户" in text
 
 
 def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -471,3 +496,56 @@ def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.Mo
     assert captured["post_kwargs"]["with_detail"] is True
     assert captured["comment"] == ("fid-1", "已经看到啦", False)
     assert results == [{"type": "plain", "text": "已评论第 1 条：已经看到啦"}]
+
+
+def test_empty_manual_comment_feed_keeps_auto_comment_safety_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "评说说"
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def stop_event(self):
+            captured["stopped"] = True
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=[], like_when_comment=False, max_feed_limit=20)
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        captured["selection"] = selection
+        captured["post_kwargs"] = kwargs
+        return []
+
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+
+    async def collect_results():
+        results = []
+        async for item in plugin.comment_feed(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["post_kwargs"]["no_commented"] is True
+    assert captured["post_kwargs"]["no_self"] is True
+    assert captured["post_kwargs"]["with_detail"] is True
+    assert results == [{"type": "plain", "text": "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。"}]

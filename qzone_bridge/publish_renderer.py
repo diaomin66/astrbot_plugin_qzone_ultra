@@ -64,6 +64,8 @@ _BYTES_CACHE_MAX_ITEMS = 64
 _BYTES_CACHE_MAX_ITEM_SIZE = 4 * 1024 * 1024
 _LAST_PRUNE_AT = 0.0
 _PRUNE_INTERVAL_SECONDS = 60.0
+COMBINED_CARD_MAX_HEIGHT = 12000
+COMBINED_CARD_MAX_PIXELS = 30_000_000
 ASSET_DIR = Path(__file__).with_name("assets")
 ACTION_STRIP_ASSET = ASSET_DIR / "publish_actions.png"
 FONT_ASSET_DIR = ASSET_DIR / "fonts"
@@ -350,6 +352,72 @@ def render_publish_result_image(
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
     image.save(path, "PNG", optimize=False, compress_level=1)
     return path
+
+
+def combine_rendered_post_cards(
+    paths: list[Path],
+    output_dir: Path,
+    *,
+    max_height: int = COMBINED_CARD_MAX_HEIGHT,
+    max_pixels: int = COMBINED_CARD_MAX_PIXELS,
+) -> Path | None:
+    """Stack rendered post cards into one left-aligned PNG."""
+
+    if not paths:
+        return None
+    if len(paths) == 1:
+        return paths[0]
+
+    images: list[Image.Image] = []
+    try:
+        for path in paths:
+            try:
+                with Image.open(path) as opened:
+                    image = opened.convert("RGB")
+                    images.append(image.copy())
+            except (OSError, UnidentifiedImageError):
+                return None
+        if not images:
+            return None
+
+        width = max(image.width for image in images)
+        gap = max(12, min(32, width // 40))
+        height = sum(image.height for image in images) + gap * (len(images) - 1)
+        pixel_count = width * height
+        scale = 1.0
+        if max_height > 0 and height > max_height:
+            scale = min(scale, max_height / height)
+        if max_pixels > 0 and pixel_count > max_pixels:
+            scale = min(scale, math.sqrt(max_pixels / pixel_count))
+        if scale < 1.0:
+            resized: list[Image.Image] = []
+            for image in images:
+                target_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                resized.append(image.resize(target_size, QUALITY_RESAMPLE))
+                image.close()
+            images = resized
+            width = max(image.width for image in images)
+            gap = max(8, int(gap * scale))
+            height = sum(image.height for image in images) + gap * (len(images) - 1)
+
+        canvas = Image.new("RGB", (width, height), WHITE)
+        y = 0
+        for image in images:
+            canvas.paste(image, (0, y))
+            y += image.height + gap
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _prune_output_dir(output_dir)
+        output_path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}_cards.png"
+        canvas.save(output_path, "PNG", optimize=False, compress_level=1)
+        canvas.close()
+        return output_path
+    finally:
+        for image in images:
+            try:
+                image.close()
+            except Exception:
+                pass
 
 
 def _render_content_text(post: PostPayload) -> str:
