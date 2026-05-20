@@ -234,6 +234,7 @@ def render_publish_result_image(
     result: dict[str, Any] | None = None,
     width: int = 900,
     remote_timeout: float = 1.5,
+    fixed_width: bool = False,
 ) -> Path:
     """Render a published post into a PNG and return the file path."""
 
@@ -248,13 +249,17 @@ def render_publish_result_image(
     render_scale = RENDER_SCALE
     scratch = ImageDraw.Draw(Image.new("RGB", (1, 1), WHITE))
     content_text = _render_content_text(post)
-    logical_width = _adaptive_logical_width(
-        post,
-        int(width or 900),
-        scratch,
-        content_text,
-        scale=render_scale,
-    )
+    requested_width = int(width or 900)
+    if fixed_width:
+        logical_width = _fixed_logical_width(requested_width)
+    else:
+        logical_width = _adaptive_logical_width(
+            post,
+            requested_width,
+            scratch,
+            content_text,
+            scale=render_scale,
+        )
     width = _scale_px(logical_width, render_scale)
     margin = _scale_px(24, render_scale)
     content_width = width - margin * 2
@@ -459,6 +464,10 @@ def _adaptive_logical_width(
     else:
         min_width, max_width = 700, requested
     return max(min_width, min(requested, max_width, natural))
+
+
+def _fixed_logical_width(requested_width: int) -> int:
+    return max(640, min(int(requested_width or 900), 1280))
 
 
 def _preferred_content_font_size(compact_len: int) -> int:

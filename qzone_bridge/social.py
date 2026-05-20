@@ -77,6 +77,8 @@ def _clean_nickname(value: Any, *, hostuin: int = 0) -> str:
         return ""
     if hostuin and text == str(hostuin):
         return ""
+    if re.fullmatch(r"\d{5,}", text):
+        return ""
     return text
 
 

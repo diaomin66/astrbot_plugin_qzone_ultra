@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026051901
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052001
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -485,6 +485,35 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             for method_name in methods:
                 if not callable(getattr(cls, method_name, None)):
                     return False
+
+    contract_attributes = {
+        "qzone_bridge.publish_renderer": ("combine_rendered_post_cards",),
+        "qzone_bridge.social": ("extract_nickname",),
+    }
+    for module_name, attributes in contract_attributes.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for attribute in attributes:
+            if getattr(module, attribute, None) is None:
+                return False
+
+    contract_class_attributes = {
+        "qzone_bridge.selection": {"PostSelection": ("has_explicit_input",)},
+    }
+    for module_name, classes in contract_class_attributes.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, attributes in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            for attribute in attributes:
+                if getattr(cls, attribute, None) is None:
+                    return False
     return True
 
 
@@ -541,15 +570,11 @@ from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
-from qzone_bridge.publish_renderer import (
-    RenderProfile,
-    cached_avatar_source,
-    combine_rendered_post_cards,
-    preload_publish_render_assets,
-    preload_static_render_assets,
-    profile_from_event,
-    render_publish_result_image,
-)
+import qzone_bridge.publish_renderer as _publish_renderer
+try:
+    import qzone_bridge.compat as _bridge_compat
+except Exception:
+    _bridge_compat = None
 from qzone_bridge.render import (
     format_action_result,
     format_feed_detail,
@@ -559,10 +584,187 @@ from qzone_bridge.render import (
     format_status,
 )
 from qzone_bridge.scheduler import cron_delay_seconds
-from qzone_bridge.selection import PostSelection, parse_post_selection, selection_from_tool_args
+import qzone_bridge.selection as _selection
 from qzone_bridge.settings import PluginSettings
-from qzone_bridge.social import QzoneComment, QzonePost, extract_nickname, post_from_entry
+import qzone_bridge.social as _social
 from qzone_bridge.utils import truncate
+
+
+class _CompatRenderProfile:
+    def __init__(self, nickname: str = "", user_id: str = "", avatar_source: str = "", time_text: str = ""):
+        self.nickname = nickname
+        self.user_id = user_id
+        self.avatar_source = avatar_source
+        self.time_text = time_text
+
+
+def _profile_from_event_fallback(event: Any) -> Any:
+    nickname = ""
+    for getter_name in ("get_sender_name", "get_sender_nickname"):
+        getter = getattr(event, getter_name, None)
+        if callable(getter):
+            try:
+                nickname = str(getter() or "").strip()
+            except Exception:
+                nickname = ""
+            if nickname:
+                break
+    return RenderProfile(nickname=nickname or "QQ Space", time_text=datetime.now().strftime("%H:%M"))
+
+
+def _missing_publish_renderer(*args: Any, **kwargs: Any) -> Path:
+    raise RuntimeError("qzone publish renderer is unavailable; falling back to text")
+
+
+RenderProfile = getattr(_publish_renderer, "RenderProfile", _CompatRenderProfile)
+cached_avatar_source = getattr(_publish_renderer, "cached_avatar_source", lambda cache_dir, profile: "")
+preload_static_render_assets = getattr(_publish_renderer, "preload_static_render_assets", lambda: None)
+profile_from_event = getattr(_publish_renderer, "profile_from_event", _profile_from_event_fallback)
+render_publish_result_image = getattr(_publish_renderer, "render_publish_result_image", _missing_publish_renderer)
+preload_publish_render_assets = getattr(
+    _publish_renderer,
+    "preload_publish_render_assets",
+    lambda profile, cache_dir, **kwargs: profile,
+)
+
+PostSelection = _selection.PostSelection
+parse_post_selection = _selection.parse_post_selection
+selection_from_tool_args = _selection.selection_from_tool_args
+
+QzoneComment = _social.QzoneComment
+QzonePost = _social.QzonePost
+post_from_entry = _social.post_from_entry
+
+
+def _clean_nickname_fallback(value: Any, *, hostuin: int = 0) -> str:
+    text = re.sub(r"<[^>]+>", "", re.sub(r"\[em\].*?\[/em\]", "", str(value or ""))).strip()
+    if not text or (hostuin and text == str(hostuin)) or re.fullmatch(r"\d{5,}", text):
+        return ""
+    return text
+
+
+def _extract_nickname_compat(raw: dict[str, Any] | None, *, hostuin: int = 0) -> str:
+    helper = getattr(_bridge_compat, "extract_nickname_compat", None)
+    if callable(helper):
+        return helper(raw, hostuin=hostuin, social_module=_social)
+    extractor = getattr(_social, "extract_nickname", None)
+    if callable(extractor):
+        try:
+            nickname = str(extractor(raw, hostuin=hostuin) or "").strip()
+        except Exception:
+            nickname = ""
+        if _clean_nickname_fallback(nickname, hostuin=hostuin):
+            return nickname
+    if isinstance(raw, dict):
+        stack: list[Any] = [raw]
+        for _ in range(48):
+            if not stack:
+                break
+            item = stack.pop(0)
+            if isinstance(item, dict):
+                owner = int(item.get("uin") or item.get("hostuin") or item.get("user_id") or 0)
+                if not hostuin or not owner or owner == hostuin:
+                    for key in ("nickname", "nickName", "name", "ownerName"):
+                        nickname = _clean_nickname_fallback(item.get(key), hostuin=hostuin)
+                        if nickname:
+                            return nickname
+                stack.extend(value for value in item.values() if isinstance(value, (dict, list)))
+            elif isinstance(item, list):
+                stack.extend(value for value in item if isinstance(value, (dict, list)))
+    return ""
+
+
+def _selection_has_explicit_input(selection: Any) -> bool:
+    helper = getattr(_bridge_compat, "selection_has_explicit_input", None)
+    if callable(helper):
+        return bool(helper(selection))
+    for attribute in (
+        "has_explicit_input",
+        "explicit_target",
+        "explicit_selector",
+        "explicit_comment_text",
+        "fid",
+        "comment_text",
+        "target_uin",
+    ):
+        try:
+            if bool(getattr(selection, attribute, False)):
+                return True
+        except Exception:
+            pass
+    try:
+        selector = str(getattr(selection, "selector", "") or "").strip().lower()
+        explicit_range = (
+            int(getattr(selection, "start", 1) or 1) != 1
+            or int(getattr(selection, "end", 1) or 1) != 1
+        )
+        return bool(selector and selector != "latest") or explicit_range
+    except Exception:
+        return False
+
+
+def _minimal_combine_rendered_post_cards(paths: list[Path], output_dir: Path) -> Path | None:
+    if len(paths) <= 1:
+        return paths[0] if paths else None
+    try:
+        import uuid
+        from PIL import Image, UnidentifiedImageError
+    except Exception:
+        return None
+    images: list[Any] = []
+    try:
+        for path in paths:
+            try:
+                with Image.open(path) as opened:
+                    images.append(opened.convert("RGB").copy())
+            except (OSError, UnidentifiedImageError):
+                return None
+        width = max((image.width for image in images), default=0)
+        if not width:
+            return None
+        gap = max(12, min(32, width // 40))
+        height = sum(image.height for image in images) + gap * (len(images) - 1)
+        canvas = Image.new("RGB", (width, height), (255, 255, 255))
+        y = 0
+        for image in images:
+            canvas.paste(image, (0, y))
+            y += image.height + gap
+        output_dir.mkdir(parents=True, exist_ok=True)
+        prune = getattr(_publish_renderer, "_prune_output_dir", None)
+        if callable(prune):
+            prune(output_dir)
+        output_path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}_cards.png"
+        canvas.save(output_path, "PNG", optimize=False, compress_level=1)
+        canvas.close()
+        return output_path
+    finally:
+        for image in images:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
+def _combine_rendered_post_cards(paths: list[Path], output_dir: Path) -> Path | None:
+    helper = getattr(_bridge_compat, "combine_rendered_post_cards_compat", None)
+    if callable(helper):
+        return helper(paths, output_dir, renderer_module=_publish_renderer)
+    combiner = getattr(_publish_renderer, "combine_rendered_post_cards", None)
+    if callable(combiner):
+        return combiner(paths, output_dir)
+    logger.warning("qzone post card combiner missing; using minimal import-compatible fallback")
+    return _minimal_combine_rendered_post_cards(paths, output_dir)
+
+
+def _render_publish_result_image(*args: Any, fixed_width: bool = False, **kwargs: Any) -> Path:
+    if not fixed_width:
+        return render_publish_result_image(*args, **kwargs)
+    try:
+        return render_publish_result_image(*args, fixed_width=fixed_width, **kwargs)
+    except TypeError as exc:
+        if "fixed_width" not in str(exc):
+            raise
+        return render_publish_result_image(*args, **kwargs)
 
 
 def _identity_filter_decorator(*args: Any, **kwargs: Any):
@@ -887,7 +1089,7 @@ class QzoneStablePlugin(Star):
             profile = profile_from_event(event)
         try:
             image_path = await asyncio.to_thread(
-                render_publish_result_image,
+                _render_publish_result_image,
                 post,
                 self.data_dir / "rendered_posts",
                 profile=profile,
@@ -914,9 +1116,9 @@ class QzoneStablePlugin(Star):
     @staticmethod
     def _post_display_nickname(post: QzonePost) -> str:
         hostuin = int(post.hostuin or 0)
-        nickname = extract_nickname({"nickname": post.nickname}, hostuin=hostuin)
+        nickname = _extract_nickname_compat({"nickname": post.nickname}, hostuin=hostuin)
         if not nickname:
-            nickname = extract_nickname(post.raw, hostuin=hostuin)
+            nickname = _extract_nickname_compat(post.raw, hostuin=hostuin)
         return nickname or "QQ 空间用户"
 
     @staticmethod
@@ -950,18 +1152,19 @@ class QzoneStablePlugin(Star):
         ]
         return PostPayload(content=(post.summary or "(空)").strip(), media=media)
 
-    async def _render_qzone_post_card(self, post: QzonePost) -> Path | None:
+    async def _render_qzone_post_card(self, post: QzonePost, *, fixed_width: bool = False) -> Path | None:
         if not self.settings.render_publish_result:
             return None
         try:
             return await asyncio.to_thread(
-                render_publish_result_image,
+                _render_publish_result_image,
                 self._post_render_payload(post),
                 self.data_dir / "rendered_posts",
                 profile=self._post_render_profile(post),
                 result={"ok": True, "tool": "qzone_post_card", "fid": post.fid},
                 width=self.settings.render_result_width,
                 remote_timeout=self.settings.render_remote_timeout,
+                fixed_width=fixed_width,
             )
         except Exception as exc:
             logger.exception("qzone post card render failed: %s", exc)
@@ -978,7 +1181,7 @@ class QzoneStablePlugin(Star):
 
         async def render_one(post: QzonePost) -> Path | None:
             async with semaphore:
-                return await self._render_qzone_post_card(post)
+                return await self._render_qzone_post_card(post, fixed_width=True)
 
         rendered = await asyncio.gather(*(render_one(post) for post in posts))
         return [path for path in rendered if path is not None]
@@ -1006,7 +1209,7 @@ class QzoneStablePlugin(Star):
         if len(image_paths) > 1:
             try:
                 combined_path = await asyncio.to_thread(
-                    combine_rendered_post_cards,
+                    _combine_rendered_post_cards,
                     image_paths,
                     self.data_dir / "rendered_posts",
                 )
@@ -2349,7 +2552,7 @@ class QzoneStablePlugin(Star):
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             selection = self._selection_for_event(event, ("评说说", "评论说说", "读说说"))
-            use_safety_filters = not selection.has_explicit_input
+            use_safety_filters = not _selection_has_explicit_input(selection)
             posts = await self._posts_for_selection(
                 selection,
                 with_detail=True,

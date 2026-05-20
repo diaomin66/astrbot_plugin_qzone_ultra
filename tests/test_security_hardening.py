@@ -72,6 +72,60 @@ def _import_main_with_stubs(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("main")
 
 
+def test_main_import_recovers_from_stale_renderer_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.publish_renderer as renderer
+
+    try:
+        monkeypatch.delattr(renderer, "combine_rendered_post_cards", raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
+def test_main_import_tolerates_missing_optional_renderer_exports(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.publish_renderer as renderer
+
+    try:
+        for name in (
+            "RenderProfile",
+            "cached_avatar_source",
+            "preload_publish_render_assets",
+            "preload_static_render_assets",
+            "profile_from_event",
+            "render_publish_result_image",
+        ):
+            monkeypatch.delattr(renderer, name, raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+        profile = main.RenderProfile(nickname="昵称", user_id="12345", avatar_source="", time_text="12:00")
+
+        assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
+        assert profile.nickname == "昵称"
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_remote_media_download_headers_do_not_send_qzone_cookie() -> None:
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
     try:
@@ -291,17 +345,19 @@ def test_qzone_post_card_profile_uses_nickname_not_numeric_fallback(monkeypatch:
 def test_qzone_post_card_range_renders_single_combined_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _import_main_with_stubs(monkeypatch)
     rendered_names: set[str] = set()
+    fixed_width_flags: list[bool] = []
     sizes = {
         "第一条": (80, 20, (255, 0, 0)),
         "第二条": (60, 20, (0, 255, 0)),
         "第三条": (70, 20, (0, 0, 255)),
     }
 
-    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5):
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
         from PIL import Image
 
         output_dir.mkdir(parents=True, exist_ok=True)
         rendered_names.add(profile.nickname)
+        fixed_width_flags.append(fixed_width)
         path = output_dir / f"{post.content}.png"
         image_width, image_height, color = sizes[post.content]
         Image.new("RGB", (image_width, image_height), color).save(path)
@@ -345,12 +401,128 @@ def test_qzone_post_card_range_renders_single_combined_image(monkeypatch: pytest
     assert results[0]["type"] == "image"
     assert Path(results[0]["path"]).name.startswith("publish_result_")
     assert rendered_names == {"阿一", "阿二", "阿三"}
+    assert fixed_width_flags == [True, True, True]
     with Image.open(results[0]["path"]) as combined:
         assert combined.width == 80
         assert combined.height > 60
         assert combined.getpixel((0, 0)) == (255, 0, 0)
         assert combined.getpixel((0, 32)) == (0, 255, 0)
         assert combined.getpixel((0, 64)) == (0, 0, 255)
+
+
+def test_publish_renderer_fixed_width_keeps_range_cards_aligned(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from qzone_bridge.media import PostPayload
+    from qzone_bridge.publish_renderer import RenderProfile, render_publish_result_image
+
+    short = render_publish_result_image(
+        PostPayload(content="短内容", media=[]),
+        tmp_path,
+        profile=RenderProfile(nickname="阿一", time_text="12:34"),
+        width=720,
+        remote_timeout=0.01,
+        fixed_width=True,
+    )
+    long = render_publish_result_image(
+        PostPayload(content="这是一条更长的说说内容，用来确认范围合成长图里头像、昵称和操作按钮处在同一套宽度坐标里。", media=[]),
+        tmp_path,
+        profile=RenderProfile(nickname="阿二", time_text="12:34"),
+        width=720,
+        remote_timeout=0.01,
+        fixed_width=True,
+    )
+
+    with Image.open(short) as short_image, Image.open(long) as long_image:
+        assert short_image.width == long_image.width
+        assert short_image.width == 720 * 3
+
+
+def test_qzone_post_card_range_combines_when_renderer_combiner_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    monkeypatch.delattr(main._publish_renderer, "combine_rendered_post_cards", raising=False)
+    sizes = {
+        "第一条": (80, 20, (255, 0, 0)),
+        "第二条": (60, 20, (0, 255, 0)),
+    }
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
+        from PIL import Image
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{post.content}.png"
+        image_width, image_height, color = sizes[post.content]
+        Image.new("RGB", (image_width, image_height), color).save(path)
+        return path
+
+    class _Event:
+        stopped = False
+
+        def stop_event(self):
+            self.stopped = True
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+        max_feed_limit=20,
+    )
+    plugin.data_dir = tmp_path
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+
+    posts = [
+        main.QzonePost(hostuin=10001, fid="fid-1", summary="第一条", nickname="阿一", local_id=1),
+        main.QzonePost(hostuin=10002, fid="fid-2", summary="第二条", nickname="阿二", local_id=2),
+    ]
+
+    results = asyncio.run(plugin._post_card_results(_Event(), posts, "fallback"))
+
+    from PIL import Image
+
+    assert len(results) == 1
+    assert results[0]["type"] == "image"
+    with Image.open(results[0]["path"]) as combined:
+        assert combined.width == 80
+        assert combined.height > 40
+        assert combined.getpixel((0, 0)) == (255, 0, 0)
+        assert combined.getpixel((0, 32)) == (0, 255, 0)
+
+
+def test_compat_fallback_combiner_prunes_stale_rendered_images(tmp_path: Path) -> None:
+    import os
+
+    from PIL import Image
+
+    from qzone_bridge.compat import fallback_combine_rendered_post_cards
+
+    output_dir = tmp_path / "rendered"
+    output_dir.mkdir()
+    for index in range(132):
+        stale = output_dir / f"publish_result_stale_{index}.png"
+        stale.write_bytes(b"old")
+        old_time = 1_700_000_000 + index
+        os.utime(stale, (old_time, old_time))
+
+    first = output_dir / "first.png"
+    second = output_dir / "second.png"
+    Image.new("RGB", (24, 12), (255, 0, 0)).save(first)
+    Image.new("RGB", (24, 12), (0, 255, 0)).save(second)
+
+    result = fallback_combine_rendered_post_cards([first, second], output_dir, renderer_module=types.SimpleNamespace())
+
+    assert result is not None and result.exists()
+    assert len(list(output_dir.glob("publish_result_*.png"))) <= 129
 
 
 def test_qzone_commands_render_post_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -424,6 +596,28 @@ def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number()
     text = post.brief(1)
     assert "12345" not in text
     assert "QQ 空间用户" in text
+
+
+def test_post_render_profile_keeps_nickname_without_social_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    monkeypatch.delattr(main._social, "extract_nickname", raising=False)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.data_dir = tmp_path
+    post = main.QzonePost(
+        hostuin=12345,
+        fid="fid-1",
+        nickname="12345",
+        raw={"owner": {"uin": 12345, "nickname": "正确昵称"}},
+        local_id=1,
+    )
+
+    profile = plugin._post_render_profile(post)
+
+    assert profile.nickname == "正确昵称"
 
 
 def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -549,3 +743,76 @@ def test_empty_manual_comment_feed_keeps_auto_comment_safety_filters(
     assert captured["post_kwargs"]["no_self"] is True
     assert captured["post_kwargs"]["with_detail"] is True
     assert results == [{"type": "plain", "text": "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。"}]
+
+
+def test_manual_comment_feed_handles_old_selection_without_explicit_property(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    monkeypatch.delattr(main.PostSelection, "has_explicit_input", raising=False)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "评说说 1 已经看到啦"
+
+        def is_admin(self):
+            return True
+
+        def get_self_id(self):
+            return 12345
+
+        def stop_event(self):
+            captured["stopped"] = True
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _PostService:
+        async def comment_post(self, post, content, *, private=False):
+            captured["comment"] = (post.fid, content, private)
+            return {"ok": True}
+
+        async def like_post(self, post):
+            return {"ok": True}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        like_when_comment=False,
+        max_feed_limit=20,
+        render_publish_result=True,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="自己的说说", nickname="自己", local_id=1)
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts(selection, **kwargs):
+        captured["post_kwargs"] = kwargs
+        return [post]
+
+    async def fake_yield_cards(*args, **kwargs):
+        if False:
+            yield None
+
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_selection = fake_posts
+    plugin._post_service = lambda: _PostService()
+    plugin._yield_post_card_results = fake_yield_cards
+
+    async def collect_results():
+        results = []
+        async for item in plugin.comment_feed(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["post_kwargs"]["no_commented"] is False
+    assert captured["post_kwargs"]["no_self"] is False
+    assert captured["comment"] == ("fid-1", "已经看到啦", False)
+    assert results == [{"type": "plain", "text": "已评论第 1 条：已经看到啦"}]
