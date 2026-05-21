@@ -25,6 +25,29 @@ FEED_CONTAINER_KEYS = ("feedpage", "main")
 FEED_LIST_KEYS = ("vFeeds", "vfeeds", "msglist", "data", "feeds", "feedlist", "feedList")
 FEED_CURSOR_KEYS = ("attachinfo", "attach_info", "attachInfo", "attach", "externparam", "res_attach")
 FEED_HAS_MORE_KEYS = ("hasmore", "hasMore", "hasMoreFeeds", "has_more")
+FEED_EXPLICIT_TIME_KEYS = (
+    "time",
+    "abstime",
+    "created_time",
+    "createdTime",
+    "created_at",
+    "createdAt",
+    "create_time",
+    "createTime",
+    "pubtime",
+    "pub_time",
+    "publish_time",
+    "publishTime",
+    "feedtime",
+    "feedTime",
+)
+FEED_GENERIC_TIME_KEYS = (
+    "timestamp",
+    "date",
+)
+HTML_TIME_ATTR_KEYS = ("data-time", "data-abstime", "data-pubtime", "time", "abstime", "pubtime")
+MIN_QZONE_TIMESTAMP_SECONDS = 1_100_000_000
+MAX_QZONE_TIMESTAMP_SECONDS = 4_102_444_800
 HTML_ATTR_RE_TEMPLATE = r"""\b{name}\s*=\s*(["'])(.*?)\1"""
 HTML_BREAK_RE = re.compile(r"<\s*br\s*/?\s*>", re.I)
 HTML_BLOCK_RE = re.compile(r"</\s*(?:p|div|li|tr)\s*>", re.I)
@@ -89,6 +112,36 @@ def _int(value: Any, default: int = 0) -> int:
         return int(value or 0)
     except Exception:
         return default
+
+
+def _timestamp_seconds(value: Any) -> int:
+    timestamp = _int(value)
+    if timestamp <= 0:
+        return 0
+    while timestamp > MAX_QZONE_TIMESTAMP_SECONDS and timestamp > 10_000_000_000:
+        timestamp //= 1000
+    if not (MIN_QZONE_TIMESTAMP_SECONDS <= timestamp <= MAX_QZONE_TIMESTAMP_SECONDS):
+        return 0
+    return timestamp
+
+
+def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any], html_markup: Any) -> int:
+    data = feed_item.get("data")
+    data_source = data if isinstance(data, dict) else {}
+    for source in (common, feed_item, data_source):
+        for key in FEED_EXPLICIT_TIME_KEYS:
+            timestamp = _timestamp_seconds(source.get(key))
+            if timestamp:
+                return timestamp
+    for key in FEED_GENERIC_TIME_KEYS:
+        timestamp = _timestamp_seconds(common.get(key))
+        if timestamp:
+            return timestamp
+    for key in HTML_TIME_ATTR_KEYS:
+        timestamp = _timestamp_seconds(_html_attr(html_markup, key))
+        if timestamp:
+            return timestamp
+    return 0
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -402,7 +455,7 @@ def extract_feed_entry(
         311,
     )
     fid = extract_fid(feed_item)
-    created_at = _int(common.get("time") or feed_item.get("abstime") or feed_item.get("created_time") or 0)
+    created_at = _created_at_from_feed_item(feed_item, common, html_markup)
     summary = extract_summary_text(feed_item)
     if not summary:
         summary = extract_summary_text(original)
@@ -418,7 +471,11 @@ def extract_feed_entry(
         or ""
     )
     unikey = (
-        _html_attr(html_markup, "data-unikey")
+        feed_item.get("unikey")
+        or feed_item.get("unlikekey")
+        or common.get("unikey")
+        or common.get("unlikekey")
+        or _html_attr(html_markup, "data-unikey")
         or _html_attr(html_markup, "unikey")
         or compute_unikey(appid, hostuin, fid)
     )

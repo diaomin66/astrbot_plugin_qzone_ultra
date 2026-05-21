@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from .astrbot_logging import get_logger
@@ -48,6 +48,22 @@ class QzonePostService:
             )
         return comments
 
+    @staticmethod
+    def _merge_detail_entry(feed_entry: FeedEntry, detail_entry: FeedEntry) -> FeedEntry:
+        """Keep list metadata when Qzone detail payload omits feed-level fields."""
+
+        return replace(
+            detail_entry,
+            summary=detail_entry.summary or feed_entry.summary,
+            nickname=detail_entry.nickname or feed_entry.nickname,
+            created_at=detail_entry.created_at if detail_entry.created_at > 0 else feed_entry.created_at,
+            curkey=detail_entry.curkey or feed_entry.curkey,
+            unikey=detail_entry.unikey or feed_entry.unikey,
+            busi_param=detail_entry.busi_param or feed_entry.busi_param,
+            topic_id=detail_entry.topic_id or feed_entry.topic_id,
+            raw=detail_entry.raw or feed_entry.raw,
+        )
+
     async def _detail_post(self, entry: FeedEntry, *, local_id: int, required: bool) -> QzonePost:
         detail_payload: dict[str, Any] | None = None
         feed_entry = entry
@@ -61,9 +77,7 @@ class QzonePostService:
             if isinstance(entry_data, dict):
                 detail_entry = FeedEntry(**entry_data)
                 if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
-                    if not detail_entry.nickname:
-                        detail_entry.nickname = entry.nickname
-                    entry = detail_entry
+                    entry = self._merge_detail_entry(entry, detail_entry)
         except Exception:
             if required:
                 raise

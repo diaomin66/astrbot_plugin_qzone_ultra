@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+from datetime import datetime
 from pathlib import Path
 import sys
 import types
@@ -12,8 +13,9 @@ import pytest
 from qzone_bridge.client import QzoneClient
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import QzoneBridgeError, QzoneParseError, QzoneRequestError
-from qzone_bridge.models import SessionState
+from qzone_bridge.models import BridgeState, SessionState
 from qzone_bridge.settings import PluginSettings
+from qzone_bridge.storage import StateStore
 from qzone_bridge import source_policy
 
 
@@ -359,6 +361,7 @@ def test_qzone_post_card_result_uses_publish_renderer(monkeypatch: pytest.Monkey
     assert rendered_post.media[0].source == "https://example.test/a.png"
     assert profile.nickname == "小明"
     assert profile.user_id == "12345"
+    assert profile.time_text == datetime.fromtimestamp(1_700_000_000).strftime("%m-%d %H:%M")
     assert captured["width"] == 720
     assert captured["remote_timeout"] == 0.01
 
@@ -699,6 +702,98 @@ def test_qzone_comment_renders_card_with_comment_text(
     assert results[1] == {"type": "image", "path": str(tmp_path / "qzone-comment-card.png")}
 
 
+@pytest.mark.parametrize("command_name", ["qzone_detail", "qzone_comment", "qzone_like"])
+def test_direct_qzone_commands_render_original_post_time(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command_name: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        stopped = False
+
+        def is_admin(self):
+            return True
+
+        def stop_event(self):
+            self.stopped = True
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _Controller:
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {
+                "entry": {
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "appid": appid,
+                    "summary": "原说说内容",
+                    "nickname": "真实昵称",
+                    "created_at": 1_690_000_000,
+                    "raw": {"summary": "原说说内容"},
+                },
+                "raw": {"summary": "原说说内容"},
+                "comments": [],
+            }
+
+        async def comment_post(self, *, hostuin: int, fid: str, content: str):
+            return {"ok": True}
+
+        async def like_post(self, *, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
+            return {"ok": True, "liked": not unlike, "summary": "原说说内容"}
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{command_name}.png"
+        path.write_bytes(b"png")
+        captured.setdefault("profiles", []).append(profile)
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+        max_feed_limit=20,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+
+    async def collect_results():
+        event = _Event()
+        results = []
+        if command_name == "qzone_detail":
+            iterator = plugin.qzone_detail(event, 12345, "fid-direct", 311)
+        elif command_name == "qzone_comment":
+            iterator = plugin.qzone_comment(event, 12345, "fid-direct", "评论内容")
+        else:
+            iterator = plugin.qzone_like(event, 12345, "fid-direct", 311, False)
+        async for item in iterator:
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    profiles = captured["profiles"]
+    assert profiles[-1].time_text == datetime.fromtimestamp(1_690_000_000).strftime("%m-%d %H:%M")
+    assert any(item.get("type") == "image" for item in results)
+
+
 def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _import_main_with_stubs(monkeypatch)
 
@@ -823,6 +918,51 @@ def test_default_feed_page_skips_numeric_info_nickname_for_owner_context() -> No
     assert entries[0].nickname == "真实昵称"
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"time": 1_690_000_000}, 1_690_000_000),
+        ({"created_at": 1_690_000_000}, 1_690_000_000),
+        ({"createdTime": 1_690_000_000}, 1_690_000_000),
+        ({"createTime": 1_690_000_000}, 1_690_000_000),
+        ({"pubtime": 1_690_000_000}, 1_690_000_000),
+        ({"common": {"timestamp": 1_690_000_000_000}}, 1_690_000_000),
+        ({"common": {"date": 1_690_000_000}}, 1_690_000_000),
+    ],
+)
+def test_feed_entry_extracts_common_qzone_time_aliases(payload: dict[str, object], expected: int) -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    payload = {
+        "hostuin": 12345,
+        "fid": "fid-time-alias",
+        "summary": "发布时间别名",
+        **payload,
+    }
+    entry = extract_feed_entry(
+        payload,
+        default_hostuin=12345,
+    )
+
+    assert entry.created_at == expected
+
+
+def test_feed_entry_ignores_unreasonable_generic_timestamps() -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "hostuin": 12345,
+            "fid": "fid-invalid-timestamp",
+            "summary": "异常时间戳",
+            "timestamp": 99_999_999_999_999_999,
+        },
+        default_hostuin=12345,
+    )
+
+    assert entry.created_at == 0
+
+
 def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
     from qzone_bridge.models import FeedEntry
     from qzone_bridge.post_service import QzonePostService
@@ -855,6 +995,139 @@ def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: P
 
     assert post.nickname == "列表昵称"
     assert "QQ 空间用户" not in post.brief(1)
+
+
+def test_detail_post_preserves_feed_created_at_when_detail_omits_time(tmp_path: Path) -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.post_service import QzonePostService
+
+    class _Controller:
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {
+                "entry": {
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "appid": appid,
+                    "summary": "详情内容",
+                    "nickname": "列表昵称",
+                    "raw": {"summary": "详情内容"},
+                },
+                "raw": {"summary": "详情内容"},
+                "comments": [],
+            }
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-time",
+        appid=311,
+        summary="列表内容",
+        nickname="列表昵称",
+        created_at=1_690_000_000,
+    )
+    service = QzonePostService(_Controller(), types.SimpleNamespace(), max_feed_limit=20)
+
+    post = asyncio.run(service._detail_post(entry, local_id=1, required=True))
+
+    assert post.created_at == 1_690_000_000
+
+
+def test_client_detail_payload_preserves_cached_created_at_when_detail_omits_time() -> None:
+    from qzone_bridge.models import FeedEntry
+
+    client = QzoneClient(SessionState(uin=12345, cookies={}))
+    try:
+        client.feed_cache[(12345, "fid-cached")] = FeedEntry(
+            hostuin=12345,
+            fid="fid-cached",
+            appid=311,
+            summary="列表内容",
+            nickname="列表昵称",
+            created_at=1_690_000_000,
+            curkey="cached-curkey",
+            unikey="cached-unikey",
+        )
+
+        entry = client.feed_entry_from_payload(
+            {
+                "hostuin": 12345,
+                "fid": "fid-cached",
+                "summary": "详情内容",
+                "nickname": "详情昵称",
+            },
+            default_hostuin=12345,
+        )
+    finally:
+        asyncio.run(client.close())
+
+    assert entry.created_at == 1_690_000_000
+    assert entry.curkey == "cached-curkey"
+    assert entry.unikey == "cached-unikey"
+
+
+def test_daemon_detail_feed_uses_legacy_feed_time_when_primary_detail_omits_time(tmp_path: Path) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    store = StateStore(tmp_path)
+    store.write(
+        BridgeState(
+            session=SessionState(
+                uin=12345,
+                cookies={"uin": "12345", "p_skey": "token"},
+                qzonetokens={"12345": "token"},
+                needs_rebind=False,
+            )
+        )
+    )
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+    calls: list[str] = []
+
+    async def fake_detail(hostuin: int, fid: str, *, appid: int = 311, busi_param: str = ""):
+        calls.append("detail")
+        return {
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "summary": "详情内容",
+            "nickname": "详情昵称",
+        }
+
+    async def fake_legacy_recent_feeds():
+        calls.append("legacy_recent")
+        return {
+            "vFeeds": [
+                {
+                    "hostuin": 12345,
+                    "fid": "fid-daemon-time",
+                    "appid": 311,
+                    "summary": "列表内容",
+                    "nickname": "列表昵称",
+                    "created_at": 1_690_000_000,
+                    "curkey": "legacy-curkey",
+                    "unikey": "legacy-unikey",
+                }
+            ]
+        }
+
+    async def fake_legacy_feeds(hostuin: int, *, page: int = 1, num: int = 20):
+        calls.append("legacy_profile")
+        return {"vFeeds": []}
+
+    service.client.detail = fake_detail
+    service.client.legacy_recent_feeds = fake_legacy_recent_feeds
+    service.client.legacy_feeds = fake_legacy_feeds
+
+    try:
+        payload = asyncio.run(service.detail_feed(hostuin=12345, fid="fid-daemon-time", appid=311))
+    finally:
+        asyncio.run(service.client.close())
+
+    entry = payload["entry"]
+    assert calls == ["detail", "legacy_recent"]
+    assert entry["summary"] == "详情内容"
+    assert entry["nickname"] == "详情昵称"
+    assert entry["created_at"] == 1_690_000_000
+    assert entry["curkey"] == "legacy-curkey"
+    assert entry["unikey"] == "legacy-unikey"
 
 
 def test_post_render_profile_keeps_nickname_without_social_extractor(
