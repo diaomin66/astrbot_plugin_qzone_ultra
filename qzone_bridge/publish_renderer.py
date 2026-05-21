@@ -32,8 +32,9 @@ MUTED = (96, 104, 112)
 LINE = (226, 226, 226)
 ACTION = (24, 24, 24)
 CARD_BG = (250, 250, 250)
-COMMENT_BG = (248, 249, 250)
-COMMENT_ACCENT = (69, 112, 203)
+COMMENT_BG = (248, 250, 249)
+COMMENT_ACCENT = (77, 113, 201)
+COMMENT_LABEL = (100, 110, 128)
 FILE_COLORS = {
     ".pdf": (216, 74, 64),
     ".doc": (64, 112, 205),
@@ -101,21 +102,42 @@ class _CommentSection:
     lines: list[str]
     height: int
     box_height: int
+    box_x_offset: int
     pad_x: int
+    pad_right: int
     pad_y: int
+    pad_bottom: int
     divider_gap_top: int
     divider_gap_bottom: int
     label_gap: int
     line_height: int
     label_height: int
+    radius: int
+    accent_width: int
+    accent_curve_radius: int
+    accent_tail_length: int
 
 
 def preload_static_render_assets() -> None:
     """Warm fonts and the static action-strip image before the first publish render."""
 
-    for size, bold in ((27, True), (25, True), (24, False), (22, False), (20, False), (18, False), (17, False), (34, True)):
+    for size, bold in (
+        (34, False),
+        (31, True),
+        (30, False),
+        (27, True),
+        (27, False),
+        (25, True),
+        (24, False),
+        (22, True),
+        (22, False),
+        (20, False),
+        (18, False),
+        (17, False),
+        (34, True),
+    ):
         _font(_scale_px(size), bold=bold)
-    for target_width in (220, 230, 240, 250, 260):
+    for target_width in (220, 230, 240, 250, 260, 280, 290):
         _action_strip(_scale_px(target_width))
 
 
@@ -283,7 +305,7 @@ def render_publish_result_image(
             scale=render_scale,
         )
     width = _scale_px(logical_width, render_scale)
-    margin = _scale_px(24, render_scale)
+    margin = _scale_px(27, render_scale)
     content_width = width - margin * 2
     meta_font = _font(_scale_px(18, render_scale))
     small_font = _font(_scale_px(17, render_scale))
@@ -297,15 +319,15 @@ def render_publish_result_image(
     dense_layout = len(text_lines) > 8 or len(post.media) + len(post.attachments) > 2
     compact_text_len = len(re.sub(r"\s+", "", content_text))
     short_text_only = not post.media and not post.attachments and compact_text_len <= 45
-    avatar_size = _scale_px(70 if len(text_lines) > 12 else 76 if dense_layout else 80, render_scale)
+    avatar_size = _scale_px(70 if len(text_lines) > 12 else 76 if dense_layout else 88, render_scale)
     header_y = _scale_px(22 if short_text_only else 24 if dense_layout else 26, render_scale)
     header_gap = _scale_px(16 if short_text_only else 18 if dense_layout else 22, render_scale)
     content_y = header_y + avatar_size + header_gap
     name_font = _font(_scale_px(28 if len(text_lines) > 12 else 30 if dense_layout else 31, render_scale), bold=True)
     time_font = _font(_scale_px(19 if dense_layout else 20, render_scale))
     block_gap = _scale_px(12 if short_text_only else 14 if dense_layout else 18, render_scale)
-    action_gap = _scale_px(4 if short_text_only else 6 if dense_layout else 8, render_scale)
-    bottom_padding = _scale_px(16 if short_text_only else 20 if dense_layout else 24, render_scale)
+    action_gap = _scale_px(4 if short_text_only else 6 if dense_layout else 15, render_scale)
+    bottom_padding = _scale_px(16 if short_text_only else 20 if dense_layout else 37, render_scale)
     line_height = _line_height(scratch, text_font, line_spacing)
     text_height = len(text_lines) * line_height if text_lines else 0
 
@@ -535,7 +557,7 @@ def _content_text_layout(
     if not compact_text:
         return _font(_scale_px(27, scale)), [], 1.26
     if len(compact_text) <= 45:
-        candidates = ((30, 4, 1.2), (29, 6, 1.2), (28, 999, 1.2))
+        candidates = ((34, 4, 1.2), (33, 6, 1.2), (32, 999, 1.2))
     elif len(compact_text) <= 120:
         candidates = ((29, 8, 1.22), (28, 11, 1.22), (27, 999, 1.22))
     elif len(compact_text) <= 260:
@@ -652,6 +674,18 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, 
     return lines
 
 
+def _merge_orphan_punctuation_lines(lines: list[str]) -> list[str]:
+    punctuation = "，。！？；：、,.!?;:"
+    merged: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if merged and 0 < len(stripped) <= 2 and all(char in punctuation for char in stripped):
+            merged[-1] = f"{merged[-1].rstrip()}{stripped}"
+        else:
+            merged.append(line)
+    return merged
+
+
 def _truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
     if _measure(draw, text, font) <= max_width:
         return text
@@ -677,32 +711,49 @@ def _comment_section_layout(
     if not text:
         return None
 
-    font = _font(_scale_px(22 if dense_layout else 23, scale))
-    label_font = _font(_scale_px(18 if dense_layout else 19, scale), bold=True)
-    pad_x = _scale_px(16 if dense_layout else 18, scale)
-    pad_y = _scale_px(11 if dense_layout else 13, scale)
-    divider_gap_top = _scale_px(4 if dense_layout else 6, scale)
-    divider_gap_bottom = _scale_px(12 if dense_layout else 14, scale)
-    label_gap = _scale_px(7, scale)
-    line_height = _line_height(draw, font, 1.22)
+    font = _font(_scale_px(27 if dense_layout else 31, scale))
+    label_font = _font(_scale_px(20 if dense_layout else 22, scale), bold=True)
+    accent_width = _scale_px(7 if dense_layout else 8, scale)
+    accent_gap = 0
+    box_x_offset = accent_width + accent_gap
+    pad_x = _scale_px(17 if dense_layout else 20, scale)
+    pad_right = _scale_px(6 if dense_layout else 3, scale)
+    pad_y = _scale_px(27 if dense_layout else 29, scale)
+    pad_bottom = _scale_px(35 if dense_layout else 39, scale)
+    divider_gap_top = _scale_px(10 if dense_layout else 16, scale)
+    divider_gap_bottom = _scale_px(46 if dense_layout else 52, scale)
+    label_gap = _scale_px(18 if dense_layout else 22, scale)
+    line_height = _line_height(draw, font, 1.45)
     label_height = _line_height(draw, label_font, 1.0)
-    lines = _wrap_text(draw, text, font, max(1, content_width - pad_x * 2))
+    lines = _merge_orphan_punctuation_lines(
+        _wrap_text(draw, text, font, max(1, content_width - box_x_offset - pad_x - pad_right))
+    )
     body_height = max(line_height, len(lines) * line_height)
-    box_height = pad_y * 2 + label_height + label_gap + body_height
+    box_height = pad_y + label_height + label_gap + body_height + pad_bottom
     height = divider_gap_top + _scale_px(1, scale) + divider_gap_bottom + box_height
+    radius = _scale_px(28 if dense_layout else 34, scale)
+    accent_curve_radius = _scale_px(22 if dense_layout else 24, scale)
+    accent_tail_length = _scale_px(18 if dense_layout else 20, scale)
     return _CommentSection(
         font=font,
         label_font=label_font,
         lines=lines,
         height=height,
         box_height=box_height,
+        box_x_offset=box_x_offset,
         pad_x=pad_x,
+        pad_right=pad_right,
         pad_y=pad_y,
+        pad_bottom=pad_bottom,
         divider_gap_top=divider_gap_top,
         divider_gap_bottom=divider_gap_bottom,
         label_gap=label_gap,
         line_height=line_height,
         label_height=label_height,
+        radius=radius,
+        accent_width=accent_width,
+        accent_curve_radius=accent_curve_radius,
+        accent_tail_length=accent_tail_length,
     )
 
 
@@ -719,23 +770,72 @@ def _draw_comment_section(
     draw.line((x, divider_y, x + width, divider_y), fill=LINE, width=_scale_px(1, scale))
 
     box_y = divider_y + _scale_px(1, scale) + section.divider_gap_bottom
-    box = (x, box_y, x + width, box_y + section.box_height)
-    draw.rounded_rectangle(box, radius=_scale_px(8, scale), fill=COMMENT_BG, outline=LINE, width=_scale_px(1, scale))
-    accent_width = _scale_px(4, scale)
-    accent_inset_y = _scale_px(1, scale)
-    draw.rounded_rectangle(
-        (x, box_y + accent_inset_y, x + accent_width, box_y + section.box_height - accent_inset_y),
-        radius=max(1, accent_width // 2),
-        fill=COMMENT_ACCENT,
-    )
+    box_x = x + section.box_x_offset
+    box = (box_x, box_y, x + width, box_y + section.box_height)
+    _draw_comment_box(draw, box, section)
+    _draw_comment_accent(draw, x, box_y, section)
 
-    text_x = x + section.pad_x
+    text_x = box_x + section.pad_x
     text_y = box_y + section.pad_y
-    _safe_text(draw, (text_x, text_y), "评论", section.label_font, MUTED)
+    _safe_text(draw, (text_x, text_y), "评论", section.label_font, COMMENT_LABEL)
     body_y = text_y + section.label_height + section.label_gap
     for line in section.lines:
         _safe_text(draw, (text_x, body_y), line, section.font, TEXT)
         body_y += section.line_height
+
+
+def _draw_comment_box(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    section: _CommentSection,
+) -> None:
+    x1, y1, x2, y2 = box
+    right_radius = max(0, min(section.radius, (y2 - y1) // 2, (x2 - x1) // 2))
+
+    draw.rectangle((x1, y1, x2 - right_radius, y2), fill=COMMENT_BG)
+    draw.rectangle((x1, y1 + right_radius, x2, y2 - right_radius), fill=COMMENT_BG)
+    if right_radius:
+        draw.ellipse((x2 - right_radius * 2, y1, x2, y1 + right_radius * 2), fill=COMMENT_BG)
+        draw.ellipse((x2 - right_radius * 2, y2 - right_radius * 2, x2, y2), fill=COMMENT_BG)
+
+
+def _draw_comment_accent(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    box_y: int,
+    section: _CommentSection,
+) -> None:
+    width = max(1, section.accent_width)
+    half_width = max(1, width // 2)
+    center_x = x + half_width
+    top_y = box_y + half_width
+    bottom_y = box_y + section.box_height - half_width
+    radius = min(section.accent_curve_radius, max(width * 2, (bottom_y - top_y) // 2))
+    radius = max(width * 2, min(radius, max(width * 2, bottom_y - top_y - width)))
+    tail_end_x = center_x + radius + section.accent_tail_length
+    center = (center_x + radius, bottom_y - radius)
+    points: list[tuple[int, int]] = [(center_x, top_y), (center_x, bottom_y - radius)]
+    for step in range(1, 9):
+        theta = math.pi - (math.pi / 2) * (step / 8)
+        points.append(
+            (
+                int(round(center[0] + radius * math.cos(theta))),
+                int(round(center[1] + radius * math.sin(theta))),
+            )
+        )
+    points.append((tail_end_x, bottom_y))
+    try:
+        draw.line(points, fill=COMMENT_ACCENT, width=width, joint="curve")
+    except TypeError:
+        draw.line(points, fill=COMMENT_ACCENT, width=width)
+    draw.ellipse(
+        (center_x - half_width, top_y - half_width, center_x + half_width, top_y + half_width),
+        fill=COMMENT_ACCENT,
+    )
+    draw.ellipse(
+        (tail_end_x - half_width, bottom_y - half_width, tail_end_x + half_width, bottom_y + half_width),
+        fill=COMMENT_ACCENT,
+    )
 
 
 def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePreview:

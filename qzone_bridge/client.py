@@ -7,7 +7,7 @@ import base64
 import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -1167,8 +1167,28 @@ class QzoneClient:
         payload = await self.shuoshuo(fid=fid, uin=hostuin, appid=appid, busi_param=busi_param)
         return payload
 
+    def merge_cached_feed_entry(self, entry: FeedEntry) -> FeedEntry:
+        cached = self.feed_cache.get((entry.hostuin, entry.fid))
+        if cached is None:
+            return entry
+        default_unikey = compute_unikey(entry.appid, entry.hostuin, entry.fid)
+        curkey = cached.curkey if cached.curkey and entry.curkey == default_unikey else entry.curkey
+        unikey = cached.unikey if cached.unikey and entry.unikey == default_unikey else entry.unikey
+        return replace(
+            entry,
+            summary=entry.summary or cached.summary,
+            nickname=entry.nickname or cached.nickname,
+            created_at=entry.created_at if entry.created_at > 0 else cached.created_at,
+            curkey=curkey or cached.curkey,
+            unikey=unikey or cached.unikey,
+            busi_param=entry.busi_param or cached.busi_param,
+            topic_id=entry.topic_id or cached.topic_id,
+            raw=entry.raw or cached.raw,
+        )
+
     def feed_entry_from_payload(self, payload: dict[str, Any], *, default_hostuin: int = 0) -> FeedEntry:
         entry = extract_feed_entry(payload, default_hostuin=default_hostuin)
+        entry = self.merge_cached_feed_entry(entry)
         self.feed_cache[(entry.hostuin, entry.fid)] = entry
         return entry
 

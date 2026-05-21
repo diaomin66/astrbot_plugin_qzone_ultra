@@ -428,9 +428,15 @@ class QzoneDaemonService:
         comments = [item.to_dict() for item in extract_comments(raw)]
         return {"entry": asdict(entry), "comments": comments, "raw": raw}
 
-    async def _detail_from_cached_or_legacy_feed(self, *, hostuin: int, fid: str) -> dict[str, Any] | None:
+    async def _detail_from_cached_or_legacy_feed(
+        self,
+        *,
+        hostuin: int,
+        fid: str,
+        require_created_at: bool = False,
+    ) -> dict[str, Any] | None:
         cached = self.client.feed_cache.get((hostuin, fid))
-        if cached is not None:
+        if cached is not None and (not require_created_at or cached.created_at > 0):
             return self._detail_payload_from_entry(cached)
 
         fetchers: list[Any] = []
@@ -449,7 +455,7 @@ class QzoneDaemonService:
                 continue
             self.client.cache_feed_page(hostuin, entries)
             for entry in entries:
-                if entry.fid == fid:
+                if entry.fid == fid and (not require_created_at or entry.created_at > 0):
                     return self._detail_payload_from_entry(entry)
         return None
 
@@ -471,6 +477,14 @@ class QzoneDaemonService:
             if not isinstance(payload, dict):
                 raise QzoneParseError("说说详情返回格式异常")
             entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
+            if entry.created_at <= 0:
+                fallback = await self._detail_from_cached_or_legacy_feed(
+                    hostuin=hostuin,
+                    fid=fid,
+                    require_created_at=True,
+                )
+                if fallback is not None:
+                    entry = self.client.merge_cached_feed_entry(entry)
             return self._detail_payload_from_entry(entry)
         except (QzoneRequestError, QzoneParseError) as exc:
             if token_error is None and not self._should_fallback_feed_fetch(exc):
