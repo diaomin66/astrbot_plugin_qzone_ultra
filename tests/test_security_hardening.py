@@ -496,7 +496,14 @@ def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path
     from PIL import Image
 
     from qzone_bridge.media import PostPayload
-    from qzone_bridge.publish_renderer import RenderProfile, render_publish_result_image
+    from qzone_bridge.publish_renderer import (
+        COMMENT_ACCENT,
+        COMMENT_BG,
+        LINE,
+        RENDER_SCALE,
+        RenderProfile,
+        render_publish_result_image,
+    )
 
     base = render_publish_result_image(
         PostPayload(content="原始说说内容", media=[]),
@@ -522,19 +529,67 @@ def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path
             (x, y)
             for y in range(commented_image.height)
             for x in range(commented_image.width)
-            if commented_image.getpixel((x, y)) == (248, 249, 250)
+            if commented_image.getpixel((x, y)) == COMMENT_BG
         ]
         accent_coords = [
             (x, y)
             for y in range(commented_image.height)
             for x in range(commented_image.width)
-            if commented_image.getpixel((x, y)) == (69, 112, 203)
+            if commented_image.getpixel((x, y)) == COMMENT_ACCENT
         ]
         assert bg_coords
         assert accent_coords
-        assert min(y for _x, y in bg_coords) > base_image.height // 2
-        assert max(y for _x, y in accent_coords) - min(y for _x, y in accent_coords) > 30
-        assert min(x for x, _y in accent_coords) < commented_image.width // 10
+        min_bg_y = min(y for _x, y in bg_coords)
+        max_bg_x = max(x for x, _y in bg_coords)
+        min_accent_x = min(x for x, _y in accent_coords)
+        max_accent_x = max(x for x, _y in accent_coords)
+        min_accent_y = min(y for _x, y in accent_coords)
+        max_accent_y = max(y for _x, y in accent_coords)
+        top_edge_accent = [(x, y) for x, y in accent_coords if y == min_bg_y]
+        top_edge_bg = [(x, y) for x, y in bg_coords if y == min_bg_y]
+        upper_vertical_accent = [
+            (x, y)
+            for x, y in accent_coords
+            if min_bg_y + 20 * RENDER_SCALE <= y <= min_bg_y + 45 * RENDER_SCALE
+        ]
+        vertical_contact_y = min_bg_y + 28 * RENDER_SCALE
+        vertical_accent_edge = [x for x, y in accent_coords if y == vertical_contact_y]
+        vertical_bg_edge = [x for x, y in bg_coords if y == vertical_contact_y]
+        assert min_bg_y > base_image.height // 2
+        assert max_bg_x > commented_image.width - 100
+        assert max_accent_y - min_accent_y > 80 * RENDER_SCALE
+        assert max_accent_x - min_accent_x > 38 * RENDER_SCALE
+        assert top_edge_accent
+        assert top_edge_bg
+        assert 0 <= min(x for x, _y in top_edge_bg) - max(x for x, _y in top_edge_accent) <= RENDER_SCALE
+        assert upper_vertical_accent
+        assert vertical_accent_edge
+        assert vertical_bg_edge
+        assert 0 <= min(vertical_bg_edge) - max(vertical_accent_edge) <= RENDER_SCALE
+        bottom_tail = [
+            (x, y)
+            for x, y in accent_coords
+            if y >= max_accent_y - 3 * RENDER_SCALE
+        ]
+        assert max(x for x, _y in bottom_tail) - min(x for x, _y in bottom_tail) > 18 * RENDER_SCALE
+        right_cap_y_values = [y for x, y in accent_coords if x == max_accent_x]
+        assert max(right_cap_y_values) - min(right_cap_y_values) >= 2 * RENDER_SCALE
+        upper_curve_y = max_accent_y - 30 * RENDER_SCALE
+        lower_curve_y = max_accent_y - 10 * RENDER_SCALE
+        upper_curve_x_values = [x for x, y in accent_coords if y == upper_curve_y]
+        lower_curve_x_values = [x for x, y in accent_coords if y == lower_curve_y]
+        assert upper_curve_x_values
+        assert lower_curve_x_values
+        assert max(lower_curve_x_values) - max(upper_curve_x_values) >= 6 * RENDER_SCALE
+        divider_y_candidates = [
+            y
+            for x in range(commented_image.width // 10, commented_image.width - commented_image.width // 10)
+            for y in range(base_image.height // 2, min_bg_y)
+            if commented_image.getpixel((x, y)) == LINE
+        ]
+        assert divider_y_candidates
+        divider_y = min(divider_y_candidates)
+        assert min_bg_y - divider_y >= 44 * RENDER_SCALE
 
 
 def test_qzone_post_card_range_combines_when_renderer_combiner_is_missing(
@@ -792,6 +847,108 @@ def test_direct_qzone_commands_render_original_post_time(
     profiles = captured["profiles"]
     assert profiles[-1].time_text == datetime.fromtimestamp(1_690_000_000).strftime("%m-%d %H:%M")
     assert any(item.get("type") == "image" for item in results)
+
+
+@pytest.mark.parametrize(
+    ("command_name", "message_str"),
+    [
+        ("view_feed", "看说说 1"),
+        ("like_feed", "赞说说 1"),
+    ],
+)
+def test_chinese_feed_commands_render_original_post_time(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command_name: str,
+    message_str: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"profiles": []}
+    created_at = 1_690_123_456
+
+    class _Event:
+        stopped = False
+
+        def __init__(self):
+            self.message_str = message_str
+
+        def is_admin(self):
+            return True
+
+        def stop_event(self):
+            self.stopped = True
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _PostService:
+        async def like_post(self, post):
+            captured["liked_fid"] = post.fid
+            return {"ok": True, "liked": True}
+
+    post = main.QzonePost(
+        hostuin=12345,
+        fid="fid-feed",
+        summary="原说说内容",
+        nickname="真实昵称",
+        created_at=created_at,
+        local_id=1,
+    )
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts_for_event(event, names, **kwargs):
+        captured["names"] = names
+        captured["post_kwargs"] = kwargs
+        return [post]
+
+    def fake_render(post_payload, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{command_name}.png"
+        path.write_bytes(b"png")
+        captured["profiles"].append(profile)
+        captured["render_result"] = result
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+        max_feed_limit=20,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = types.SimpleNamespace()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_event = fake_posts_for_event
+    plugin._post_service = lambda: _PostService()
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+
+    async def collect_results():
+        event = _Event()
+        results = []
+        iterator = plugin.view_feed(event) if command_name == "view_feed" else plugin.like_feed(event)
+        async for item in iterator:
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    profiles = captured["profiles"]
+    assert profiles
+    assert profiles[0].nickname == "真实昵称"
+    assert profiles[0].time_text == datetime.fromtimestamp(created_at).strftime("%m-%d %H:%M")
+    assert captured["post_kwargs"]["with_detail"] is True
+    assert any(result["type"] == "image" for result in results)
+    if command_name == "like_feed":
+        assert captured["liked_fid"] == "fid-feed"
 
 
 def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
