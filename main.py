@@ -29,6 +29,8 @@ REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052002
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
+AUTO_BIND_RETRY_ATTEMPTS = 3
+AUTO_BIND_RETRY_DELAY_SECONDS = 1.0
 
 SENSITIVE_LOG_KEYS = {
     "cookie",
@@ -807,6 +809,8 @@ class QzoneStablePlugin(Star):
         )
         self._capture_onebot_client_from_context()
         self._daemon_warmup_task: asyncio.Task | None = None
+        self._auto_bind_bootstrap_task: asyncio.Task | None = None
+        self._auto_bind_bootstrap_succeeded = False
         self._scheduled_tasks: list[asyncio.Task] = []
         self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
         self._publisher_profile_preload_task: asyncio.Task | None = None
@@ -2415,16 +2419,38 @@ class QzoneStablePlugin(Star):
             if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
                 return status
 
-            cookie_text = await fetch_cookie_text(bot, domain=self.settings.cookie_domain)
-            if not cookie_text:
-                raise QzoneCookieAcquireError(f"OneBot 没有返回可用 Cookie。{self._cookie_binding_hint()}")
+            last_error: QzoneBridgeError | None = None
+            for attempt in range(1, AUTO_BIND_RETRY_ATTEMPTS + 1):
+                try:
+                    cookie_text = await fetch_cookie_text(bot, domain=self.settings.cookie_domain)
+                    if not cookie_text:
+                        raise QzoneCookieAcquireError(f"OneBot 没有返回可用 Cookie。{self._cookie_binding_hint()}")
 
-            try:
-                cookie_uin = normalize_uin(parse_cookie_text(cookie_text))
-            except Exception:
-                cookie_uin = 0
-            payload = await self.controller.bind_cookie_local(cookie_text, uin=cookie_uin, source=source)
-            return payload
+                    try:
+                        cookie_uin = normalize_uin(parse_cookie_text(cookie_text))
+                    except Exception:
+                        cookie_uin = 0
+                    payload = await self.controller.bind_cookie_local(cookie_text, uin=cookie_uin, source=source)
+                    if attempt > 1:
+                        logger.info("qzone auto bind succeeded on attempt %s/%s", attempt, AUTO_BIND_RETRY_ATTEMPTS)
+                    return payload
+                except QzoneBridgeError as exc:
+                    last_error = exc
+                except Exception as exc:
+                    last_error = QzoneCookieAcquireError(f"自动绑定 Cookie 失败：{exc}")
+
+                logger.warning(
+                    "qzone auto bind attempt %s/%s failed: %s",
+                    attempt,
+                    AUTO_BIND_RETRY_ATTEMPTS,
+                    last_error,
+                )
+                if attempt < AUTO_BIND_RETRY_ATTEMPTS:
+                    await asyncio.sleep(AUTO_BIND_RETRY_DELAY_SECONDS)
+
+            if last_error is not None:
+                raise last_error
+            raise QzoneCookieAcquireError(f"OneBot 没有返回可用 Cookie。{self._cookie_binding_hint()}")
 
     async def _ensure_cookie_ready(
         self,
@@ -2444,17 +2470,39 @@ class QzoneStablePlugin(Star):
         self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
         return payload
 
-    async def _bootstrap_auto_bind(self, trigger: str) -> None:
-        client = self._capture_onebot_client_from_context()
-        if client is None or not self.settings.auto_bind_cookie:
+    async def _bootstrap_auto_bind(self, trigger: str, event: AstrMessageEvent | None = None) -> bool:
+        client = self._capture_onebot_client(event) if event is not None else self._capture_onebot_client_from_context()
+        if client is None:
             await self._prewarm_daemon_if_cookie_ready(trigger)
-            return
+            return False
+        if not self.settings.auto_bind_cookie:
+            await self._prewarm_daemon_if_cookie_ready(trigger)
+            return True
         try:
-            await self._ensure_cookie_ready(source="aiocqhttp")
+            await self._ensure_cookie_ready(event, source="aiocqhttp")
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
-            return
+            return False
         await self._prewarm_daemon_if_cookie_ready(trigger)
+        return True
+
+    def _schedule_bootstrap_auto_bind(self, trigger: str, event: AstrMessageEvent | None = None) -> None:
+        task = getattr(self, "_auto_bind_bootstrap_task", None)
+        if task is not None and not task.done():
+            return
+        if bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)):
+            return
+        if event is not None and self._capture_onebot_client(event) is None and self.settings.auto_bind_cookie:
+            return
+
+        async def runner() -> None:
+            try:
+                if await self._bootstrap_auto_bind(trigger, event):
+                    self._auto_bind_bootstrap_succeeded = True
+            except Exception:
+                logger.warning("qzone auto bind on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._auto_bind_bootstrap_task = asyncio.create_task(runner())
 
     async def _prewarm_daemon_if_cookie_ready(self, trigger: str) -> None:
         if not self.settings.auto_start_daemon:
@@ -2494,6 +2542,7 @@ class QzoneStablePlugin(Star):
             except QzoneBridgeError as exc:
                 logger.warning("qzone config cookie bind failed: %s", exc)
         self._start_scheduled_tasks()
+        self._schedule_bootstrap_auto_bind("initialize")
 
     @filter.command_group("qzone")
     def qzone(self):
@@ -2502,18 +2551,22 @@ class QzoneStablePlugin(Star):
     @filter.on_astrbot_loaded()
     async def qzone_on_astrbot_loaded(self):
         self._start_scheduled_tasks()
-        await self._bootstrap_auto_bind("astrbot load")
+        self._schedule_bootstrap_auto_bind("astrbot load")
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
         self._capture_onebot_client(event)
-        if self.settings.read_prob <= 0 or random.random() >= self.settings.read_prob:
+        should_auto_read = self.settings.read_prob > 0 and random.random() < self.settings.read_prob
+        if not should_auto_read:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
             return
         group_id = str(self._group_id(event) or "")
         sender_id = str(self._sender_id(event) or "")
         if group_id and group_id in self.settings.ignore_groups:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
             return
         if sender_id and sender_id in self.settings.ignore_users:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
             return
         try:
             await self._ensure_cookie_ready(event)
@@ -3978,6 +4031,10 @@ class QzoneStablePlugin(Star):
             self._daemon_warmup_task.cancel()
             await asyncio.gather(self._daemon_warmup_task, return_exceptions=True)
             self._daemon_warmup_task = None
+        if self._auto_bind_bootstrap_task is not None:
+            self._auto_bind_bootstrap_task.cancel()
+            await asyncio.gather(self._auto_bind_bootstrap_task, return_exceptions=True)
+            self._auto_bind_bootstrap_task = None
         try:
             await self.controller.close()
         except Exception as exc:

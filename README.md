@@ -44,6 +44,8 @@ pip install -r requirements.txt
 /qzone autobind
 ```
 
+插件安装、下载后重载或 AstrBot 启动时会自动尝试执行一次 autobind；如果当时 OneBot 客户端稍后才就绪，插件会在首次捕获 aiocqhttp 事件后补触发。自动绑定最多尝试 3 次，仍失败时再使用上面的命令或手动 Cookie 绑定。
+
 如果平台无法提供 Cookie，可以手动绑定：
 
 ```text
