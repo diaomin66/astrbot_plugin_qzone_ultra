@@ -12,7 +12,7 @@ import pytest
 
 from qzone_bridge.client import QzoneClient
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import QzoneBridgeError, QzoneParseError, QzoneRequestError
+from qzone_bridge.errors import QzoneBridgeError, QzoneCookieAcquireError, QzoneParseError, QzoneRequestError
 from qzone_bridge.models import BridgeState, SessionState
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.storage import StateStore
@@ -176,6 +176,337 @@ def test_main_import_tolerates_missing_optional_renderer_exports(monkeypatch: py
                 sys.modules.pop(name, None)
         sys.modules.update(saved_modules)
         sys.modules.pop("main", None)
+
+
+def test_auto_bind_cookie_retries_empty_fetch_before_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    attempts: list[str] = []
+    sleeps: list[float] = []
+    bound: dict[str, object] = {}
+
+    class _Controller:
+        async def get_status(self, *, probe_daemon=False):
+            return {"cookie_count": 0, "needs_rebind": True}
+
+        async def bind_cookie_local(self, cookie_text, *, uin=0, source="manual"):
+            bound.update({"cookie_text": cookie_text, "uin": uin, "source": source})
+            return {"cookie_count": 4, "needs_rebind": False, "login_uin": uin}
+
+    class _Event:
+        bot = object()
+
+    async def fake_fetch_cookie_text(bot, *, domain):
+        attempts.append(domain)
+        if len(attempts) < 3:
+            return ""
+        return "uin=o12345; p_uin=o12345; p_skey=secret; skey=secret"
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(auto_bind_cookie=True, cookie_domain="user.qzone.qq.com")
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._cookie_lock = None
+    monkeypatch.setattr(main, "fetch_cookie_text", fake_fetch_cookie_text)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(plugin._auto_bind_cookie(_Event(), source="test"))
+
+    assert len(attempts) == 3
+    assert sleeps == [main.AUTO_BIND_RETRY_DELAY_SECONDS, main.AUTO_BIND_RETRY_DELAY_SECONDS]
+    assert bound == {
+        "cookie_text": "uin=o12345; p_uin=o12345; p_skey=secret; skey=secret",
+        "uin": 12345,
+        "source": "test",
+    }
+    assert result["login_uin"] == 12345
+
+
+def test_auto_bind_cookie_fails_after_three_fetch_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    attempts = 0
+    sleeps: list[float] = []
+
+    class _Controller:
+        async def get_status(self, *, probe_daemon=False):
+            return {"cookie_count": 0, "needs_rebind": True}
+
+    class _Event:
+        bot = object()
+
+    async def fake_fetch_cookie_text(bot, *, domain):
+        nonlocal attempts
+        attempts += 1
+        return ""
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(auto_bind_cookie=True, cookie_domain="user.qzone.qq.com")
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._cookie_lock = None
+    monkeypatch.setattr(main, "fetch_cookie_text", fake_fetch_cookie_text)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(QzoneCookieAcquireError):
+        asyncio.run(plugin._auto_bind_cookie(_Event()))
+
+    assert attempts == 3
+    assert sleeps == [main.AUTO_BIND_RETRY_DELAY_SECONDS, main.AUTO_BIND_RETRY_DELAY_SECONDS]
+
+
+def test_aiocqhttp_capture_schedules_bootstrap_auto_bind_without_read_prob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        bot = object()
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(auto_bind_cookie=True, read_prob=0.0)
+    plugin._onebot_client = None
+    plugin._auto_bind_bootstrap_task = None
+    plugin._auto_bind_bootstrap_succeeded = False
+
+    async def fake_bootstrap(trigger, event=None):
+        captured["trigger"] = trigger
+        captured["event"] = event
+        return True
+
+    plugin._bootstrap_auto_bind = fake_bootstrap
+
+    async def run_capture():
+        event = _Event()
+        await plugin.qzone_capture_aiocqhttp_client(event)
+        task = plugin._auto_bind_bootstrap_task
+        assert task is not None
+        await task
+        return event
+
+    event = asyncio.run(run_capture())
+
+    assert captured == {"trigger": "aiocqhttp capture", "event": event}
+    assert plugin._auto_bind_bootstrap_succeeded is True
+
+
+def test_initialize_schedules_auto_bind_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    bot = object()
+    started = False
+
+    async def run_initialize():
+        nonlocal started
+        blocker = asyncio.Event()
+        plugin = object.__new__(main.QzoneStablePlugin)
+        plugin.settings = types.SimpleNamespace(auto_bind_cookie=True, cookies_str="")
+        plugin._onebot_client = bot
+        plugin._auto_bind_bootstrap_task = None
+        plugin._auto_bind_bootstrap_succeeded = False
+        plugin._start_scheduled_tasks = lambda: None
+        plugin._capture_onebot_client_from_context = lambda: bot
+
+        async def fake_bootstrap(trigger, event=None):
+            nonlocal started
+            started = True
+            assert trigger == "initialize"
+            await blocker.wait()
+            return True
+
+        plugin._bootstrap_auto_bind = fake_bootstrap
+
+        await plugin.initialize()
+        task = plugin._auto_bind_bootstrap_task
+        assert task is not None
+        await asyncio.sleep(0)
+        assert started is True
+        assert not task.done()
+        blocker.set()
+        await task
+        assert plugin._auto_bind_bootstrap_succeeded is True
+
+    asyncio.run(run_initialize())
+
+
+def test_astrbot_loaded_schedules_auto_bind_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    bot = object()
+    started = False
+
+    async def run_loaded():
+        nonlocal started
+        blocker = asyncio.Event()
+        plugin = object.__new__(main.QzoneStablePlugin)
+        plugin.settings = types.SimpleNamespace(auto_bind_cookie=True)
+        plugin._onebot_client = bot
+        plugin._auto_bind_bootstrap_task = None
+        plugin._auto_bind_bootstrap_succeeded = False
+        plugin._start_scheduled_tasks = lambda: None
+        plugin._capture_onebot_client_from_context = lambda: bot
+
+        async def fake_bootstrap(trigger, event=None):
+            nonlocal started
+            started = True
+            assert trigger == "astrbot load"
+            await blocker.wait()
+            return True
+
+        plugin._bootstrap_auto_bind = fake_bootstrap
+
+        await plugin.qzone_on_astrbot_loaded()
+        task = plugin._auto_bind_bootstrap_task
+        assert task is not None
+        await asyncio.sleep(0)
+        assert started is True
+        assert not task.done()
+        blocker.set()
+        await task
+        assert plugin._auto_bind_bootstrap_succeeded is True
+
+    asyncio.run(run_loaded())
+
+
+def test_auto_bind_bootstrap_failure_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    bot = object()
+    attempts: list[str] = []
+
+    async def run_retries():
+        plugin = object.__new__(main.QzoneStablePlugin)
+        plugin.settings = types.SimpleNamespace(auto_bind_cookie=True)
+        plugin._onebot_client = bot
+        plugin._auto_bind_bootstrap_task = None
+        plugin._auto_bind_bootstrap_succeeded = False
+        plugin._capture_onebot_client_from_context = lambda: bot
+
+        async def fake_bootstrap(trigger, event=None):
+            attempts.append(trigger)
+            return len(attempts) > 1
+
+        plugin._bootstrap_auto_bind = fake_bootstrap
+
+        plugin._schedule_bootstrap_auto_bind("first")
+        first_task = plugin._auto_bind_bootstrap_task
+        assert first_task is not None
+        await first_task
+        assert plugin._auto_bind_bootstrap_succeeded is False
+
+        plugin._schedule_bootstrap_auto_bind("second")
+        second_task = plugin._auto_bind_bootstrap_task
+        assert second_task is not None
+        assert second_task is not first_task
+        await second_task
+        assert plugin._auto_bind_bootstrap_succeeded is True
+
+    asyncio.run(run_retries())
+    assert attempts == ["first", "second"]
+
+
+def test_aiocqhttp_capture_schedules_auto_bind_when_auto_read_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        bot = object()
+
+        def get_group_id(self):
+            return 42
+
+        def get_sender_id(self):
+            return 7
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        auto_bind_cookie=True,
+        read_prob=1.0,
+        ignore_groups=["42"],
+        ignore_users=[],
+    )
+    plugin._onebot_client = None
+    plugin._auto_bind_bootstrap_task = None
+    plugin._auto_bind_bootstrap_succeeded = False
+
+    async def fake_bootstrap(trigger, event=None):
+        captured["trigger"] = trigger
+        captured["event"] = event
+        return True
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("ignored auto-read events should not synchronously bind")
+
+    plugin._bootstrap_auto_bind = fake_bootstrap
+    plugin._ensure_cookie_ready = fail_if_called
+
+    async def run_capture():
+        event = _Event()
+        await plugin.qzone_capture_aiocqhttp_client(event)
+        task = plugin._auto_bind_bootstrap_task
+        assert task is not None
+        await task
+        return event
+
+    event = asyncio.run(run_capture())
+
+    assert captured == {"trigger": "aiocqhttp capture", "event": event}
+    assert plugin._auto_bind_bootstrap_succeeded is True
+
+
+def test_terminate_cancels_auto_bind_bootstrap_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    closed = False
+
+    class _Controller:
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    async def run_terminate():
+        blocker = asyncio.Event()
+        plugin = object.__new__(main.QzoneStablePlugin)
+        plugin._scheduled_tasks = []
+        plugin._publisher_profile_preload_task = None
+        plugin._daemon_warmup_task = None
+        plugin._auto_bind_bootstrap_task = asyncio.create_task(blocker.wait())
+        plugin.controller = _Controller()
+
+        await plugin.terminate()
+
+        assert plugin._auto_bind_bootstrap_task is None
+
+    asyncio.run(run_terminate())
+    assert closed is True
+
+
+def test_auto_bind_cookie_reuses_ready_status_without_fetching(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Controller:
+        async def get_status(self, *, probe_daemon=False):
+            return {"cookie_count": 4, "needs_rebind": False, "login_uin": 12345}
+
+        async def bind_cookie_local(self, *args, **kwargs):
+            raise AssertionError("ready cookie state should not be rebound")
+
+    async def fail_fetch(*args, **kwargs):
+        raise AssertionError("ready cookie state should not fetch OneBot cookies")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(auto_bind_cookie=True, cookie_domain="user.qzone.qq.com")
+    plugin.controller = _Controller()
+    plugin._onebot_client = object()
+    plugin._cookie_lock = None
+    monkeypatch.setattr(main, "fetch_cookie_text", fail_fetch)
+
+    result = asyncio.run(plugin._auto_bind_cookie())
+
+    assert result == {"cookie_count": 4, "needs_rebind": False, "login_uin": 12345}
 
 
 def test_remote_media_download_headers_do_not_send_qzone_cookie() -> None:
