@@ -2389,6 +2389,7 @@ class QzoneStablePlugin(Star):
         skipped_self = 0
         skipped_duplicate = 0
         skipped_empty = 0
+        skipped_detail = 0
         for entry in entries:
             if commented >= target_count:
                 break
@@ -2411,7 +2412,14 @@ class QzoneStablePlugin(Star):
                     if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
                         entry = detail_entry
             except Exception as exc:
-                logger.debug("qzone scheduled comment detail check failed: %s", exc)
+                skipped_detail += 1
+                logger.warning(
+                    "qzone scheduled comment skipped hostuin=%s fid=%s: detail check failed: %s",
+                    entry.hostuin,
+                    entry.fid,
+                    exc,
+                )
+                continue
             post = post_from_entry(entry, detail=(detail_payload or {}).get("raw"), local_id=0)
             if detail_payload and detail_payload.get("comments"):
                 post.comments = [
@@ -2436,17 +2444,33 @@ class QzoneStablePlugin(Star):
                 continue
             comment_text = text.strip()
             await self._post_service().comment_post(post, comment_text)
-            if getattr(self.settings, "like_when_comment", False):
-                await self._post_service().like_post(post)
-            await self._notify_admin_post_card(
-                None,
-                post,
-                f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
-                comment_text=comment_text,
-            )
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
             commented += 1
+            if getattr(self.settings, "like_when_comment", False):
+                try:
+                    await self._post_service().like_post(post)
+                except Exception as exc:
+                    logger.warning(
+                        "qzone scheduled comment like failed after comment hostuin=%s fid=%s: %s",
+                        post.hostuin,
+                        post.fid,
+                        exc,
+                    )
+            try:
+                await self._notify_admin_post_card(
+                    None,
+                    post,
+                    f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                    comment_text=comment_text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "qzone scheduled comment admin notification failed hostuin=%s fid=%s: %s",
+                    post.hostuin,
+                    post.fid,
+                    exc,
+                )
             logger.info(
                 "qzone scheduled comment posted hostuin=%s fid=%s count=%s/%s",
                 post.hostuin,
@@ -2454,14 +2478,25 @@ class QzoneStablePlugin(Star):
                 commented,
                 target_count,
             )
-        logger.info(
-            "qzone scheduled comment succeeded commented=%s skipped_self=%s skipped_duplicate=%s skipped_empty=%s scanned=%s",
-            commented,
-            skipped_self,
-            skipped_duplicate,
-            skipped_empty,
-            len(entries),
-        )
+        if commented:
+            logger.info(
+                "qzone scheduled comment succeeded commented=%s skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                commented,
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
+        else:
+            logger.info(
+                "qzone scheduled comment finished with no eligible posts skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
 
     def _get_cookie_lock(self) -> asyncio.Lock:
         if self._cookie_lock is None:

@@ -1861,6 +1861,63 @@ def test_auto_publish_once_notifies_admin_with_rendered_result(
     assert any("scheduled publish succeeded" in item for item in captured["logs"])
 
 
+def test_notify_admin_publish_result_sends_rendered_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Bot:
+        def __init__(self):
+            self.sent: list[dict[str, object]] = []
+
+        def send_group_msg(self, *, group_id: int, message):
+            self.sent.append({"group_id": group_id, "message": message})
+
+    async def fake_profile(event=None, **kwargs):
+        return main.RenderProfile(nickname="发布者", user_id="99999", avatar_source="", time_text="08:30")
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=0.35, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "scheduled-publish.png"
+        path.write_bytes(b"png")
+        captured["post"] = post
+        captured["profile"] = profile
+        captured["result"] = result
+        captured["width"] = width
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        send_admin=True,
+        manage_group=123456,
+        admin_uins=[],
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+    )
+    plugin.data_dir = tmp_path
+    plugin._onebot_client = _Bot()
+    plugin._context = None
+    plugin._publisher_render_profile = fake_profile
+    monkeypatch.setattr(main, "_render_publish_result_image", fake_render)
+
+    post = main.PostPayload(content="定时发布内容", media=[])
+    asyncio.run(plugin._notify_admin_publish_result(post, {"fid": "fid-published"}, "定时自动发布完成"))
+
+    assert captured["post"] is post
+    assert captured["result"]["fid"] == "fid-published"
+    assert captured["profile"].nickname == "发布者"
+    assert captured["width"] == 720
+    assert plugin._onebot_client.sent[0]["group_id"] == 123456
+    message = plugin._onebot_client.sent[0]["message"]
+    assert message[0]["type"] == "text"
+    assert "定时自动发布完成" in message[0]["data"]["text"]
+    assert message[1]["type"] == "image"
+    assert message[1]["data"]["file"].startswith("file:///")
+
+
 def test_auto_comment_once_comments_configured_active_latest_posts_without_duplicates(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1964,6 +2021,136 @@ def test_auto_comment_once_comments_configured_active_latest_posts_without_dupli
     assert "99999:fid-self" not in saved
     assert any("scheduled comment started" in item for item in captured["logs"])
     assert any("scheduled comment succeeded" in item and "commented=2" in item for item in captured["logs"])
+
+
+def test_auto_comment_marks_comment_done_before_like_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"comments": [], "logs": []}
+
+    entry = main.FeedEntry(hostuin=11111, fid="fid-like-fails", appid=311, summary="好友动态", nickname="阿一")
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def info(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+        def warning(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Controller:
+        async def list_feeds(self, *, hostuin=0, limit=5, cursor="", scope=""):
+            return {"items": [asdict(entry)]}
+
+        async def get_status(self, *, probe_daemon=False):
+            return {"login_uin": 99999}
+
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {"entry": asdict(entry), "comments": [], "raw": entry.raw}
+
+    class _PostStore:
+        async def upsert_async(self, post):
+            return None
+
+    class _PostService:
+        async def comment_post(self, post, text):
+            captured["comments"].append((post.hostuin, post.fid, text))
+            return {"commentid": "comment-1"}
+
+        async def like_post(self, post):
+            raise RuntimeError("like failed")
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_generate(event, post):
+        return "写得真好"
+
+    async def fake_notify(event, post, message, *, comment_text=""):
+        captured["notified"] = post.fid
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(comment_latest_count=1, max_feed_limit=20, like_when_comment=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._generate_comment_text = fake_generate
+    plugin._post_store = lambda: _PostStore()
+    plugin._post_service = lambda: _PostService()
+    plugin._notify_admin_post_card = fake_notify
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    asyncio.run(plugin._auto_comment_once())
+
+    assert captured["comments"] == [(11111, "fid-like-fails", "写得真好")]
+    assert captured["notified"] == "fid-like-fails"
+    saved = (tmp_path / "auto_comment_state.json").read_text(encoding="utf-8")
+    assert "11111:fid-like-fails" in saved
+    assert any("like failed after comment" in item for item in captured["logs"])
+
+    asyncio.run(plugin._auto_comment_once())
+    assert captured["comments"] == [(11111, "fid-like-fails", "写得真好")]
+
+
+def test_auto_comment_skips_candidate_when_detail_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"comments": [], "logs": []}
+
+    entry = main.FeedEntry(hostuin=11111, fid="fid-detail-fails", appid=311, summary="好友动态", nickname="阿一")
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def info(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+        def warning(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Controller:
+        async def list_feeds(self, *, hostuin=0, limit=5, cursor="", scope=""):
+            return {"items": [asdict(entry)]}
+
+        async def get_status(self, *, probe_daemon=False):
+            return {"login_uin": 99999}
+
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            raise RuntimeError("detail failed")
+
+    class _PostService:
+        async def comment_post(self, post, text):
+            captured["comments"].append((post.hostuin, post.fid, text))
+            return {"commentid": "comment-1"}
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(comment_latest_count=1, max_feed_limit=20, like_when_comment=False)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._post_service = lambda: _PostService()
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    asyncio.run(plugin._auto_comment_once())
+
+    assert captured["comments"] == []
+    assert not (tmp_path / "auto_comment_state.json").exists()
+    assert any("detail check failed" in item for item in captured["logs"])
+    assert any("no eligible posts" in item for item in captured["logs"])
 
 
 def test_active_feed_scope_uses_home_timeline_without_defaulting_items_to_login_uin() -> None:
