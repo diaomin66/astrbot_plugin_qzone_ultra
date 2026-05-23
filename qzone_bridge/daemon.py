@@ -34,7 +34,7 @@ from .parser import (
 )
 from .protocol import SECRET_HEADER, fail, ok
 from .selection import NUMERIC_FID_MIN_LENGTH
-from .social import extract_comments
+from .social import extract_comments, extract_images
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
 
@@ -434,9 +434,14 @@ class QzoneDaemonService:
         hostuin: int,
         fid: str,
         require_created_at: bool = False,
+        require_images: bool = False,
     ) -> dict[str, Any] | None:
         cached = self.client.feed_cache.get((hostuin, fid))
-        if cached is not None and (not require_created_at or cached.created_at > 0):
+        if (
+            cached is not None
+            and (not require_created_at or cached.created_at > 0)
+            and (not require_images or bool(extract_images(cached.raw)))
+        ):
             return self._detail_payload_from_entry(cached)
 
         fetchers: list[Any] = []
@@ -455,7 +460,11 @@ class QzoneDaemonService:
                 continue
             self.client.cache_feed_page(hostuin, entries)
             for entry in entries:
-                if entry.fid == fid and (not require_created_at or entry.created_at > 0):
+                if (
+                    entry.fid == fid
+                    and (not require_created_at or entry.created_at > 0)
+                    and (not require_images or bool(extract_images(entry.raw)))
+                ):
                     return self._detail_payload_from_entry(entry)
         return None
 
@@ -477,11 +486,12 @@ class QzoneDaemonService:
             if not isinstance(payload, dict):
                 raise QzoneParseError("说说详情返回格式异常")
             entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
-            if entry.created_at <= 0:
+            if entry.created_at <= 0 or not extract_images(entry.raw):
                 fallback = await self._detail_from_cached_or_legacy_feed(
                     hostuin=hostuin,
                     fid=fid,
-                    require_created_at=True,
+                    require_created_at=entry.created_at <= 0,
+                    require_images=not extract_images(entry.raw),
                 )
                 if fallback is not None:
                     entry = self.client.merge_cached_feed_entry(entry)

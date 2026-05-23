@@ -40,10 +40,39 @@ FEED_EXPLICIT_TIME_KEYS = (
     "publishTime",
     "feedtime",
     "feedTime",
+    "feed_time",
+    "feedsTime",
+    "feeds_time",
+    "opertime",
+    "operTime",
+    "operation_time",
+    "operationTime",
+    "uploadtime",
+    "uploadTime",
+    "addtime",
+    "addTime",
+    "ctime",
 )
 FEED_GENERIC_TIME_KEYS = (
     "timestamp",
     "date",
+)
+FEED_TIME_CONTAINER_KEYS = (
+    "data",
+    "common",
+    "cell_comm",
+    "cellComm",
+    "feed",
+    "feedInfo",
+    "feedinfo",
+    "original",
+    "summary",
+    "operation",
+    "cell",
+    "cell_summary",
+    "cellSummary",
+    "msg",
+    "message",
 )
 HTML_TIME_ATTR_KEYS = ("data-time", "data-abstime", "data-pubtime", "time", "abstime", "pubtime")
 MIN_QZONE_TIMESTAMP_SECONDS = 1_100_000_000
@@ -125,18 +154,45 @@ def _timestamp_seconds(value: Any) -> int:
     return timestamp
 
 
-def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any], html_markup: Any) -> int:
+def _iter_feed_time_sources(feed_item: dict[str, Any], common: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add(value: Any, *, depth: int = 0) -> None:
+        if not isinstance(value, dict):
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        sources.append(value)
+        if depth <= 0:
+            return
+        for key in FEED_TIME_CONTAINER_KEYS:
+            child = value.get(key)
+            if isinstance(child, dict):
+                add(child, depth=depth - 1)
+
+    add(common, depth=2)
+    add(feed_item, depth=2)
     data = feed_item.get("data")
-    data_source = data if isinstance(data, dict) else {}
-    for source in (common, feed_item, data_source):
+    if isinstance(data, dict):
+        add(data, depth=2)
+    return sources
+
+
+def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any], html_markup: Any) -> int:
+    sources = _iter_feed_time_sources(feed_item, common)
+    for source in sources:
         for key in FEED_EXPLICIT_TIME_KEYS:
             timestamp = _timestamp_seconds(source.get(key))
             if timestamp:
                 return timestamp
-    for key in FEED_GENERIC_TIME_KEYS:
-        timestamp = _timestamp_seconds(common.get(key))
-        if timestamp:
-            return timestamp
+    for source in sources:
+        for key in FEED_GENERIC_TIME_KEYS:
+            timestamp = _timestamp_seconds(source.get(key))
+            if timestamp:
+                return timestamp
     for key in HTML_TIME_ATTR_KEYS:
         timestamp = _timestamp_seconds(_html_attr(html_markup, key))
         if timestamp:

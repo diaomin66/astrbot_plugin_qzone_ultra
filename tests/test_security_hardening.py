@@ -1180,6 +1180,84 @@ def test_direct_qzone_commands_render_original_post_time(
     assert any(item.get("type") == "image" for item in results)
 
 
+def test_qzone_detail_renders_cached_feed_image_from_detail_raw(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        def is_admin(self):
+            return True
+
+        def stop_event(self):
+            pass
+
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _Controller:
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            raw = {
+                "summary": "detail text",
+                "_feed_raw": {"pic": [{"url1": "https://qzone.example.test/cached-feed.jpg"}]},
+            }
+            return {
+                "entry": {
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "appid": appid,
+                    "summary": "detail text",
+                    "nickname": "detail nickname",
+                    "created_at": 1_690_000_000,
+                    "raw": raw,
+                },
+                "raw": raw,
+                "comments": [],
+            }
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=1.5, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "detail-card.png"
+        path.write_bytes(b"png")
+        captured["post"] = post
+        return path
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=[],
+        render_publish_result=True,
+        render_result_width=720,
+        render_remote_timeout=0.01,
+        render_feed_card_limit=5,
+        max_feed_limit=20,
+    )
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    monkeypatch.setattr(main, "render_publish_result_image", fake_render)
+
+    async def collect_results():
+        results = []
+        async for item in plugin.qzone_detail(_Event(), 12345, "fid-detail-image", 311):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+    rendered_post = captured["post"]
+
+    assert rendered_post.media[0].source == "https://qzone.example.test/cached-feed.jpg"
+    assert results == [{"type": "image", "path": str(tmp_path / "rendered_posts" / "detail-card.png")}]
+
+
 @pytest.mark.parametrize(
     ("command_name", "message_str"),
     [
@@ -1451,6 +1529,110 @@ def test_feed_entry_ignores_unreasonable_generic_timestamps() -> None:
     assert entry.created_at == 0
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"data": {"feedsTime": 1_690_000_001_000}}, 1_690_000_001),
+        ({"cell_comm": {"opertime": 1_690_000_002}}, 1_690_000_002),
+        ({"original": {"uploadTime": "1690000003000"}}, 1_690_000_003),
+        ({"timestamp": 1_690_000_004}, 1_690_000_004),
+    ],
+)
+def test_feed_entry_extracts_nested_qzone_time_aliases(payload: dict[str, object], expected: int) -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "hostuin": 12345,
+            "fid": "fid-nested-time-alias",
+            "summary": "time alias",
+            **payload,
+        },
+        default_hostuin=12345,
+    )
+
+    assert entry.created_at == expected
+
+
+def test_post_from_entry_preserves_feed_images_when_detail_omits_media() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-feed-image",
+        appid=311,
+        summary="detail text",
+        nickname="viewer",
+        created_at=1_690_000_000,
+        raw={
+            "summary": "list text",
+            "pic": [
+                {
+                    "url1": "https://qzone.example.test/list-image.jpg",
+                }
+            ],
+        },
+    )
+
+    post = post_from_entry(
+        entry,
+        detail={"summary": "detail text"},
+        fallback_raw=entry.raw,
+        local_id=1,
+    )
+
+    assert post.images == ["https://qzone.example.test/list-image.jpg"]
+
+
+def test_post_from_entry_extracts_nested_qzone_image_aliases() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-nested-image",
+        appid=311,
+        summary="image aliases",
+        raw={
+            "cell_pic": {
+                "photoList": [
+                    {"originUrl": "https://qzone.example.test/origin.jpg"},
+                    {"pre": "https://qzone.example.test/preview.jpg"},
+                ]
+            },
+            "media": [{"smallUrl": "https://qzone.example.test/small.jpg"}],
+        },
+    )
+
+    post = post_from_entry(entry, local_id=1)
+
+    assert post.images == [
+        "https://qzone.example.test/origin.jpg",
+        "https://qzone.example.test/preview.jpg",
+        "https://qzone.example.test/small.jpg",
+    ]
+
+
+def test_extract_images_ignores_unsafe_sources_and_handles_cycles() -> None:
+    from qzone_bridge.social import extract_images
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    payload = {
+        "images": [
+            "base64://not-from-qzone-feed",
+            "data:image/png;base64,AAAA",
+            "not a url",
+            "file:///tmp/not-remote.png",
+            "https://qzone.example.test/ok.jpg",
+            cyclic,
+        ],
+    }
+
+    assert extract_images(payload) == ["https://qzone.example.test/ok.jpg"]
+
+
 def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
     from qzone_bridge.models import FeedEntry
     from qzone_bridge.post_service import QzonePostService
@@ -1519,6 +1701,41 @@ def test_detail_post_preserves_feed_created_at_when_detail_omits_time(tmp_path: 
     assert post.created_at == 1_690_000_000
 
 
+def test_detail_post_preserves_feed_images_when_detail_omits_media(tmp_path: Path) -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.post_service import QzonePostService
+
+    class _Controller:
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {
+                "entry": {
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "appid": appid,
+                    "summary": "detail text",
+                    "nickname": "list nickname",
+                    "raw": {"summary": "detail text"},
+                },
+                "raw": {"summary": "detail text"},
+                "comments": [],
+            }
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-detail-image",
+        appid=311,
+        summary="list text",
+        nickname="list nickname",
+        created_at=1_690_000_000,
+        raw={"pic": [{"url1": "https://qzone.example.test/feed-image.jpg"}]},
+    )
+    service = QzonePostService(_Controller(), types.SimpleNamespace(), max_feed_limit=20)
+
+    post = asyncio.run(service._detail_post(entry, local_id=1, required=True))
+
+    assert post.images == ["https://qzone.example.test/feed-image.jpg"]
+
+
 def test_client_detail_payload_preserves_cached_created_at_when_detail_omits_time() -> None:
     from qzone_bridge.models import FeedEntry
 
@@ -1550,6 +1767,41 @@ def test_client_detail_payload_preserves_cached_created_at_when_detail_omits_tim
     assert entry.created_at == 1_690_000_000
     assert entry.curkey == "cached-curkey"
     assert entry.unikey == "cached-unikey"
+
+
+def test_client_detail_payload_preserves_cached_raw_for_detail_cards() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    client = QzoneClient(SessionState(uin=12345, cookies={}))
+    try:
+        client.feed_cache[(12345, "fid-cached-image")] = FeedEntry(
+            hostuin=12345,
+            fid="fid-cached-image",
+            appid=311,
+            summary="list text",
+            nickname="list nickname",
+            created_at=1_690_000_000,
+            raw={"pic": [{"url1": "https://qzone.example.test/cached-feed.jpg"}]},
+        )
+
+        entry = client.feed_entry_from_payload(
+            {
+                "hostuin": 12345,
+                "fid": "fid-cached-image",
+                "summary": "detail text",
+                "nickname": "detail nickname",
+                "created_at": 1_690_000_000,
+            },
+            default_hostuin=12345,
+        )
+    finally:
+        asyncio.run(client.close())
+
+    post = post_from_entry(entry, detail=entry.raw, local_id=1)
+
+    assert entry.raw.get("_feed_raw") == {"pic": [{"url1": "https://qzone.example.test/cached-feed.jpg"}]}
+    assert post.images == ["https://qzone.example.test/cached-feed.jpg"]
 
 
 def test_daemon_detail_feed_uses_legacy_feed_time_when_primary_detail_omits_time(tmp_path: Path) -> None:
@@ -1592,6 +1844,7 @@ def test_daemon_detail_feed_uses_legacy_feed_time_when_primary_detail_omits_time
                     "created_at": 1_690_000_000,
                     "curkey": "legacy-curkey",
                     "unikey": "legacy-unikey",
+                    "pic": [{"url1": "https://qzone.example.test/legacy-time.jpg"}],
                 }
             ]
         }
@@ -1618,6 +1871,68 @@ def test_daemon_detail_feed_uses_legacy_feed_time_when_primary_detail_omits_time
     assert entry["unikey"] == "legacy-unikey"
 
 
+def test_daemon_detail_feed_uses_legacy_feed_media_when_primary_detail_omits_images(tmp_path: Path) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    store = StateStore(tmp_path)
+    store.write(
+        BridgeState(
+            session=SessionState(
+                uin=12345,
+                cookies={"uin": "12345", "p_skey": "token"},
+                qzonetokens={"12345": "token"},
+                needs_rebind=False,
+            )
+        )
+    )
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+    calls: list[str] = []
+
+    async def fake_detail(hostuin: int, fid: str, *, appid: int = 311, busi_param: str = ""):
+        calls.append("detail")
+        return {
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "summary": "detail text",
+            "nickname": "detail nickname",
+            "created_at": 1_690_000_000,
+        }
+
+    async def fake_legacy_recent_feeds():
+        calls.append("legacy_recent")
+        return {
+            "vFeeds": [
+                {
+                    "hostuin": 12345,
+                    "fid": "fid-daemon-image",
+                    "appid": 311,
+                    "summary": "list text",
+                    "nickname": "list nickname",
+                    "created_at": 1_690_000_000,
+                    "pic": [{"url1": "https://qzone.example.test/legacy-feed.jpg"}],
+                }
+            ]
+        }
+
+    async def fake_legacy_feeds(hostuin: int, *, page: int = 1, num: int = 20):
+        calls.append("legacy_profile")
+        return {"vFeeds": []}
+
+    service.client.detail = fake_detail
+    service.client.legacy_recent_feeds = fake_legacy_recent_feeds
+    service.client.legacy_feeds = fake_legacy_feeds
+
+    try:
+        payload = asyncio.run(service.detail_feed(hostuin=12345, fid="fid-daemon-image", appid=311))
+    finally:
+        asyncio.run(service.client.close())
+
+    entry = payload["entry"]
+    assert calls == ["detail", "legacy_recent"]
+    assert entry["raw"]["_feed_raw"]["pic"][0]["url1"] == "https://qzone.example.test/legacy-feed.jpg"
+
+
 def test_post_render_profile_keeps_nickname_without_social_extractor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1638,6 +1953,21 @@ def test_post_render_profile_keeps_nickname_without_social_extractor(
     profile = plugin._post_render_profile(post)
 
     assert profile.nickname == "正确昵称"
+
+
+def test_post_render_profile_does_not_use_current_time_when_created_at_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.data_dir = tmp_path
+
+    post = main.QzonePost(hostuin=12345, fid="fid-no-time", summary="no time", created_at=0)
+
+    profile = plugin._post_render_profile(post)
+
+    assert profile.time_text == "未知时间"
 
 
 def test_manual_comment_feed_does_not_hide_selected_posts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

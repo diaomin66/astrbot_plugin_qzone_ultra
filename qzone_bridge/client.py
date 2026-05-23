@@ -1174,6 +1174,10 @@ class QzoneClient:
         default_unikey = compute_unikey(entry.appid, entry.hostuin, entry.fid)
         curkey = cached.curkey if cached.curkey and entry.curkey == default_unikey else entry.curkey
         unikey = cached.unikey if cached.unikey and entry.unikey == default_unikey else entry.unikey
+        raw = entry.raw or cached.raw
+        if entry.raw and cached.raw:
+            raw = dict(entry.raw)
+            raw.setdefault("_feed_raw", cached.raw)
         return replace(
             entry,
             summary=entry.summary or cached.summary,
@@ -1183,7 +1187,7 @@ class QzoneClient:
             unikey=unikey or cached.unikey,
             busi_param=entry.busi_param or cached.busi_param,
             topic_id=entry.topic_id or cached.topic_id,
-            raw=entry.raw or cached.raw,
+            raw=raw,
         )
 
     def feed_entry_from_payload(self, payload: dict[str, Any], *, default_hostuin: int = 0) -> FeedEntry:
