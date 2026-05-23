@@ -163,6 +163,21 @@ def _dig(value: Any, *keys: str) -> Any:
     return current
 
 
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    text = html_lib.unescape(value).strip()
+    if not text or text[0] != "{" or len(text) > 200_000:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -342,7 +357,8 @@ def _iter_feed_time_sources(feed_item: dict[str, Any], common: dict[str, Any]) -
     seen: set[int] = set()
 
     def add(value: Any, *, depth: int = 0) -> None:
-        if not isinstance(value, dict):
+        value = _json_mapping(value)
+        if not value:
             return
         marker = id(value)
         if marker in seen:
@@ -352,14 +368,14 @@ def _iter_feed_time_sources(feed_item: dict[str, Any], common: dict[str, Any]) -
         if depth <= 0:
             return
         for key in FEED_TIME_CONTAINER_KEYS:
-            child = value.get(key)
-            if isinstance(child, dict):
+            child = _json_mapping(value.get(key))
+            if child:
                 add(child, depth=depth - 1)
 
     add(common, depth=2)
     add(feed_item, depth=2)
-    data = feed_item.get("data")
-    if isinstance(data, dict):
+    data = _json_mapping(feed_item.get("data"))
+    if data:
         add(data, depth=2)
     return sources
 
@@ -670,24 +686,12 @@ def extract_feed_entry(
     default_hostuin: int = 0,
     nickname_context: dict[str, Any] | None = None,
 ) -> FeedEntry:
-    common = feed_item.get("common") or feed_item.get("cell_comm") or {}
-    if not isinstance(common, dict):
-        common = {}
-    userinfo = feed_item.get("userinfo") or feed_item.get("user") or {}
-    if not isinstance(userinfo, dict):
-        userinfo = {}
-    like = feed_item.get("like") or {}
-    if not isinstance(like, dict):
-        like = {}
-    comment = feed_item.get("comment") or {}
-    if not isinstance(comment, dict):
-        comment = {}
-    operation = feed_item.get("operation") or {}
-    if not isinstance(operation, dict):
-        operation = {}
-    original = feed_item.get("original") or {}
-    if not isinstance(original, dict):
-        original = {}
+    common = _json_mapping(feed_item.get("common")) or _json_mapping(feed_item.get("cell_comm")) or {}
+    userinfo = _json_mapping(feed_item.get("userinfo")) or _json_mapping(feed_item.get("user")) or {}
+    like = _json_mapping(feed_item.get("like")) or {}
+    comment = _json_mapping(feed_item.get("comment")) or {}
+    operation = _json_mapping(feed_item.get("operation")) or {}
+    original = _json_mapping(feed_item.get("original")) or {}
     html_markups = _html_markup_candidates(feed_item)
     html_markup = html_markups[0] if html_markups else None
 

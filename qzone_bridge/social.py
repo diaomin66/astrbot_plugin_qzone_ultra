@@ -106,6 +106,32 @@ IMAGE_URL_KEYS = (
     "cover",
     "coverUrl",
 )
+IMAGE_ALIAS_PRIORITY_KEYS = (
+    "url3",
+    "origin_url",
+    "originUrl",
+    "original_url",
+    "originalUrl",
+    "largeurl",
+    "largeUrl",
+    "url2",
+    "pic_url",
+    "picUrl",
+    "photo_url",
+    "photoUrl",
+    "photourl",
+    "image_url",
+    "imageUrl",
+    "url",
+    "url1",
+    "pre",
+    "smallurl",
+    "smallUrl",
+    "thumb",
+    "thumbnail",
+    "cover",
+    "coverUrl",
+)
 IMAGE_CONTAINER_KEYS = (
     "images",
     "image",
@@ -155,6 +181,31 @@ IMAGE_HTML_KEYS = (
     "message",
     "text",
 )
+FEED_ID_KEYS = ("fid", "tid", "cellid", "feedid", "feedId", "ugckey", "ugcrightkey")
+FEED_FALLBACK_ID_KEYS = ("key",)
+FEED_ID_CONTAINER_KEYS = ("common", "cell_comm", "cellComm", "id")
+FEED_NODE_HINT_KEYS = (
+    "summary",
+    "content",
+    "con",
+    "msg",
+    "message",
+    "text",
+    "html",
+    "htmlContent",
+    "common",
+    "cell_comm",
+    "cellComm",
+    "userinfo",
+    "user",
+    "owner",
+    "operation",
+    "like",
+    "comment",
+    "feed",
+    "original",
+    "data",
+)
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -164,6 +215,21 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    text = unescape(value).strip()
+    if not text or text[0] != "{" or len(text) > 200_000:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def clean_qzone_text(value: Any) -> str:
@@ -449,9 +515,11 @@ def extract_comments(payload: dict[str, Any]) -> list[QzoneComment]:
     return comments
 
 
-def extract_images(payload: dict[str, Any]) -> list[str]:
+def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[str]:
     images: list[str] = []
     seen_nodes: set[int] = set()
+    target_fid = str(fid or "").strip()
+    target_hostuin = _to_int(hostuin)
 
     def valid_image_source(value: str) -> str:
         source = unescape(str(value or "")).strip().strip("\"'")
@@ -472,6 +540,56 @@ def extract_images(payload: dict[str, Any]) -> list[str]:
             value = valid_image_source(value)
             if value and value not in images:
                 images.append(value)
+
+    def best_mapping_image_source(value: dict[str, Any]) -> str:
+        for key in IMAGE_ALIAS_PRIORITY_KEYS:
+            source = valid_image_source(value.get(key))
+            if source:
+                return source
+        return ""
+
+    def mapping_feed_id(value: dict[str, Any]) -> str:
+        for key in FEED_ID_KEYS:
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return str(candidate)
+        if not best_mapping_image_source(value) and any(key in value for key in FEED_NODE_HINT_KEYS):
+            for key in FEED_FALLBACK_ID_KEYS:
+                candidate = value.get(key)
+                if candidate not in (None, ""):
+                    return str(candidate)
+        for key in FEED_ID_CONTAINER_KEYS:
+            child = _json_mapping(value.get(key))
+            if not child:
+                continue
+            for child_key in (*FEED_ID_KEYS, *FEED_FALLBACK_ID_KEYS):
+                candidate = child.get(child_key)
+                if candidate not in (None, ""):
+                    return str(candidate)
+        return ""
+
+    def mapping_hostuin(value: dict[str, Any]) -> int:
+        owner = _mapping_uin(value)
+        if owner:
+            return owner
+        for key in ("userinfo", "user", "owner", "host"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                owner = _mapping_uin(child)
+                if owner:
+                    return owner
+        return 0
+
+    def belongs_to_target(value: dict[str, Any]) -> bool:
+        if target_fid:
+            node_fid = mapping_feed_id(value)
+            if node_fid and node_fid != target_fid:
+                return False
+        if target_hostuin:
+            node_hostuin = mapping_hostuin(value)
+            if node_hostuin and node_hostuin != target_hostuin:
+                return False
+        return True
 
     def add_html_images(value: Any) -> None:
         if not isinstance(value, str):
@@ -525,8 +643,9 @@ def extract_images(payload: dict[str, Any]) -> list[str]:
         if marker in seen_nodes:
             return
         seen_nodes.add(marker)
-        for key in IMAGE_URL_KEYS:
-            add(value.get(key))
+        if not belongs_to_target(value):
+            return
+        add(best_mapping_image_source(value))
         for key in IMAGE_HTML_KEYS:
             add_html_images(value.get(key))
         if depth <= 0:
@@ -582,7 +701,7 @@ def post_from_entry(
     for source in (detail_raw, entry_raw, fallback):
         if not source:
             continue
-        for image in extract_images(source):
+        for image in extract_images(source, fid=entry.fid, hostuin=entry.hostuin):
             if image not in images:
                 images.append(image)
     nickname = (
