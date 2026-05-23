@@ -31,6 +31,7 @@ LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
 AUTO_BIND_RETRY_ATTEMPTS = 3
 AUTO_BIND_RETRY_DELAY_SECONDS = 1.0
+UNKNOWN_POST_TIME_TEXT = "未知时间"
 
 SENSITIVE_LOG_KEYS = {
     "cookie",
@@ -1132,11 +1133,11 @@ class QzoneStablePlugin(Star):
     def _post_time_text(post: QzonePost) -> str:
         created_at = int(post.created_at or 0)
         if created_at <= 0:
-            return datetime.now().strftime("%H:%M")
+            return UNKNOWN_POST_TIME_TEXT
         try:
             created = datetime.fromtimestamp(created_at)
         except (OSError, OverflowError, ValueError):
-            return datetime.now().strftime("%H:%M")
+            return UNKNOWN_POST_TIME_TEXT
         if created.date() == datetime.now().date():
             return created.strftime("%H:%M")
         return created.strftime("%m-%d %H:%M")

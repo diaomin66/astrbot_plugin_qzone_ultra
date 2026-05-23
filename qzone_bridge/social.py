@@ -6,6 +6,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from .models import FeedEntry
 from .utils import truncate
@@ -70,6 +71,66 @@ NESTED_NICKNAME_PATHS = (
     ("entry", "owner"),
     ("entry", "cell_userinfo"),
     ("entry", "cellUserInfo"),
+)
+IMAGE_URL_KEYS = (
+    "origin_url",
+    "originUrl",
+    "original_url",
+    "originalUrl",
+    "largeurl",
+    "largeUrl",
+    "url",
+    "pic_url",
+    "picUrl",
+    "photo_url",
+    "photoUrl",
+    "photourl",
+    "image_url",
+    "imageUrl",
+    "url3",
+    "url2",
+    "url1",
+    "pre",
+    "smallurl",
+    "smallUrl",
+    "thumb",
+    "thumbnail",
+    "cover",
+    "coverUrl",
+)
+IMAGE_CONTAINER_KEYS = (
+    "images",
+    "image",
+    "pics",
+    "pic",
+    "picdata",
+    "picData",
+    "cell_pic",
+    "cellPic",
+    "photos",
+    "photo",
+    "photoList",
+    "photolist",
+    "picList",
+    "piclist",
+    "imageList",
+    "imagelist",
+    "media",
+    "medias",
+    "attachment",
+    "attachments",
+)
+IMAGE_NESTED_CONTAINER_KEYS = (
+    "data",
+    "feed",
+    "entry",
+    "original",
+    "content",
+    "summary",
+    "cell",
+    "cell_summary",
+    "cellSummary",
+    "_feed_raw",
 )
 
 
@@ -367,24 +428,68 @@ def extract_comments(payload: dict[str, Any]) -> list[QzoneComment]:
 
 def extract_images(payload: dict[str, Any]) -> list[str]:
     images: list[str] = []
+    seen_nodes: set[int] = set()
+
+    def valid_image_source(value: str) -> str:
+        source = str(value or "").strip()
+        if not source:
+            return ""
+        parsed = urlparse(source)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return source
 
     def add(value: Any) -> None:
-        if isinstance(value, str) and value and value not in images:
-            images.append(value)
+        if isinstance(value, str):
+            value = valid_image_source(value)
+            if value and value not in images:
+                images.append(value)
 
-    for key in ("images", "pics", "pic"):
-        value = payload.get(key)
+    def image_url_from_mapping(value: dict[str, Any]) -> str:
+        for key in IMAGE_URL_KEYS:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return ""
+
+    def walk(value: Any, *, depth: int = 4) -> None:
+        if depth < 0:
+            return
+        if isinstance(value, str):
+            add(value)
+            return
         if isinstance(value, list):
+            marker = id(value)
+            if marker in seen_nodes:
+                return
+            seen_nodes.add(marker)
             for item in value:
-                if isinstance(item, str):
-                    add(item)
-                elif isinstance(item, dict):
-                    add(item.get("url") or item.get("pic_url") or item.get("smallurl") or item.get("origin_url"))
-        elif isinstance(value, dict):
-            add(value.get("url") or value.get("pic_url") or value.get("smallurl") or value.get("origin_url"))
+                walk(item, depth=depth - 1)
+            return
+        if not isinstance(value, dict):
+            return
 
-    for item in _iter_mappings(payload.get("picdata")):
-        add(item.get("url") or item.get("pic_url") or item.get("smallurl") or item.get("origin_url"))
+        marker = id(value)
+        if marker in seen_nodes:
+            return
+        seen_nodes.add(marker)
+        add(image_url_from_mapping(value))
+        if depth <= 0:
+            return
+        for key in (*IMAGE_CONTAINER_KEYS, *IMAGE_NESTED_CONTAINER_KEYS):
+            child = value.get(key)
+            if child is None:
+                continue
+            if key in IMAGE_NESTED_CONTAINER_KEYS and not isinstance(child, (dict, list)):
+                continue
+            walk(child, depth=depth - 1)
+
+    for key in IMAGE_CONTAINER_KEYS:
+        walk(payload.get(key))
+    for key in IMAGE_NESTED_CONTAINER_KEYS:
+        child = payload.get(key)
+        if isinstance(child, (dict, list)):
+            walk(child)
     return images
 
 
@@ -400,6 +505,13 @@ def post_from_entry(
     fallback = fallback_raw if isinstance(fallback_raw, dict) else {}
     raw = detail_raw or entry_raw
     comments = extract_comments(raw or {})
+    images: list[str] = []
+    for source in (detail_raw, entry_raw, fallback):
+        if not source:
+            continue
+        for image in extract_images(source):
+            if image not in images:
+                images.append(image)
     nickname = (
         _clean_nickname(entry.nickname, hostuin=entry.hostuin)
         or extract_nickname(detail_raw, hostuin=entry.hostuin)
@@ -419,7 +531,7 @@ def post_from_entry(
         like_count=entry.like_count,
         comment_count=max(entry.comment_count, len(comments)),
         liked=entry.liked,
-        images=extract_images(raw or {}),
+        images=images,
         comments=comments,
         busi_param=dict(entry.busi_param or {}),
         local_id=local_id,
