@@ -1430,6 +1430,10 @@ class QzoneStablePlugin(Star):
         if callable(method):
             await self._maybe_await(method(**kwargs))
             return
+        call_action = getattr(bot, "call_action", None)
+        if callable(call_action):
+            await self._maybe_await(call_action(action, **kwargs))
+            return
         api = getattr(bot, "api", None)
         call_action = getattr(api, "call_action", None)
         if callable(call_action):

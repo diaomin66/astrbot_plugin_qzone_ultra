@@ -1901,6 +1901,80 @@ def test_admin_notification_supports_onebot_api_call_action(monkeypatch: pytest.
     assert calls == [("send_private_msg", {"user_id": 2134084530, "message": "hello"})]
 
 
+def test_admin_notification_supports_onebot_direct_call_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Context:
+        def get_config(self):
+            return {"admins_id": ["2134084530"]}
+
+    class _Bot:
+        async def call_action(self, action: str, **kwargs):
+            calls.append((action, kwargs))
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(manage_group=0, admin_uins=[])
+    plugin._context = _Context()
+
+    sent = asyncio.run(plugin._send_admin_outgoing(_Bot(), "hello"))
+
+    assert sent == 1
+    assert calls == [("send_private_msg", {"user_id": 2134084530, "message": "hello"})]
+
+
+def test_capture_onebot_client_from_context_get_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    bot = object()
+
+    class _Context:
+        def get_platform(self, platform_type: str):
+            assert platform_type == "aiocqhttp"
+            return types.SimpleNamespace(bot=bot)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._context = _Context()
+    plugin._onebot_client = None
+
+    assert plugin._capture_onebot_client_from_context() is bot
+    assert plugin._onebot_client is bot
+
+
+def test_admin_notifications_warn_when_onebot_client_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, list[str]] = {"logs": []}
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def info(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def warning(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Context:
+        def get_platform(self, platform_type: str):
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(send_admin=True)
+    plugin._context = _Context()
+    plugin._onebot_client = None
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="post")
+    payload = main.PostPayload(content="post", media=[])
+    asyncio.run(plugin._notify_admin_post_card(None, post, "comment done"))
+    asyncio.run(plugin._notify_admin_publish_result(payload, {"fid": "fid-1"}, "publish done"))
+
+    assert any("post card notification skipped: no OneBot client" in item for item in captured["logs"])
+    assert any("publish admin notification skipped: no OneBot client" in item for item in captured["logs"])
+
+
 def test_auto_publish_once_notifies_admin_with_rendered_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
