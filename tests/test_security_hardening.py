@@ -1806,6 +1806,101 @@ def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.Mon
     assert message[1]["data"]["file"].startswith("file:///")
 
 
+def test_auto_comment_admin_feedback_falls_back_to_astrbot_global_admins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Context:
+        def get_config(self):
+            return {"admins_id": ["2134084530", "not-a-qq", "2134084530"]}
+
+    class _Bot:
+        def __init__(self):
+            self.sent: list[dict[str, object]] = []
+
+        def send_private_msg(self, *, user_id: int, message):
+            self.sent.append({"user_id": user_id, "message": message})
+
+    async def fake_render_card(self, post, *, comment_text=""):
+        path = tmp_path / "auto-card.png"
+        path.write_bytes(b"png")
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(send_admin=True, manage_group=0, admin_uins=[])
+    plugin._onebot_client = _Bot()
+    plugin._context = _Context()
+    monkeypatch.setattr(main.QzoneStablePlugin, "_render_qzone_post_card", fake_render_card)
+
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="一条自动评论目标说说", nickname="小明")
+    asyncio.run(plugin._notify_admin_post_card(None, post, "定时自动评论完成", comment_text="写得真好"))
+
+    assert plugin._onebot_client.sent
+    assert plugin._onebot_client.sent[0]["user_id"] == 2134084530
+    message = plugin._onebot_client.sent[0]["message"]
+    assert message[0]["type"] == "text"
+    assert message[1]["type"] == "image"
+
+
+def test_admin_notification_logs_when_no_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, list[str]] = {"logs": []}
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def info(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def warning(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Context:
+        def get_config(self):
+            return {"admins_id": []}
+
+    class _Bot:
+        def send_private_msg(self, *, user_id: int, message):
+            raise AssertionError("no private send target should be attempted")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(manage_group=0, admin_uins=[])
+    plugin._context = _Context()
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    sent = asyncio.run(plugin._send_admin_outgoing(_Bot(), "hello"))
+
+    assert sent == 0
+    assert any("no target" in item for item in captured["logs"])
+
+
+def test_admin_notification_supports_onebot_api_call_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Context:
+        def get_config(self):
+            return {"admins_id": ["2134084530"]}
+
+    class _Api:
+        async def call_action(self, action: str, **kwargs):
+            calls.append((action, kwargs))
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(manage_group=0, admin_uins=[])
+    plugin._context = _Context()
+
+    sent = asyncio.run(plugin._send_admin_outgoing(types.SimpleNamespace(api=_Api()), "hello"))
+
+    assert sent == 1
+    assert calls == [("send_private_msg", {"user_id": 2134084530, "message": "hello"})]
+
+
 def test_auto_publish_once_notifies_admin_with_rendered_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

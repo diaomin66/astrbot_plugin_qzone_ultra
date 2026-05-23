@@ -1317,9 +1317,11 @@ class QzoneStablePlugin(Star):
         comment_text: str = "",
     ) -> None:
         if not self.settings.send_admin:
+            logger.debug("qzone admin post card notification skipped: send_admin disabled")
             return
         bot = self._capture_onebot_client(event)
         if bot is None:
+            logger.warning("qzone admin post card notification skipped: no OneBot client")
             return
         try:
             image_path = await self._render_qzone_post_card(post, comment_text=comment_text)
@@ -1329,10 +1331,13 @@ class QzoneStablePlugin(Star):
             image_path = await self._render_qzone_post_card(post)
         outgoing: Any = message
         if image_path is not None:
+            logger.info("qzone admin post card rendered path=%s", image_path)
             outgoing = [
                 {"type": "text", "data": {"text": f"{message}\n"}},
                 {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
             ]
+        else:
+            logger.warning("qzone admin post card render returned no image; sending text fallback")
         await self._send_admin_outgoing(bot, outgoing)
 
     async def _notify_admin_publish_result(
@@ -1342,10 +1347,11 @@ class QzoneStablePlugin(Star):
         message: str,
     ) -> None:
         if not getattr(self.settings, "send_admin", False):
+            logger.debug("qzone scheduled publish admin notification skipped: send_admin disabled")
             return
         bot = self._capture_onebot_client(None)
         if bot is None:
-            logger.info("qzone scheduled publish admin notification skipped: no OneBot client")
+            logger.warning("qzone scheduled publish admin notification skipped: no OneBot client")
             return
         result_text = format_action_result("发布结果", payload)
         outgoing: Any = f"{message}\n{result_text}"
@@ -1367,25 +1373,101 @@ class QzoneStablePlugin(Star):
             except Exception as exc:
                 logger.exception("qzone scheduled publish result render failed: %s", exc)
             else:
+                logger.info("qzone scheduled publish result rendered path=%s", image_path)
                 outgoing = [
                     {"type": "text", "data": {"text": f"{message}\n"}},
                     {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
                 ]
         await self._send_admin_outgoing(bot, outgoing)
 
-    async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> None:
+    @staticmethod
+    def _coerce_uin_targets(values: Any) -> list[int]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            items: Any = values.split(",")
+        elif isinstance(values, (list, tuple, set)):
+            items = values
+        else:
+            items = [values]
+        targets: list[int] = []
+        seen: set[int] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text.isdigit():
+                continue
+            target = int(text)
+            if target > 0 and target not in seen:
+                targets.append(target)
+                seen.add(target)
+        return targets
+
+    def _global_admin_targets(self) -> list[int]:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        if context is None:
+            return []
         try:
-            manage_group = int(getattr(self.settings, "manage_group", 0) or 0)
-            if manage_group and hasattr(bot, "send_group_msg"):
-                result = bot.send_group_msg(group_id=manage_group, message=outgoing)
-                await self._maybe_await(result)
-                return
-            if hasattr(bot, "send_private_msg"):
-                for admin in getattr(self.settings, "admin_uins", []):
-                    result = bot.send_private_msg(user_id=admin, message=outgoing)
-                    await self._maybe_await(result)
+            config = context.get_config()
         except Exception as exc:
-            logger.debug("qzone admin notification failed: %s", exc)
+            logger.debug("qzone global admin target lookup failed: %s", exc)
+            return []
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            return self._coerce_uin_targets(getter("admins_id", []))
+        return self._coerce_uin_targets(getattr(config, "admins_id", []))
+
+    def _admin_private_targets(self) -> tuple[list[int], str]:
+        configured = self._coerce_uin_targets(getattr(self.settings, "admin_uins", []))
+        if configured:
+            return configured, "admin_uins"
+        global_admins = self._global_admin_targets()
+        if global_admins:
+            return global_admins, "admins_id"
+        return [], ""
+
+    async def _call_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> None:
+        method = getattr(bot, action, None)
+        if callable(method):
+            await self._maybe_await(method(**kwargs))
+            return
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+        if callable(call_action):
+            await self._maybe_await(call_action(action, **kwargs))
+            return
+        raise AttributeError(f"OneBot client does not support {action}")
+
+    async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> int:
+        sent = 0
+        manage_group = int(getattr(self.settings, "manage_group", 0) or 0)
+        admin_targets, admin_source = self._admin_private_targets()
+        if manage_group:
+            try:
+                await self._call_onebot_action(bot, "send_group_msg", group_id=manage_group, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone admin notification group send failed group_id=%s: %s", manage_group, exc)
+            else:
+                logger.info("qzone admin notification sent to manage_group=%s", manage_group)
+                return 1
+
+        for admin in admin_targets:
+            try:
+                await self._call_onebot_action(bot, "send_private_msg", user_id=admin, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone admin notification private send failed user_id=%s: %s", admin, exc)
+                continue
+            sent += 1
+            logger.info("qzone admin notification sent to %s user_id=%s", admin_source, admin)
+
+        if sent:
+            return sent
+        if manage_group or admin_targets:
+            logger.warning("qzone admin notification skipped: no supported OneBot send method or all sends failed")
+        else:
+            logger.warning(
+                "qzone admin notification skipped: no target; configure manage_group/admin_uins or AstrBot admins_id"
+            )
+        return 0
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
