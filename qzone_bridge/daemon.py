@@ -116,7 +116,7 @@ class QzoneDaemonService:
         keepalive_interval: int = 120,
         request_timeout: float = 15.0,
         user_agent: str = "",
-        version: str = "0.1.0",
+        version: str = "0.3.2",
     ) -> None:
         self.store = store
         self.state = ensure_state_secret(store.read())
@@ -1182,7 +1182,7 @@ def main() -> None:
     parser.add_argument("--keepalive-interval", type=int, default=120)
     parser.add_argument("--request-timeout", type=float, default=15.0)
     parser.add_argument("--user-agent", default="")
-    parser.add_argument("--version", default="0.1.0")
+    parser.add_argument("--version", default="0.3.2")
     args = parser.parse_args()
     if not args.secret:
         parser.error("--secret or QZONE_BRIDGE_SECRET is required")

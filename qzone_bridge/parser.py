@@ -5,6 +5,7 @@ from __future__ import annotations
 import html as html_lib
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from .models import FeedEntry
@@ -27,28 +28,52 @@ FEED_CURSOR_KEYS = ("attachinfo", "attach_info", "attachInfo", "attach", "extern
 FEED_HAS_MORE_KEYS = ("hasmore", "hasMore", "hasMoreFeeds", "has_more")
 FEED_EXPLICIT_TIME_KEYS = (
     "time",
+    "timeStr",
+    "timestr",
+    "time_text",
+    "timeText",
+    "time_desc",
+    "timeDesc",
     "abstime",
     "created_time",
     "createdTime",
+    "created_time_text",
+    "createdTimeText",
     "created_at",
     "createdAt",
     "create_time",
     "createTime",
+    "create_time_text",
+    "createTimeText",
     "pubtime",
     "pub_time",
+    "pubtimeText",
+    "pub_time_text",
     "publish_time",
     "publishTime",
+    "publish_time_text",
+    "publishTimeText",
     "feedtime",
     "feedTime",
+    "feedstime",
+    "feedtimeText",
+    "feedTimeText",
+    "feedstimeText",
     "feed_time",
     "feedsTime",
     "feeds_time",
+    "feedsTimeText",
+    "feeds_time_text",
     "opertime",
     "operTime",
+    "opertimeText",
+    "operTimeText",
     "operation_time",
     "operationTime",
     "uploadtime",
     "uploadTime",
+    "uploadtimeText",
+    "uploadTimeText",
     "addtime",
     "addTime",
     "ctime",
@@ -74,13 +99,56 @@ FEED_TIME_CONTAINER_KEYS = (
     "msg",
     "message",
 )
-HTML_TIME_ATTR_KEYS = ("data-time", "data-abstime", "data-pubtime", "time", "abstime", "pubtime")
+FEED_HTML_MARKUP_KEYS = (
+    "html",
+    "htmlContent",
+    "html_content",
+    "contentHtml",
+    "content_html",
+    "richval",
+    "richVal",
+    "content",
+    "summary",
+    "con",
+    "msg",
+    "message",
+    "text",
+)
+HTML_TIME_ATTR_KEYS = (
+    "data-time",
+    "data-abstime",
+    "data-pubtime",
+    "data-timestamp",
+    "data-created-at",
+    "data-created-time",
+    "time",
+    "abstime",
+    "pubtime",
+    "timestamp",
+)
 MIN_QZONE_TIMESTAMP_SECONDS = 1_100_000_000
 MAX_QZONE_TIMESTAMP_SECONDS = 4_102_444_800
-HTML_ATTR_RE_TEMPLATE = r"""\b{name}\s*=\s*(["'])(.*?)\1"""
+HTML_ATTR_RE_TEMPLATE = r"""\b{name}\s*=\s*(?:(["'])(.*?)\1|([^\s"'<>`]+))"""
 HTML_BREAK_RE = re.compile(r"<\s*br\s*/?\s*>", re.I)
 HTML_BLOCK_RE = re.compile(r"</\s*(?:p|div|li|tr)\s*>", re.I)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+TEXT_TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{10,13})(?!\d)")
+TEXT_FULL_DATE_RE = re.compile(
+    r"(?P<year>20\d{2}|19\d{2})\s*(?:年|[-/.])\s*"
+    r"(?P<month>\d{1,2})\s*(?:月|[-/.])\s*"
+    r"(?P<day>\d{1,2})(?!\d)\s*(?:日)?"
+    r"(?:\s*(?P<hour>\d{1,2})[:：](?P<minute>\d{1,2})(?:[:：](?P<second>\d{1,2}))?)?"
+)
+TEXT_MONTH_DAY_RE = re.compile(
+    r"(?<!\d)(?P<month>\d{1,2})\s*(?:月|[-/.])\s*"
+    r"(?P<day>\d{1,2})(?!\d)\s*(?:日)?\s*"
+    r"(?P<hour>\d{1,2})[:：](?P<minute>\d{1,2})(?:[:：](?P<second>\d{1,2}))?"
+)
+TEXT_RELATIVE_DAY_RE = re.compile(
+    r"(?P<day>今天|昨天|前天)\s*"
+    r"(?P<hour>\d{1,2})[:：](?P<minute>\d{1,2})(?:[:：](?P<second>\d{1,2}))?"
+)
+TEXT_RELATIVE_AGO_RE = re.compile(r"(?P<amount>\d{1,3})\s*(?P<unit>秒|分钟|小时|天)前")
 
 
 def _dig(value: Any, *keys: str) -> Any:
@@ -133,7 +201,33 @@ def _html_attr(markup: Any, name: str) -> str:
     match = re.search(pattern, text, re.S | re.I)
     if not match:
         return ""
-    return html_lib.unescape(match.group(2)).strip()
+    return html_lib.unescape(match.group(2) or match.group(3) or "").strip()
+
+
+def _html_markup_candidates(feed_item: dict[str, Any]) -> list[Any]:
+    candidates: list[Any] = []
+    seen: set[int] = set()
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, (str, dict, list)):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            candidates.append(value)
+
+    for key in FEED_HTML_MARKUP_KEYS:
+        add(feed_item.get(key))
+
+    for key in FEED_TIME_CONTAINER_KEYS:
+        child = feed_item.get(key)
+        if isinstance(child, dict):
+            for html_key in FEED_HTML_MARKUP_KEYS:
+                add(child.get(html_key))
+
+    return candidates
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -143,8 +237,7 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _timestamp_seconds(value: Any) -> int:
-    timestamp = _int(value)
+def _normalize_timestamp_seconds(timestamp: int) -> int:
     if timestamp <= 0:
         return 0
     while timestamp > MAX_QZONE_TIMESTAMP_SECONDS and timestamp > 10_000_000_000:
@@ -152,6 +245,96 @@ def _timestamp_seconds(value: Any) -> int:
     if not (MIN_QZONE_TIMESTAMP_SECONDS <= timestamp <= MAX_QZONE_TIMESTAMP_SECONDS):
         return 0
     return timestamp
+
+
+def _datetime_to_timestamp(value: datetime) -> int:
+    try:
+        return _normalize_timestamp_seconds(int(value.timestamp()))
+    except (OSError, OverflowError, ValueError):
+        return 0
+
+
+def _timestamp_from_match(match: re.Match[str], *, default_year: int | None = None) -> int:
+    year = int(match.groupdict().get("year") or default_year or datetime.now().year)
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    hour = int(match.groupdict().get("hour") or 0)
+    minute = int(match.groupdict().get("minute") or 0)
+    second = int(match.groupdict().get("second") or 0)
+    try:
+        return _datetime_to_timestamp(datetime(year, month, day, hour, minute, second))
+    except ValueError:
+        return 0
+
+
+def _timestamp_from_text(value: str) -> int:
+    text = _html_to_text(value)
+    if not text:
+        text = html_lib.unescape(str(value or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return 0
+
+    for match in TEXT_TIMESTAMP_RE.finditer(text):
+        timestamp = _normalize_timestamp_seconds(int(match.group(1)))
+        if timestamp:
+            return timestamp
+
+    match = TEXT_FULL_DATE_RE.search(text)
+    if match:
+        timestamp = _timestamp_from_match(match)
+        if timestamp:
+            return timestamp
+
+    match = TEXT_MONTH_DAY_RE.search(text)
+    if match:
+        timestamp = _timestamp_from_match(match, default_year=datetime.now().year)
+        if timestamp:
+            return timestamp
+
+    match = TEXT_RELATIVE_DAY_RE.search(text)
+    if match:
+        days = {"今天": 0, "昨天": 1, "前天": 2}[match.group("day")]
+        base = datetime.now() - timedelta(days=days)
+        try:
+            return _datetime_to_timestamp(
+                datetime(
+                    base.year,
+                    base.month,
+                    base.day,
+                    int(match.group("hour")),
+                    int(match.group("minute")),
+                    int(match.groupdict().get("second") or 0),
+                )
+            )
+        except ValueError:
+            return 0
+
+    match = TEXT_RELATIVE_AGO_RE.search(text)
+    if match:
+        amount = int(match.group("amount"))
+        unit = match.group("unit")
+        seconds = {
+            "秒": amount,
+            "分钟": amount * 60,
+            "小时": amount * 3600,
+            "天": amount * 86400,
+        }[unit]
+        return _datetime_to_timestamp(datetime.now() - timedelta(seconds=seconds))
+
+    if "刚刚" in text:
+        return _datetime_to_timestamp(datetime.now())
+
+    return 0
+
+
+def _timestamp_seconds(value: Any) -> int:
+    timestamp = _normalize_timestamp_seconds(_int(value))
+    if timestamp:
+        return timestamp
+    if isinstance(value, str):
+        return _timestamp_from_text(value)
+    return 0
 
 
 def _iter_feed_time_sources(feed_item: dict[str, Any], common: dict[str, Any]) -> list[dict[str, Any]]:
@@ -181,7 +364,7 @@ def _iter_feed_time_sources(feed_item: dict[str, Any], common: dict[str, Any]) -
     return sources
 
 
-def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any], html_markup: Any) -> int:
+def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any], html_markups: Any) -> int:
     sources = _iter_feed_time_sources(feed_item, common)
     for source in sources:
         for key in FEED_EXPLICIT_TIME_KEYS:
@@ -193,10 +376,12 @@ def _created_at_from_feed_item(feed_item: dict[str, Any], common: dict[str, Any]
             timestamp = _timestamp_seconds(source.get(key))
             if timestamp:
                 return timestamp
-    for key in HTML_TIME_ATTR_KEYS:
-        timestamp = _timestamp_seconds(_html_attr(html_markup, key))
-        if timestamp:
-            return timestamp
+    markups = html_markups if isinstance(html_markups, list) else [html_markups]
+    for markup in markups:
+        for key in HTML_TIME_ATTR_KEYS:
+            timestamp = _timestamp_seconds(_html_attr(markup, key))
+            if timestamp:
+                return timestamp
     return 0
 
 
@@ -391,7 +576,7 @@ def unwrap_payload(payload: Any) -> Any:
 
 
 def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
-    html_markup = feed_item.get("html")
+    html_markup = _html_markup_candidates(feed_item)
     candidates = [
         feed_item.get("uin"),
         feed_item.get("hostuin"),
@@ -416,7 +601,7 @@ def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
 
 
 def extract_fid(feed_item: dict[str, Any]) -> str:
-    html_markup = feed_item.get("html")
+    html_markup = _html_markup_candidates(feed_item)
     candidates = [
         feed_item.get("fid"),
         feed_item.get("tid"),
@@ -449,6 +634,9 @@ def extract_summary_text(feed_item: dict[str, Any]) -> str:
         _text(feed_item.get("text")),
         _html_to_text(feed_item.get("html")),
     ]
+    for key in FEED_HTML_MARKUP_KEYS:
+        if key != "html":
+            candidates.append(_html_to_text(feed_item.get(key)))
     for candidate in candidates:
         if candidate:
             return truncate(str(candidate).strip(), 500)
@@ -500,7 +688,8 @@ def extract_feed_entry(
     original = feed_item.get("original") or {}
     if not isinstance(original, dict):
         original = {}
-    html_markup = feed_item.get("html")
+    html_markups = _html_markup_candidates(feed_item)
+    html_markup = html_markups[0] if html_markups else None
 
     hostuin = extract_hostuin(feed_item, default_hostuin)
     appid = _int(
@@ -511,7 +700,7 @@ def extract_feed_entry(
         311,
     )
     fid = extract_fid(feed_item)
-    created_at = _created_at_from_feed_item(feed_item, common, html_markup)
+    created_at = _created_at_from_feed_item(feed_item, common, html_markups)
     summary = extract_summary_text(feed_item)
     if not summary:
         summary = extract_summary_text(original)
