@@ -1,5 +1,5 @@
 name: astrbot_plugin_qzone_ultra
-version: 0.3.2
+version: 0.3.3
 author: 雪碧bir
 desc: QQ空间Ultra，更稳定的QQ空间插件，支持自动绑定QQ空间，采用独立进程：占用极低、稳定性极高，支持看/评/赞/发/写/删说说、回评、投稿审核、自动发评和 LLM tools。
 display_name: QQ空间Ultra

@@ -58,6 +58,22 @@ QUALITY_RESAMPLE = Image.Resampling.LANCZOS
 RENDER_SCALE = 3
 PREVIEW_MAX_EDGE = 3200
 SOURCE_IMAGE_MAX_BYTES = 32 * 1024 * 1024
+QZONE_IMAGE_HOST_SUFFIXES = (
+    "qpic.cn",
+    "gtimg.cn",
+    "qzone.qq.com",
+    "photo.qq.com",
+    "qq.com",
+)
+REMOTE_IMAGE_HEADERS = {
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+}
 ACTION_STRIP_DEFAULT_WIDTH = 260 * RENDER_SCALE
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="qzone-render")
 _THREAD_LOCAL = threading.local()
@@ -923,6 +939,7 @@ def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float, al
                 with client.stream(
                     "GET",
                     current_url,
+                    headers=_remote_image_headers(current_url),
                     timeout=httpx.Timeout(remote_timeout),
                     follow_redirects=False,
                 ) as response:
@@ -988,6 +1005,14 @@ def _thread_http_client() -> httpx.Client:
         client = httpx.Client(trust_env=False)
         _THREAD_LOCAL.http_client = client
     return client
+
+
+def _remote_image_headers(source: str) -> dict[str, str]:
+    headers = dict(REMOTE_IMAGE_HEADERS)
+    host = (urlparse(source).hostname or "").lower().rstrip(".")
+    if any(host == suffix or host.endswith(f".{suffix}") for suffix in QZONE_IMAGE_HOST_SUFFIXES):
+        headers["Referer"] = "https://user.qzone.qq.com/"
+    return headers
 
 
 def _bytes_cache_key(source: str) -> str:

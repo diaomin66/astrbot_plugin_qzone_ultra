@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
+from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import get_logger
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import sanitize_publish_content
@@ -236,6 +237,7 @@ class QzoneDaemonController:
         self._process: subprocess.Popen | None = None
         self._health_cache: tuple[int, str, bool, float] | None = None
         self._health_cache_ttl = 1.0
+        self._incompatible_daemon: tuple[int, str] | None = None
 
     def _runtime(self):
         def update(state):
@@ -305,6 +307,42 @@ class QzoneDaemonController:
     def _invalidate_health_cache(self) -> None:
         self._health_cache = None
 
+    @staticmethod
+    def _health_data(payload: dict[str, Any]) -> dict[str, Any]:
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    @classmethod
+    def _health_payload_is_qzone_daemon(cls, payload: dict[str, Any]) -> bool:
+        data = cls._health_data(payload)
+        identity_keys = ("daemon_state", "daemon_port", "daemon_version")
+        return all(key in data for key in identity_keys)
+
+    @classmethod
+    def _bridge_api_version_from_health(cls, payload: dict[str, Any]) -> int:
+        data = cls._health_data(payload)
+        try:
+            return int(data.get("bridge_api_version") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _health_payload_is_compatible(self, payload: dict[str, Any]) -> bool:
+        return (
+            self._health_payload_is_qzone_daemon(payload)
+            and self._bridge_api_version_from_health(payload) >= BRIDGE_API_VERSION
+        )
+
+    async def _stop_incompatible_daemon(self, port: int, secret: str) -> None:
+        if self._incompatible_daemon != (int(port or 0), secret):
+            return
+        self._incompatible_daemon = None
+        log.warning("qzone daemon bridge API is stale; restarting daemon on port %s", port)
+        if await self._request_daemon_shutdown(port, secret):
+            await self._wait_for_port_release(port, 3.0)
+        self._invalidate_health_cache()
+
     def _spawn_daemon(self, port: int) -> subprocess.Popen:
         runtime = self._runtime()
         cmd = [
@@ -318,6 +356,8 @@ class QzoneDaemonController:
             str(self.keepalive_interval),
             "--request-timeout",
             str(self.request_timeout),
+            "--version",
+            BRIDGE_VERSION,
         ]
         if self.user_agent:
             cmd.extend(["--user-agent", self.user_agent])
@@ -359,6 +399,8 @@ class QzoneDaemonController:
             cached_port, cached_secret, cached_ok, expires_at = self._health_cache
             if cached_port == resolved_port and cached_secret == resolved_secret and expires_at > now:
                 return cached_ok
+        if self._incompatible_daemon == (resolved_port, resolved_secret):
+            self._incompatible_daemon = None
 
         try:
             response = await self._client.get(
@@ -378,6 +420,14 @@ class QzoneDaemonController:
             return False
         ok = bool(payload.get("ok"))
         if ok:
+            if not self._health_payload_is_compatible(payload):
+                if self._health_payload_is_qzone_daemon(payload):
+                    self._incompatible_daemon = (resolved_port, resolved_secret)
+                else:
+                    self._incompatible_daemon = None
+                self._invalidate_health_cache()
+                return False
+            self._incompatible_daemon = None
             self._health_cache = (
                 resolved_port,
                 resolved_secret,
@@ -396,6 +446,7 @@ class QzoneDaemonController:
             "daemon_pid": runtime.daemon_pid,
             "daemon_port": runtime.daemon_port or self.default_port,
             "daemon_version": runtime.version,
+            "bridge_api_version": BRIDGE_API_VERSION,
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
             "login_uin": state.session.uin,
@@ -433,6 +484,7 @@ class QzoneDaemonController:
             port = runtime.daemon_port or self.default_port
             if await self._probe_health(port):
                 return self._status_from_state(self.store.read(), daemon_state="ready")
+            await self._stop_incompatible_daemon(port, runtime.secret)
 
             if not self._daemon_script().exists():
                 exc = DaemonUnavailableError(
@@ -474,6 +526,7 @@ class QzoneDaemonController:
                     if await self._probe_health(port):
                         runtime.daemon_port = port
                         runtime.daemon_pid = self._process.pid if self._process else 0
+                        runtime.version = BRIDGE_VERSION
                         runtime.started_at = now_iso()
                         runtime.last_seen_at = now_iso()
 

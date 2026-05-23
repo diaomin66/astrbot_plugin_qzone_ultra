@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 
+from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import configure_standalone_logging, get_logger
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
@@ -116,7 +117,7 @@ class QzoneDaemonService:
         keepalive_interval: int = 120,
         request_timeout: float = 15.0,
         user_agent: str = "",
-        version: str = "0.3.2",
+        version: str = BRIDGE_VERSION,
     ) -> None:
         self.store = store
         self.state = ensure_state_secret(store.read())
@@ -231,6 +232,7 @@ class QzoneDaemonService:
             "daemon_pid": runtime.daemon_pid,
             "daemon_port": runtime.daemon_port,
             "daemon_version": runtime.version,
+            "bridge_api_version": BRIDGE_API_VERSION,
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
             "uptime_seconds": self._uptime_seconds(),
@@ -1182,7 +1184,7 @@ def main() -> None:
     parser.add_argument("--keepalive-interval", type=int, default=120)
     parser.add_argument("--request-timeout", type=float, default=15.0)
     parser.add_argument("--user-agent", default="")
-    parser.add_argument("--version", default="0.3.2")
+    parser.add_argument("--version", default=BRIDGE_VERSION)
     args = parser.parse_args()
     if not args.secret:
         parser.error("--secret or QZONE_BRIDGE_SECRET is required")

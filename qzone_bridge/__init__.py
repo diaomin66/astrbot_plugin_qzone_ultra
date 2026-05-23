@@ -1,4 +1,4 @@
 """QQ空间 AstrBot bridge."""
 
-__version__ = "0.3.2"
-BRIDGE_API_VERSION = 2026052002
+__version__ = "0.3.3"
+BRIDGE_API_VERSION = 2026052301

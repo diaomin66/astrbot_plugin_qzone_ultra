@@ -520,6 +520,47 @@ def test_remote_media_download_headers_do_not_send_qzone_cookie() -> None:
         asyncio.run(client.close())
 
 
+def test_publish_renderer_uses_public_qzone_image_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge.publish_renderer as renderer
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def iter_bytes(self):
+            yield b"image-bytes"
+
+    class _Client:
+        def stream(self, method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers") or {}
+            return _Response()
+
+    monkeypatch.setattr(renderer, "is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr(renderer, "_thread_http_client", lambda: _Client())
+
+    data = renderer._read_source_bytes(
+        "https://m.qpic.cn/feed-image.jpg",
+        max_bytes=1024,
+        remote_timeout=0.1,
+    )
+
+    headers = captured["headers"]
+    assert data == b"image-bytes"
+    assert headers["Referer"] == "https://user.qzone.qq.com/"
+    assert headers["User-Agent"]
+    assert "Cookie" not in headers
+
+
 def test_remote_media_response_cookies_do_not_pollute_qzone_session(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Response:
         status_code = 200
@@ -593,6 +634,353 @@ def test_daemon_secret_is_not_passed_in_argv(tmp_path, monkeypatch: pytest.Monke
     assert "--secret" not in cmd
     assert isinstance(env, dict)
     assert env.get("QZONE_BRIDGE_SECRET")
+
+
+def test_daemon_spawn_passes_current_version(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge
+
+    captured: dict[str, object] = {}
+
+    class _Process:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd=None, **kwargs):
+        captured["cmd"] = cmd
+        return _Process()
+
+    monkeypatch.setattr("qzone_bridge.controller.subprocess.Popen", fake_popen)
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data")
+    controller._spawn_daemon(18999)
+
+    cmd = [str(item) for item in captured["cmd"]]
+    assert cmd[cmd.index("--version") + 1] == qzone_bridge.__version__
+
+
+def test_ensure_running_restarts_incompatible_daemon(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge
+
+    (tmp_path / "daemon_main.py").write_text("# daemon entry", encoding="utf-8")
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", start_timeout=0.2)
+
+    def mark_runtime_stale(state):
+        state.runtime.version = "0.3.2"
+
+    controller.store.update(mark_runtime_stale)
+    runtime = controller._runtime()
+    calls: dict[str, object] = {"health": 0, "shutdown": [], "spawn": []}
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, data: dict[str, object]):
+            self._data = data
+
+        def json(self):
+            return {"ok": True, "data": self._data}
+
+    class _Client:
+        async def get(self, url, headers=None):
+            calls["health"] = int(calls["health"]) + 1
+            if calls["health"] == 1:
+                return _Response(
+                    {
+                        "daemon_state": "ready",
+                        "daemon_port": 18999,
+                        "daemon_version": "0.3.2",
+                    }
+                )
+            return _Response(
+                {
+                    "daemon_state": "ready",
+                    "daemon_port": 18999,
+                    "daemon_version": qzone_bridge.__version__,
+                    "bridge_api_version": qzone_bridge.BRIDGE_API_VERSION,
+                }
+            )
+
+    class _Process:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    async def fake_shutdown(port: int, secret: str) -> bool:
+        calls["shutdown"].append((port, secret))
+        return True
+
+    async def fake_wait(port: int, timeout: float = 3.0) -> bool:
+        return True
+
+    def fake_spawn(port: int):
+        calls["spawn"].append(port)
+        return _Process()
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_request_daemon_shutdown", fake_shutdown)
+    monkeypatch.setattr(controller, "_wait_for_port_release", fake_wait)
+    monkeypatch.setattr(controller, "_spawn_daemon", fake_spawn)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", lambda port: asyncio.sleep(0, result=True))
+
+    status = asyncio.run(controller.ensure_running())
+
+    assert calls["shutdown"] == [(runtime.daemon_port, runtime.secret)]
+    assert calls["spawn"] == [runtime.daemon_port]
+    assert status["daemon_state"] == "ready"
+    assert status["daemon_version"] == qzone_bridge.__version__
+
+
+def test_ensure_running_does_not_shutdown_foreign_health_service(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge
+
+    (tmp_path / "daemon_main.py").write_text("# daemon entry", encoding="utf-8")
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", start_timeout=0.2)
+    runtime = controller._runtime()
+    controller._incompatible_daemon = (runtime.daemon_port, runtime.secret)
+    calls: dict[str, object] = {"health": 0, "shutdown": [], "spawn": []}
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, data: dict[str, object]):
+            self._data = data
+
+        def json(self):
+            return {"ok": True, "data": self._data}
+
+    class _Client:
+        async def get(self, url, headers=None):
+            calls["health"] = int(calls["health"]) + 1
+            if calls["health"] == 1:
+                return _Response({"service": "other-local-service"})
+            return _Response(
+                {
+                    "daemon_state": "ready",
+                    "daemon_port": 19000,
+                    "daemon_version": qzone_bridge.__version__,
+                    "bridge_api_version": qzone_bridge.BRIDGE_API_VERSION,
+                }
+            )
+
+    class _Process:
+        pid = 4322
+
+        def poll(self):
+            return None
+
+    async def fake_shutdown(port: int, secret: str) -> bool:
+        calls["shutdown"].append((port, secret))
+        return True
+
+    async def fake_port_free(port: int) -> bool:
+        return port != runtime.daemon_port
+
+    def fake_spawn(port: int):
+        calls["spawn"].append(port)
+        return _Process()
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_request_daemon_shutdown", fake_shutdown)
+    monkeypatch.setattr(controller, "_spawn_daemon", fake_spawn)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", fake_port_free)
+
+    status = asyncio.run(controller.ensure_running())
+
+    assert calls["shutdown"] == []
+    assert calls["spawn"] == [runtime.daemon_port + 1]
+    assert status["daemon_state"] == "ready"
+    assert status["daemon_port"] == runtime.daemon_port + 1
+
+
+@pytest.mark.parametrize("foreign_mode", ["not_found", "not_json", "not_ok"])
+def test_stale_incompatible_marker_is_cleared_for_failed_foreign_health(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreign_mode: str,
+) -> None:
+    import qzone_bridge
+
+    (tmp_path / "daemon_main.py").write_text("# daemon entry", encoding="utf-8")
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", start_timeout=0.2)
+    runtime = controller._runtime()
+    controller._incompatible_daemon = (runtime.daemon_port, runtime.secret)
+    calls: dict[str, object] = {"health": 0, "shutdown": [], "spawn": []}
+
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object] | None = None, *, broken_json: bool = False):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self._broken_json = broken_json
+
+        def json(self):
+            if self._broken_json:
+                raise ValueError("not json")
+            return self._payload
+
+    class _Client:
+        async def get(self, url, headers=None):
+            calls["health"] = int(calls["health"]) + 1
+            if calls["health"] == 1:
+                if foreign_mode == "not_found":
+                    return _Response(404)
+                if foreign_mode == "not_json":
+                    return _Response(200, broken_json=True)
+                return _Response(200, {"ok": False, "error": {"code": "FOREIGN"}})
+            return _Response(
+                200,
+                {
+                    "ok": True,
+                    "data": {
+                        "daemon_state": "ready",
+                        "daemon_port": 19000,
+                        "daemon_version": qzone_bridge.__version__,
+                        "bridge_api_version": qzone_bridge.BRIDGE_API_VERSION,
+                    },
+                },
+            )
+
+    class _Process:
+        pid = 4324
+
+        def poll(self):
+            return None
+
+    async def fake_shutdown(port: int, secret: str) -> bool:
+        calls["shutdown"].append((port, secret))
+        return True
+
+    async def fake_port_free(port: int) -> bool:
+        return port != runtime.daemon_port
+
+    def fake_spawn(port: int):
+        calls["spawn"].append(port)
+        return _Process()
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_request_daemon_shutdown", fake_shutdown)
+    monkeypatch.setattr(controller, "_spawn_daemon", fake_spawn)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", fake_port_free)
+
+    status = asyncio.run(controller.ensure_running())
+
+    assert calls["shutdown"] == []
+    assert calls["spawn"] == [runtime.daemon_port + 1]
+    assert status["daemon_state"] == "ready"
+
+
+def test_detail_card_after_stale_daemon_restart_has_images_and_real_time(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import qzone_bridge
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    main = _import_main_with_stubs(monkeypatch)
+    (tmp_path / "daemon_main.py").write_text("# daemon entry", encoding="utf-8")
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", start_timeout=0.2)
+    calls: dict[str, object] = {"health": 0, "shutdown": [], "spawn": [], "request": []}
+    created_at = 1_690_000_000
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]):
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        async def get(self, url, headers=None):
+            calls["health"] = int(calls["health"]) + 1
+            if calls["health"] == 1:
+                return _Response(
+                    {
+                        "ok": True,
+                        "data": {
+                            "daemon_state": "ready",
+                            "daemon_port": 18999,
+                            "daemon_version": "0.3.2",
+                        },
+                    }
+                )
+            return _Response(
+                {
+                    "ok": True,
+                    "data": {
+                        "daemon_state": "ready",
+                        "daemon_port": 18999,
+                        "daemon_version": qzone_bridge.__version__,
+                        "bridge_api_version": qzone_bridge.BRIDGE_API_VERSION,
+                    },
+                }
+            )
+
+        async def request(self, method, url, headers=None, params=None, json=None):
+            calls["request"].append((method, url))
+            raw = {
+                "picdata": {"0": {"url1": "//m.qpic.cn/restarted-card.jpg"}},
+                "htmlContent": f"<div data-abstime={created_at}>图文说说</div>",
+            }
+            return _Response(
+                {
+                    "ok": True,
+                    "data": {
+                        "entry": {
+                            "hostuin": 12345,
+                            "fid": "fid-restarted",
+                            "appid": 311,
+                            "summary": "图文说说",
+                            "nickname": "列表昵称",
+                            "created_at": created_at,
+                            "raw": raw,
+                        },
+                        "raw": raw,
+                        "comments": [],
+                    },
+                }
+            )
+
+    class _Process:
+        pid = 4323
+
+        def poll(self):
+            return None
+
+    async def fake_shutdown(port: int, secret: str) -> bool:
+        calls["shutdown"].append((port, secret))
+        return True
+
+    async def fake_wait(port: int, timeout: float = 3.0) -> bool:
+        return True
+
+    def fake_spawn(port: int):
+        calls["spawn"].append(port)
+        return _Process()
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_request_daemon_shutdown", fake_shutdown)
+    monkeypatch.setattr(controller, "_wait_for_port_release", fake_wait)
+    monkeypatch.setattr(controller, "_spawn_daemon", fake_spawn)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", lambda port: asyncio.sleep(0, result=True))
+
+    payload = asyncio.run(controller.detail_feed(hostuin=12345, fid="fid-restarted", appid=311))
+    entry = FeedEntry(**payload["entry"])
+    post = post_from_entry(entry, detail=payload.get("raw"), local_id=1)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.data_dir = tmp_path
+    profile = plugin._post_render_profile(post)
+
+    assert calls["shutdown"]
+    assert calls["spawn"] == [18999]
+    assert calls["request"]
+    assert post.images == ["https://m.qpic.cn/restarted-card.jpg"]
+    assert post.created_at == created_at
+    assert profile.time_text != "未知时间"
 
 
 def test_public_error_text_redacts_detail(monkeypatch: pytest.MonkeyPatch) -> None:
