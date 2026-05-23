@@ -1554,6 +1554,42 @@ def test_feed_entry_extracts_nested_qzone_time_aliases(payload: dict[str, object
     assert entry.created_at == expected
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {"timeStr": "2026-05-20 13:45:06"},
+            int(datetime(2026, 5, 20, 13, 45, 6).timestamp()),
+        ),
+        (
+            {"feedstimeText": "2026-05-20 13:45:07"},
+            int(datetime(2026, 5, 20, 13, 45, 7).timestamp()),
+        ),
+        (
+            {"data": {"pubtimeText": "2026年5月20日 13:45"}},
+            int(datetime(2026, 5, 20, 13, 45).timestamp()),
+        ),
+        ({"html": '<div data-abstime=1690000000>图文说说</div>'}, 1_690_000_000),
+        ({"htmlContent": "<div data-abstime=1690000001>图文说说</div>"}, 1_690_000_001),
+        ({"contentHtml": '<div timestamp="1690000002">图文说说</div>'}, 1_690_000_002),
+    ],
+)
+def test_feed_entry_extracts_real_qzone_textual_time_aliases(payload: dict[str, object], expected: int) -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "hostuin": 12345,
+            "fid": "fid-real-time-alias",
+            "summary": "真实发布时间",
+            **payload,
+        },
+        default_hostuin=12345,
+    )
+
+    assert entry.created_at == expected
+
+
 def test_post_from_entry_preserves_feed_images_when_detail_omits_media() -> None:
     from qzone_bridge.models import FeedEntry
     from qzone_bridge.social import post_from_entry
@@ -1611,6 +1647,51 @@ def test_post_from_entry_extracts_nested_qzone_image_aliases() -> None:
         "https://qzone.example.test/origin.jpg",
         "https://qzone.example.test/preview.jpg",
         "https://qzone.example.test/small.jpg",
+    ]
+
+
+def test_extract_images_handles_real_qzone_protocol_relative_sources() -> None:
+    from qzone_bridge.social import extract_images
+
+    payload = {
+        "picdata": {
+            "0": {"url1": "//m.qpic.cn/feed-a.jpg"},
+            "1": {"smallurl": "https://qzone.example.test/feed-b.jpg"},
+        },
+        "cell_pic": '{"photoList":[{"originUrl":"//qzonestyle.gtimg.cn/feed-c.jpg"}]}',
+        "html": (
+            '<div><img src="//m.qpic.cn/feed-d.jpg">'
+            '<img data-src="https://qzone.example.test/feed-e.jpg"></div>'
+        ),
+    }
+
+    assert extract_images(payload) == [
+        "https://m.qpic.cn/feed-a.jpg",
+        "https://qzone.example.test/feed-b.jpg",
+        "https://qzonestyle.gtimg.cn/feed-c.jpg",
+        "https://m.qpic.cn/feed-d.jpg",
+        "https://qzone.example.test/feed-e.jpg",
+    ]
+
+
+def test_extract_images_scans_textual_html_feed_fields() -> None:
+    from qzone_bridge.social import extract_images
+
+    payload = {
+        "content": (
+            '<img srcset="//m.qpic.cn/feed-f.jpg 1x, '
+            'https://qzone.example.test/feed-g.jpg 2x">'
+        ),
+        "summary": (
+            '<span style="background:url(//qzonestyle.gtimg.cn/feed-h.jpg)">'
+            "图文说说</span>"
+        ),
+    }
+
+    assert extract_images(payload) == [
+        "https://m.qpic.cn/feed-f.jpg",
+        "https://qzone.example.test/feed-g.jpg",
+        "https://qzonestyle.gtimg.cn/feed-h.jpg",
     ]
 
 
