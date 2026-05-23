@@ -106,6 +106,32 @@ IMAGE_URL_KEYS = (
     "cover",
     "coverUrl",
 )
+IMAGE_ALIAS_PRIORITY_KEYS = (
+    "url3",
+    "origin_url",
+    "originUrl",
+    "original_url",
+    "originalUrl",
+    "largeurl",
+    "largeUrl",
+    "url2",
+    "pic_url",
+    "picUrl",
+    "photo_url",
+    "photoUrl",
+    "photourl",
+    "image_url",
+    "imageUrl",
+    "url",
+    "url1",
+    "pre",
+    "smallurl",
+    "smallUrl",
+    "thumb",
+    "thumbnail",
+    "cover",
+    "coverUrl",
+)
 IMAGE_CONTAINER_KEYS = (
     "images",
     "image",
@@ -155,6 +181,8 @@ IMAGE_HTML_KEYS = (
     "message",
     "text",
 )
+FEED_ID_KEYS = ("fid", "tid", "cellid", "feedid", "feedId", "key", "ugckey", "ugcrightkey")
+FEED_ID_CONTAINER_KEYS = ("common", "cell_comm", "cellComm", "id")
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -449,9 +477,11 @@ def extract_comments(payload: dict[str, Any]) -> list[QzoneComment]:
     return comments
 
 
-def extract_images(payload: dict[str, Any]) -> list[str]:
+def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[str]:
     images: list[str] = []
     seen_nodes: set[int] = set()
+    target_fid = str(fid or "").strip()
+    target_hostuin = _to_int(hostuin)
 
     def valid_image_source(value: str) -> str:
         source = unescape(str(value or "")).strip().strip("\"'")
@@ -472,6 +502,51 @@ def extract_images(payload: dict[str, Any]) -> list[str]:
             value = valid_image_source(value)
             if value and value not in images:
                 images.append(value)
+
+    def best_mapping_image_source(value: dict[str, Any]) -> str:
+        for key in IMAGE_ALIAS_PRIORITY_KEYS:
+            source = valid_image_source(value.get(key))
+            if source:
+                return source
+        return ""
+
+    def mapping_feed_id(value: dict[str, Any]) -> str:
+        for key in FEED_ID_KEYS:
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return str(candidate)
+        for key in FEED_ID_CONTAINER_KEYS:
+            child = value.get(key)
+            if not isinstance(child, dict):
+                continue
+            for child_key in FEED_ID_KEYS:
+                candidate = child.get(child_key)
+                if candidate not in (None, ""):
+                    return str(candidate)
+        return ""
+
+    def mapping_hostuin(value: dict[str, Any]) -> int:
+        owner = _mapping_uin(value)
+        if owner:
+            return owner
+        for key in ("userinfo", "user", "owner", "host"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                owner = _mapping_uin(child)
+                if owner:
+                    return owner
+        return 0
+
+    def belongs_to_target(value: dict[str, Any]) -> bool:
+        if target_fid:
+            node_fid = mapping_feed_id(value)
+            if node_fid and node_fid != target_fid:
+                return False
+        if target_hostuin:
+            node_hostuin = mapping_hostuin(value)
+            if node_hostuin and node_hostuin != target_hostuin:
+                return False
+        return True
 
     def add_html_images(value: Any) -> None:
         if not isinstance(value, str):
@@ -525,8 +600,9 @@ def extract_images(payload: dict[str, Any]) -> list[str]:
         if marker in seen_nodes:
             return
         seen_nodes.add(marker)
-        for key in IMAGE_URL_KEYS:
-            add(value.get(key))
+        if not belongs_to_target(value):
+            return
+        add(best_mapping_image_source(value))
         for key in IMAGE_HTML_KEYS:
             add_html_images(value.get(key))
         if depth <= 0:
@@ -582,7 +658,7 @@ def post_from_entry(
     for source in (detail_raw, entry_raw, fallback):
         if not source:
             continue
-        for image in extract_images(source):
+        for image in extract_images(source, fid=entry.fid, hostuin=entry.hostuin):
             if image not in images:
                 images.append(image)
     nickname = (

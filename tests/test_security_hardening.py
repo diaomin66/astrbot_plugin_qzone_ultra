@@ -2102,6 +2102,67 @@ def test_extract_images_ignores_unsafe_sources_and_handles_cycles() -> None:
     assert extract_images(payload) == ["https://qzone.example.test/ok.jpg"]
 
 
+def test_extract_images_collapses_aliases_from_one_qzone_photo_object() -> None:
+    from qzone_bridge.social import extract_images
+
+    payload = {
+        "picdata": {
+            "0": {
+                "url1": "https://m.qpic.cn/one-photo-small.jpg",
+                "url2": "https://m.qpic.cn/one-photo-large.jpg",
+                "url3": "https://m.qpic.cn/one-photo-original.jpg",
+                "smallurl": "https://qzone.example.test/one-photo-thumb.jpg",
+            }
+        }
+    }
+
+    assert extract_images(payload) == ["https://m.qpic.cn/one-photo-original.jpg"]
+
+
+def test_post_from_entry_scopes_detail_images_to_current_fid() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-text-only",
+        appid=311,
+        summary="hello",
+        raw={"fid": "fid-text-only", "summary": "hello"},
+    )
+    detail_payload_with_neighbor_feed = {
+        "fid": "fid-text-only",
+        "summary": "hello",
+        "data": [
+            {"fid": "fid-text-only", "summary": "hello"},
+            {
+                "fid": "fid-with-image",
+                "summary": "想我吗",
+                "pic": [{"url3": "https://m.qpic.cn/neighbor-image.jpg"}],
+            },
+        ],
+    }
+
+    post = post_from_entry(entry, detail=detail_payload_with_neighbor_feed, local_id=2)
+
+    assert post.images == []
+
+
+def test_extract_feed_entry_reads_time_from_json_cell_comm() -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "fid": "fid-json-time",
+            "hostuin": 12345,
+            "summary": "图文说说",
+            "cell_comm": '{"abstime":1690000000}',
+        }
+    )
+
+    assert entry.created_at == 1_690_000_000
+
+
 def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
     from qzone_bridge.models import FeedEntry
     from qzone_bridge.post_service import QzonePostService
@@ -2400,6 +2461,77 @@ def test_daemon_detail_feed_uses_legacy_feed_media_when_primary_detail_omits_ima
     entry = payload["entry"]
     assert calls == ["detail", "legacy_recent"]
     assert entry["raw"]["_feed_raw"]["pic"][0]["url1"] == "https://qzone.example.test/legacy-feed.jpg"
+
+
+def test_daemon_detail_feed_ignores_neighbor_media_when_recovering_current_images(tmp_path: Path) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    store = StateStore(tmp_path)
+    store.write(
+        BridgeState(
+            session=SessionState(
+                uin=12345,
+                cookies={"uin": "12345", "p_skey": "token"},
+                qzonetokens={"12345": "token"},
+                needs_rebind=False,
+            )
+        )
+    )
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+    calls: list[str] = []
+
+    async def fake_detail(hostuin: int, fid: str, *, appid: int = 311, busi_param: str = ""):
+        calls.append("detail")
+        return {
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "summary": "hello",
+            "nickname": "椰子",
+            "created_at": 1_690_000_000,
+            "feed": [
+                {"fid": fid, "hostuin": hostuin, "summary": "hello"},
+                {
+                    "fid": "fid-neighbor",
+                    "hostuin": hostuin,
+                    "summary": "想我吗",
+                    "pic": [{"url3": "https://m.qpic.cn/neighbor-image.jpg"}],
+                },
+            ],
+        }
+
+    async def fake_legacy_recent_feeds():
+        calls.append("legacy_recent")
+        return {
+            "vFeeds": [
+                {
+                    "hostuin": 12345,
+                    "fid": "fid-current",
+                    "appid": 311,
+                    "summary": "hello",
+                    "nickname": "椰子",
+                    "created_at": 1_690_000_000,
+                    "pic": [{"url3": "https://m.qpic.cn/current-image.jpg"}],
+                }
+            ]
+        }
+
+    async def fake_legacy_feeds(hostuin: int, *, page: int = 1, num: int = 20):
+        calls.append("legacy_profile")
+        return {"vFeeds": []}
+
+    service.client.detail = fake_detail
+    service.client.legacy_recent_feeds = fake_legacy_recent_feeds
+    service.client.legacy_feeds = fake_legacy_feeds
+
+    try:
+        payload = asyncio.run(service.detail_feed(hostuin=12345, fid="fid-current", appid=311))
+    finally:
+        asyncio.run(service.client.close())
+
+    entry = payload["entry"]
+    assert calls == ["detail", "legacy_recent"]
+    assert entry["raw"]["_feed_raw"]["pic"][0]["url3"] == "https://m.qpic.cn/current-image.jpg"
 
 
 def test_post_render_profile_keeps_nickname_without_social_extractor(
