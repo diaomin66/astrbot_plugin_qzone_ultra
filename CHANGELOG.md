@@ -2,11 +2,11 @@
 
 ## v0.5.0 - 2026-05-29
 
-- Added: A full AstrBot Pages surface for Qzone under `pages/qzone`, including feed browsing, detail view, publishing, image upload, likes, comments, replies, and safe self-post deletion.
-- Added: Browser-safe page APIs and controller wiring in `qzone_bridge/page_api.py`, with opaque post ids, redacted payloads, and AstrBot Pages bridge compatibility.
-- Added: An auto-comment pipeline in `qzone_bridge/auto_comment.py`, plus command/config/runtime wiring for staged judgment, reasoning, execution, and deduplicated persistence.
-- Improved: Local daemon compatibility, page/backend health checks, plugin-side security hardening, and Page-specific regression coverage across status/feed/detail/reply/upload flows.
-- Improved: The WebUI page UX with a redesigned three-pane layout, smoother detail/reply flows, round avatars, quantity-aware media layouts, and better image presentation for mixed aspect ratios.
+- 新增：`pages/qzone` AstrBot Pages 页面端能力，支持动态流浏览、详情查看、发布说说、图片上传、点赞、评论、回复，以及安全删除自己的说说。
+- 新增：`qzone_bridge/page_api.py` 页面后端接口与控制器接线，使用不透明说说标识、脱敏返回结构，并兼容 AstrBot Pages bridge。
+- 新增：`qzone_bridge/auto_comment.py` 自动评论流水线，补齐分阶段判断、推理、执行以及去重持久化相关的命令、配置和运行时接线。
+- 优化：本地 daemon 兼容性、页面与后端健康检查、插件侧安全加固，以及覆盖状态、列表、详情、回复、上传等流程的页面回归测试。
+- 优化：WebUI 页面体验，重构三栏布局、详情与回复交互、圆形头像、多图按数量自适应排版，以及混合比例图片的展示效果。
 
 ## v0.4.3 - 2026-05-27
 
