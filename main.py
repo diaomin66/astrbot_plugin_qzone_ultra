@@ -23,10 +23,17 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
+try:
+    from quart import jsonify as _quart_jsonify
+    from quart import request as _quart_request
+except Exception:
+    _quart_jsonify = None
+    _quart_request = None
+
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052305
-LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052901
+LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
 AUTO_BIND_RETRY_ATTEMPTS = 3
@@ -435,8 +442,13 @@ def _standard_data_dir(plugin_root: Path) -> Path:
     plugin_name = _read_plugin_name(plugin_root)
     data_dir = _star_tools_data_dir(plugin_name)
     if data_dir is None:
-        return plugin_root / "data" / "qzone"
+        data_dir = plugin_root / "data" / "plugin_data" / plugin_name
     _migrate_legacy_data_dir(plugin_root / "data" / "qzone", data_dir)
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(data_dir)
+    except Exception as exc:
+        logger.warning("qzone standard data dir is not writable: %s", exc)
     return data_dir
 
 
@@ -520,6 +532,28 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             for attribute in attributes:
                 if getattr(cls, attribute, None) is None:
                     return False
+
+    signature_contracts = {
+        "qzone_bridge.controller": {"QzoneDaemonController.list_feeds": "record_recent"},
+        "qzone_bridge.daemon": {"QzoneDaemonService.list_feeds": "record_recent"},
+        "qzone_bridge.page_api": {"QzonePageApi.__init__": "preload_scheduler"},
+    }
+    for module_name, members in signature_contracts.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for dotted_name, parameter in members.items():
+            target: Any = module
+            for part in dotted_name.split("."):
+                target = getattr(target, part, None)
+                if target is None:
+                    return False
+            try:
+                if parameter not in inspect.signature(target).parameters:
+                    return False
+            except (TypeError, ValueError):
+                return False
     return True
 
 
@@ -566,6 +600,12 @@ def _load_local_qzone_bridge_package() -> None:
 
 _load_local_qzone_bridge_package()
 
+from qzone_bridge.auto_comment import (
+    AutoCommentPipeline,
+    AutoCommentPipelineConfig,
+    AutoCommentPipelineResult,
+    AutoCommentStateStore,
+)
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
@@ -574,6 +614,7 @@ from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, nor
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
+from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
 import qzone_bridge.publish_renderer as _publish_renderer
@@ -795,6 +836,7 @@ class QzoneStablePlugin(Star):
         raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
         self.settings = PluginSettings.from_mapping(raw_config)
         self.root = Path(__file__).resolve().parent
+        self.plugin_name = _read_plugin_name(self.root)
         self.data_dir = _standard_data_dir(self.root)
         self._onebot_client: Any | None = None
         self._cookie_lock: asyncio.Lock | None = None
@@ -811,6 +853,9 @@ class QzoneStablePlugin(Star):
         self._capture_onebot_client_from_context()
         self._daemon_warmup_task: asyncio.Task | None = None
         self._auto_bind_bootstrap_task: asyncio.Task | None = None
+        self._page_preload_task: asyncio.Task | None = None
+        self._page_feed_preload_task: asyncio.Task | None = None
+        self._last_page_feed_preload_at = 0.0
         self._auto_bind_bootstrap_succeeded = False
         self._scheduled_tasks: list[asyncio.Task] = []
         self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
@@ -818,9 +863,17 @@ class QzoneStablePlugin(Star):
         self.drafts = DraftStore(self.data_dir / "drafts.json")
         self.posts = PostStore(self.data_dir / "posts.json")
         self.llm = QzoneLLM(self._context, self.settings)
+        self.page_api = QzonePageApi(
+            controller=self.controller,
+            post_service_factory=self._post_service,
+            settings=self.settings,
+            status_provider=self._status_with_recovery,
+            preload_scheduler=self._schedule_page_preload,
+        )
         self._pillowmd_style: Any | None = None
         self._pillowmd_style_dir = ""
         preload_static_render_assets()
+        self._register_page_web_apis()
 
     def _sender_id(self, event: AstrMessageEvent) -> int:
         try:
@@ -858,6 +911,136 @@ class QzoneStablePlugin(Star):
             self._post_store(),
             max_feed_limit=self.settings.max_feed_limit,
         )
+
+    def _register_page_web_apis(self) -> None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        register = getattr(context, "register_web_api", None)
+        if not callable(register):
+            return
+        routes = (
+            ("page/status", self.page_status, ["GET"], "Qzone Page status"),
+            ("page/feed", self.page_feed, ["GET"], "Qzone Page feed"),
+            ("page/detail", self.page_detail, ["GET"], "Qzone Page detail"),
+            ("page/publish", self.page_publish, ["POST"], "Qzone Page publish"),
+            ("page/like", self.page_like, ["POST"], "Qzone Page like"),
+            ("page/comment", self.page_comment, ["POST"], "Qzone Page comment"),
+            ("page/reply", self.page_reply, ["POST"], "Qzone Page reply"),
+            ("page/delete", self.page_delete, ["POST"], "Qzone Page delete"),
+            ("page/upload-media", self.page_upload_media, ["POST"], "Qzone Page upload media"),
+        )
+        for endpoint, handler, methods, description in routes:
+            path = f"/{self.plugin_name}/{endpoint}"
+            try:
+                register(path, handler, methods, description)
+            except TypeError:
+                register(path, handler, methods)
+
+    async def _page_response(self, payload: dict[str, Any], *, status: int = 200):
+        if _quart_jsonify is None:
+            return payload
+        response = _quart_jsonify(payload)
+        response.status_code = status
+        return response
+
+    async def _page_json(self, callback):
+        try:
+            payload = await callback()
+            status = 200
+        except Exception as exc:
+            payload, status = page_error_payload(exc)
+            try:
+                request_path = str(getattr(_quart_request, "path", "") or "")
+            except Exception:
+                request_path = ""
+            callback_name = getattr(callback, "__qualname__", getattr(callback, "__name__", type(callback).__name__))
+            logger.warning(
+                "qzone page api failed route=%s callback=%s: %s",
+                request_path,
+                callback_name,
+                exc,
+                exc_info=True,
+            )
+        return await self._page_response(payload, status=status)
+
+    async def _page_query_params(self) -> dict[str, Any]:
+        request = _quart_request
+        if request is None:
+            return {}
+        args = getattr(request, "args", {}) or {}
+        try:
+            items = args.items(multi=False)
+        except TypeError:
+            items = args.items() if hasattr(args, "items") else []
+        try:
+            return {str(key): value for key, value in items}
+        except TypeError:
+            return dict(args)
+
+    async def _page_json_body(self) -> dict[str, Any]:
+        request = _quart_request
+        if request is None:
+            return {}
+        getter = getattr(request, "get_json", None)
+        data: Any = None
+        if callable(getter):
+            try:
+                data = await self._maybe_await(getter(silent=True))
+            except TypeError:
+                data = await self._maybe_await(getter())
+        if data is None:
+            data = await self._maybe_await(getattr(request, "json", None))
+        return data if isinstance(data, dict) else {}
+
+    async def page_status(self):
+        return await self._page_json(self.page_api.status)
+
+    async def page_feed(self):
+        params = await self._page_query_params()
+        return await self._page_json(lambda: self.page_api.feed(params))
+
+    async def page_detail(self):
+        params = await self._page_query_params()
+        return await self._page_json(lambda: self.page_api.detail(params))
+
+    async def page_publish(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.publish(body))
+
+    async def page_like(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.like(body))
+
+    async def page_comment(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.comment(body))
+
+    async def page_reply(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.reply(body))
+
+    async def page_delete(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.delete(body))
+
+    async def page_upload_media(self):
+        async def handle_upload():
+            request = _quart_request
+            if request is None:
+                raise QzoneBridgeError("当前运行环境不支持 Page 文件上传")
+            files = await self._maybe_await(getattr(request, "files", None))
+            upload = None
+            if hasattr(files, "get"):
+                upload = files.get("file") or files.get("image") or files.get("media")
+            if upload is None:
+                raise QzoneBridgeError("没有收到图片文件")
+            data = await self._maybe_await(upload.read())
+            return await self.page_api.upload_media(
+                filename=getattr(upload, "filename", "") or "image.jpg",
+                content_type=getattr(upload, "content_type", "") or "",
+                data=data or b"",
+            )
+
+        return await self._page_json(handle_upload)
 
     def _llm_adapter(self) -> QzoneLLM:
         self.llm.context = getattr(self, "_context", None) or getattr(self, "context", None)
@@ -949,6 +1132,7 @@ class QzoneStablePlugin(Star):
         *,
         status: dict[str, Any] | None = None,
         allow_network: bool = False,
+        cache_assets: bool = True,
     ) -> RenderProfile:
         profile = profile_from_event(event) if event is not None else RenderProfile(time_text=time.strftime("%H:%M"))
         if status is None:
@@ -962,7 +1146,10 @@ class QzoneStablePlugin(Star):
             return profile
 
         cached = self._cached_publisher_profile(login_uin, time_text=profile.time_text)
-        if cached is not None:
+        if cached is not None and (
+            not allow_network
+            or _clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin)
+        ):
             return cached
 
         nickname = str(
@@ -992,6 +1179,16 @@ class QzoneStablePlugin(Star):
             avatar_source=avatar_source or self._qlogo_url(login_uin, 640),
             time_text=profile.time_text,
         )
+        if not cache_assets:
+            cached_profile = RenderProfile(
+                nickname=base_profile.nickname,
+                user_id=base_profile.user_id,
+                avatar_source=base_profile.avatar_source,
+                time_text="",
+            )
+            self._publisher_profile_cache = (login_uin, cached_profile)
+            return self._clone_render_profile(cached_profile, time_text=profile.time_text)
+
         cached_avatar = cached_avatar_source(self._render_asset_dir(), base_profile)
         if cached_avatar:
             cached_profile = RenderProfile(
@@ -1050,6 +1247,39 @@ class QzoneStablePlugin(Star):
                 return result
         return {}
 
+    def _cached_profile_has_display_name(self, login_uin: int) -> bool:
+        cached = self._cached_publisher_profile(login_uin, time_text="")
+        if cached is None:
+            return False
+        return bool(_clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin))
+
+    def _schedule_login_profile_preload(
+        self,
+        trigger: str,
+        *,
+        event: AstrMessageEvent | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        login_uin = int((status or {}).get("login_uin") or (status or {}).get("uin") or 0)
+        if login_uin and self._cached_profile_has_display_name(login_uin):
+            return
+        task = getattr(self, "_publisher_profile_preload_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self._publisher_render_profile(
+                    event,
+                    status=status,
+                    allow_network=True,
+                    cache_assets=False,
+                )
+            except Exception:
+                logger.debug("qzone login profile preload on %s failed", trigger, exc_info=True)
+
+        self._publisher_profile_preload_task = asyncio.create_task(runner())
+
     def _schedule_publish_render_asset_preload(
         self,
         trigger: str,
@@ -1058,9 +1288,10 @@ class QzoneStablePlugin(Star):
         status: dict[str, Any] | None = None,
     ) -> None:
         if not self.settings.render_publish_result:
+            self._schedule_login_profile_preload(trigger, event=event, status=status)
             return
         login_uin = int((status or {}).get("login_uin") or 0)
-        if login_uin and self._cached_publisher_profile(login_uin, time_text="") is not None:
+        if login_uin and self._cached_profile_has_display_name(login_uin):
             return
         task = self._publisher_profile_preload_task
         if task is not None and not task.done():
@@ -1535,6 +1766,47 @@ class QzoneStablePlugin(Star):
             payload["detail"] = detail
         return payload
 
+    def _status_with_cached_profile(self, status: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(status or {})
+        login_uin = int(enriched.get("login_uin") or enriched.get("uin") or 0)
+        if not login_uin:
+            return enriched
+        cached = self._cached_publisher_profile(login_uin, time_text="")
+        if cached is None:
+            return enriched
+        nickname = _clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin)
+        if nickname and not _clean_nickname_fallback(enriched.get("login_nickname") or enriched.get("nickname"), hostuin=login_uin):
+            enriched["login_nickname"] = nickname
+        avatar = str(getattr(cached, "avatar_source", "") or "").strip()
+        if avatar and not str(enriched.get("login_avatar") or enriched.get("avatar") or "").strip():
+            enriched["login_avatar"] = avatar
+        return enriched
+
+    async def _status_with_live_profile(self, status: dict[str, Any]) -> dict[str, Any]:
+        enriched = self._status_with_cached_profile(status)
+        login_uin = int(enriched.get("login_uin") or enriched.get("uin") or 0)
+        if not login_uin:
+            return enriched
+        if _clean_nickname_fallback(enriched.get("login_nickname") or enriched.get("nickname"), hostuin=login_uin):
+            return enriched
+        if self._capture_onebot_client(None) is None:
+            self._schedule_login_profile_preload("status missing profile", status=enriched)
+            return enriched
+        try:
+            await asyncio.wait_for(
+                self._publisher_render_profile(
+                    None,
+                    status=enriched,
+                    allow_network=True,
+                    cache_assets=False,
+                ),
+                timeout=0.9,
+            )
+        except Exception:
+            self._schedule_login_profile_preload("status live fallback", status=enriched)
+            return enriched
+        return self._status_with_cached_profile(enriched)
+
     async def _status_with_recovery(self) -> dict[str, Any]:
         status = await self.controller.get_status()
         should_start = (
@@ -1544,10 +1816,12 @@ class QzoneStablePlugin(Star):
             and not bool(status.get("needs_rebind"))
         )
         if not should_start:
+            status = await self._status_with_live_profile(status)
             self._schedule_publish_render_asset_preload("status", status=status)
             return status
         try:
             recovered = await self.controller.ensure_running()
+            recovered = await self._status_with_live_profile(recovered)
             self._schedule_publish_render_asset_preload("status recovery", status=recovered)
             return recovered
         except QzoneBridgeError as exc:
@@ -1558,6 +1832,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone daemon status recovery failed: %s detail=%s", exc.message, detail_text)
             fallback = await self.controller.get_status(probe_daemon=False)
             fallback["daemon_start_error"] = self._status_error_payload(exc)
+            fallback = await self._status_with_live_profile(fallback)
             self._schedule_publish_render_asset_preload("status fallback", status=fallback)
             return fallback
 
@@ -2252,26 +2527,14 @@ class QzoneStablePlugin(Star):
     def _auto_comment_state_path(self) -> Path:
         return self.data_dir / "auto_comment_state.json"
 
+    def _auto_comment_state_store(self) -> AutoCommentStateStore:
+        return AutoCommentStateStore(self._auto_comment_state_path())
+
     def _load_auto_comment_keys(self) -> set[str]:
-        path = self._auto_comment_state_path()
-        if not path.exists():
-            return set()
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return set()
-        items = payload.get("commented") if isinstance(payload, dict) else payload
-        if not isinstance(items, list):
-            return set()
-        return {str(item) for item in items if item}
+        return self._auto_comment_state_store().read_keys()
 
     def _save_auto_comment_keys(self, keys: set[str]) -> None:
-        path = self._auto_comment_state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"commented": sorted(keys)[-500:]}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        self._auto_comment_state_store().write_keys(keys)
 
     def _auto_comment_key(self, post: QzonePost | FeedEntry) -> str:
         return f"{int(getattr(post, 'hostuin', 0) or 0)}:{getattr(post, 'fid', '')}"
@@ -2391,6 +2654,39 @@ class QzoneStablePlugin(Star):
 
     async def _generate_comment_text(self, event: AstrMessageEvent, post: QzonePost) -> str:
         return await self._llm_adapter().generate_comment_text(event, post)
+
+    async def _generate_auto_comment_pipeline(self, post: QzonePost) -> AutoCommentPipelineResult:
+        config = AutoCommentPipelineConfig(
+            enabled=bool(getattr(self.settings, "comment_pipeline_enabled", True)),
+            judgment_provider_id=str(getattr(self.settings, "comment_judgment_provider_id", "") or ""),
+            reasoning_provider_id=str(getattr(self.settings, "comment_reasoning_provider_id", "") or ""),
+            execution_provider_id=str(getattr(self.settings, "comment_execution_provider_id", "") or ""),
+            skip_checkins=bool(getattr(self.settings, "comment_skip_checkins", True)),
+            max_comment_length=int(getattr(self.settings, "comment_max_length", 60) or 60),
+        )
+        pipeline = AutoCommentPipeline(config)
+
+        async def generate_stage(prompt: str, provider_id: str, system_prompt: str) -> str:
+            try:
+                return await self._generate_text(None, prompt, provider_id=provider_id, system_prompt=system_prompt)  # type: ignore[arg-type]
+            except Exception as exc:
+                logger.debug("qzone auto-comment pipeline stage failed: %s", exc)
+                return ""
+
+        async def execute_comment(reasoning: str) -> str:
+            if config.execution_provider_id:
+                try:
+                    return await self._llm_adapter().generate_comment_text(
+                        None,  # type: ignore[arg-type]
+                        post,
+                        provider_id=config.execution_provider_id,
+                        reasoning=reasoning,
+                    )
+                except Exception as exc:
+                    logger.debug("qzone auto-comment execution provider failed: %s", exc)
+            return await self._generate_comment_text(None, post)  # type: ignore[arg-type]
+
+        return await pipeline.run(post, generate_text=generate_stage, execute_comment=execute_comment)
 
     async def _generate_reply_text(self, event: AstrMessageEvent, post: QzonePost, comment: QzoneComment) -> str:
         return await self._llm_adapter().generate_reply_text(event, post, comment)
@@ -2524,11 +2820,17 @@ class QzoneStablePlugin(Star):
                 skipped_duplicate += 1
                 continue
             await self._post_store().upsert_async(post)
-            text = await self._generate_comment_text(None, post)  # type: ignore[arg-type]
-            if not text.strip():
+            pipeline_result = await self._generate_auto_comment_pipeline(post)
+            if not pipeline_result.should_comment or not pipeline_result.comment_text.strip():
                 skipped_empty += 1
+                logger.info(
+                    "qzone scheduled comment skipped hostuin=%s fid=%s reason=%s",
+                    post.hostuin,
+                    post.fid,
+                    pipeline_result.skip_reason or "empty_comment",
+                )
                 continue
-            comment_text = text.strip()
+            comment_text = pipeline_result.comment_text.strip()
             await self._post_service().comment_post(post, comment_text)
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
@@ -2697,7 +2999,28 @@ class QzoneStablePlugin(Star):
         self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
         return payload
 
-    async def _bootstrap_auto_bind(self, trigger: str, event: AstrMessageEvent | None = None) -> bool:
+    async def _call_bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> bool:
+        try:
+            signature = inspect.signature(self._bootstrap_auto_bind)
+            if "force_refresh" in signature.parameters:
+                return await self._bootstrap_auto_bind(trigger, event, force_refresh=force_refresh)
+        except (TypeError, ValueError):
+            pass
+        return await self._bootstrap_auto_bind(trigger, event)
+
+    async def _bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> bool:
         client = self._capture_onebot_client(event) if event is not None else self._capture_onebot_client_from_context()
         if client is None:
             await self._prewarm_daemon_if_cookie_ready(trigger)
@@ -2706,30 +3029,82 @@ class QzoneStablePlugin(Star):
             await self._prewarm_daemon_if_cookie_ready(trigger)
             return True
         try:
-            await self._ensure_cookie_ready(event, source="aiocqhttp")
+            await self._ensure_cookie_ready(event, force=force_refresh, source="aiocqhttp")
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
             return False
         await self._prewarm_daemon_if_cookie_ready(trigger)
         return True
 
-    def _schedule_bootstrap_auto_bind(self, trigger: str, event: AstrMessageEvent | None = None) -> None:
+    def _schedule_bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> None:
         task = getattr(self, "_auto_bind_bootstrap_task", None)
         if task is not None and not task.done():
             return
-        if bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)):
+        if bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)) and not force_refresh:
             return
         if event is not None and self._capture_onebot_client(event) is None and self.settings.auto_bind_cookie:
             return
 
         async def runner() -> None:
             try:
-                if await self._bootstrap_auto_bind(trigger, event):
+                if await self._call_bootstrap_auto_bind(trigger, event, force_refresh=force_refresh):
                     self._auto_bind_bootstrap_succeeded = True
+                    self._schedule_page_feed_preload(trigger)
             except Exception:
                 logger.warning("qzone auto bind on %s failed unexpectedly", trigger, exc_info=True)
 
         self._auto_bind_bootstrap_task = asyncio.create_task(runner())
+
+    def _schedule_page_preload(self, trigger: str) -> None:
+        task = getattr(self, "_page_preload_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                if not bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)):
+                    if await self._call_bootstrap_auto_bind(trigger):
+                        self._auto_bind_bootstrap_succeeded = True
+                await self._prewarm_daemon_if_cookie_ready(trigger)
+            except Exception:
+                logger.debug("qzone page preload on %s failed", trigger, exc_info=True)
+
+        self._page_preload_task = asyncio.create_task(runner())
+
+    def _schedule_page_feed_preload(self, trigger: str) -> None:
+        if not bool(getattr(self.settings, "auto_start_daemon", True)):
+            return
+        if not hasattr(self, "controller"):
+            return
+        task = getattr(self, "_page_feed_preload_task", None)
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now - float(getattr(self, "_last_page_feed_preload_at", 0.0) or 0.0) < 45.0:
+            return
+        self._last_page_feed_preload_at = now
+
+        async def runner() -> None:
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+                if int(status.get("cookie_count") or 0) <= 0 or bool(status.get("needs_rebind")):
+                    return
+                await self.controller.ensure_running()
+                limit = min(max(5, int(getattr(self.settings, "max_feed_limit", 10) or 10)), 10)
+                await self.controller.list_feeds(hostuin=0, limit=limit, scope="active", record_recent=False)
+            except QzoneBridgeError as exc:
+                logger.debug("qzone page feed preload on %s failed: %s", trigger, exc)
+            except Exception:
+                logger.debug("qzone page feed preload on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._page_feed_preload_task = asyncio.create_task(runner())
 
     async def _prewarm_daemon_if_cookie_ready(self, trigger: str) -> None:
         if not self.settings.auto_start_daemon:
@@ -2766,37 +3141,46 @@ class QzoneStablePlugin(Star):
             try:
                 payload = await self.controller.bind_cookie_local(self.settings.cookies_str, source="config")
                 self._schedule_publish_render_asset_preload("config bind", status=payload)
+                self._schedule_daemon_warmup("config bind")
             except QzoneBridgeError as exc:
                 logger.warning("qzone config cookie bind failed: %s", exc)
         self._start_scheduled_tasks()
-        self._schedule_bootstrap_auto_bind("initialize")
+        self._schedule_bootstrap_auto_bind("initialize", force_refresh=True)
 
     @filter.command_group("qzone")
     def qzone(self):
+        """QQ 空间管理命令组，可绑定 Cookie、查看状态和管理说说。"""
         pass
 
     @filter.on_astrbot_loaded()
     async def qzone_on_astrbot_loaded(self):
+        """AstrBot 加载完成后启动定时任务，并预热 Qzone Cookie。"""
         self._start_scheduled_tasks()
-        self._schedule_bootstrap_auto_bind("astrbot load")
+        self._schedule_bootstrap_auto_bind("astrbot load", force_refresh=True)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
+        """捕获 OneBot 客户端，并按配置预热或自动读取 Qzone 说说。"""
         self._capture_onebot_client(event)
         should_auto_read = self.settings.read_prob > 0 and random.random() < self.settings.read_prob
+        force_cookie_refresh = bool(self.settings.auto_bind_cookie) and not bool(
+            getattr(self, "_auto_bind_bootstrap_succeeded", False)
+        )
         if not should_auto_read:
-            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
             return
         group_id = str(self._group_id(event) or "")
         sender_id = str(self._sender_id(event) or "")
         if group_id and group_id in self.settings.ignore_groups:
-            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
             return
         if sender_id and sender_id in self.settings.ignore_users:
-            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event)
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
             return
         try:
-            await self._ensure_cookie_ready(event)
+            await self._ensure_cookie_ready(event, force=force_cookie_refresh)
+            if force_cookie_refresh:
+                self._auto_bind_bootstrap_succeeded = True
             await self._ensure_daemon()
             posts = await self._posts_for_event(
                 event,
@@ -2821,6 +3205,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看访客")
     async def view_visitor(self, event: AstrMessageEvent):
+        """查看当前 QQ 空间最近访客。"""
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -2833,6 +3218,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("看说说", alias={"查看说说"})
     async def view_feed(self, event: AstrMessageEvent):
+        """查看好友或指定 QQ 的说说，并渲染成卡片。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以查看说说。")
             return
@@ -2849,6 +3235,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("读说说")
     async def read_feed(self, event: AstrMessageEvent):
+        """按序号读取说说详情，不自动评论或点赞。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以查看说说。")
             return
@@ -2872,6 +3259,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("评说说", alias={"评论说说"})
     async def comment_feed(self, event: AstrMessageEvent):
+        """给选中的说说发表评论，留空时由 AI 生成。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以评论。")
             return
@@ -2929,6 +3317,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("赞说说")
     async def like_feed(self, event: AstrMessageEvent):
+        """给选中的说说点赞。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以点赞。")
             return
@@ -2958,6 +3347,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("发说说")
     async def publish_feed(self, event: AstrMessageEvent, content: str = ""):
+        """发布一条 QQ 空间说说，支持文字和图片。"""
         self._stop_event(event)
         post = self._collect_target_post_payload(event, content, ("发说说",))
         profile_task: asyncio.Task | None = None
@@ -2989,6 +3379,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("写说说", alias={"写稿"})
     async def write_feed(self, event: AstrMessageEvent):
+        """根据主题生成说说草稿，提交管理员审核。"""
         topic = self._message_after_command(self._event_text(event), ("写说说", "写稿"))
         post = self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
         try:
@@ -3007,6 +3398,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("删说说")
     async def delete_feed(self, event: AstrMessageEvent):
+        """删除当前账号已发布的指定说说。"""
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -3030,6 +3422,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("回评", alias={"回复评论"})
     async def reply_comment(self, event: AstrMessageEvent):
+        """回复指定已发布说说下的评论。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以回评。")
             return
@@ -3107,6 +3500,7 @@ class QzoneStablePlugin(Star):
 
     @filter.command("投稿")
     async def contribute_post(self, event: AstrMessageEvent, content: str = ""):
+        """提交一条待审核的说说投稿。"""
         post = self._collect_target_post_payload(event, content, ("投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
@@ -3117,6 +3511,7 @@ class QzoneStablePlugin(Star):
 
     @filter.command("匿名投稿")
     async def anon_contribute_post(self, event: AstrMessageEvent, content: str = ""):
+        """匿名提交一条待审核的说说投稿。"""
         post = self._collect_target_post_payload(event, content, ("匿名投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
@@ -3127,6 +3522,7 @@ class QzoneStablePlugin(Star):
 
     @filter.command("撤稿")
     async def recall_post(self, event: AstrMessageEvent):
+        """撤回自己尚未审核的投稿。"""
         draft_id, _ = self._draft_id_from_event(event, ("撤稿",))
         if draft_id <= 0:
             yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
@@ -3170,6 +3566,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("看稿", alias={"查看稿件"})
     async def view_post(self, event: AstrMessageEvent):
+        """查看待审核投稿列表或指定稿件。"""
         draft_id, _ = self._draft_id_from_event(event, ("看稿", "查看稿件"))
         if draft_id > 0:
             draft = await self.drafts.get_async(draft_id)
@@ -3182,6 +3579,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("过稿", alias={"通过稿件", "通过投稿"})
     async def approve_post(self, event: AstrMessageEvent):
+        """通过投稿并发布到当前 QQ 空间。"""
         draft_id, _ = self._draft_id_from_event(event, ("过稿", "通过稿件", "通过投稿"))
         if draft_id <= 0:
             yield self._command_result(event, "请提供要通过的稿件ID，例如：过稿 3。")
@@ -3259,6 +3657,7 @@ class QzoneStablePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("拒稿", alias={"拒绝稿件", "拒绝投稿"})
     async def reject_post(self, event: AstrMessageEvent):
+        """拒绝投稿并记录原因。"""
         draft_id, reason = self._draft_id_from_event(event, ("拒稿", "拒绝稿件", "拒绝投稿"))
         if draft_id <= 0:
             yield self._command_result(event, "请提供要拒绝的稿件ID，例如：拒稿 3 原因。")
@@ -3292,6 +3691,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("help")
     async def qzone_help(self, event: AstrMessageEvent):
+        """查看 QQ 空间 Ultra 的命令用法。"""
         text = "\n".join(
             [
                 "QQ 空间命令",
@@ -3335,6 +3735,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("status")
     async def qzone_status(self, event: AstrMessageEvent):
+        """查看 Cookie、daemon 和 QQ 空间连接状态。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以查看状态。")
             return
@@ -3347,6 +3748,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("bind")
     async def qzone_bind(self, event: AstrMessageEvent, cookie: str):
+        """手动绑定 QQ 空间 Cookie。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以绑定 Cookie。")
             return
@@ -3366,6 +3768,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("autobind")
     async def qzone_autobind(self, event: AstrMessageEvent):
+        """从 OneBot 自动获取并刷新 QQ 空间 Cookie。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以自动绑定 Cookie。")
             return
@@ -3385,6 +3788,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("unbind")
     async def qzone_unbind(self, event: AstrMessageEvent):
+        """解绑当前保存的 QQ 空间 Cookie。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以解绑。")
             return
@@ -3397,6 +3801,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("feed")
     async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
+        """列出 QQ 空间说说，支持目标 QQ、数量和游标。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以查看说说。")
             return
@@ -3419,6 +3824,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+        """查看指定说说详情和评论。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以查看说说详情。")
             return
@@ -3455,6 +3861,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("post")
     async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
+        """通过 /qzone post 发布一条说说。"""
         self._stop_event(event)
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以发说说。")
@@ -3483,6 +3890,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("comment")
     async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
+        """给指定 fid 的说说发表评论。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以评论。")
             return
@@ -3507,6 +3915,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("like")
     async def qzone_like(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
+        """给指定 fid 的说说点赞或取消点赞。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以点赞。")
             return
@@ -4262,6 +4671,16 @@ class QzoneStablePlugin(Star):
             self._auto_bind_bootstrap_task.cancel()
             await asyncio.gather(self._auto_bind_bootstrap_task, return_exceptions=True)
             self._auto_bind_bootstrap_task = None
+        page_preload_task = getattr(self, "_page_preload_task", None)
+        if page_preload_task is not None:
+            page_preload_task.cancel()
+            await asyncio.gather(page_preload_task, return_exceptions=True)
+            self._page_preload_task = None
+        page_feed_preload_task = getattr(self, "_page_feed_preload_task", None)
+        if page_feed_preload_task is not None:
+            page_feed_preload_task.cancel()
+            await asyncio.gather(page_feed_preload_task, return_exceptions=True)
+            self._page_feed_preload_task = None
         try:
             await self.controller.close()
         except Exception as exc:

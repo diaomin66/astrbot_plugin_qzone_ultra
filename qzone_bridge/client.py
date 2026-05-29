@@ -58,11 +58,25 @@ QZONE_UNLIKE_URL = QZONE_UNLIKE_DIRECT_URL
 QZONE_VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
 QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
-MAX_UPLOAD_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_UPLOAD_IMAGE_BYTES: int | None = None
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
 IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
 IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+
+def _looks_like_supported_image_bytes(data: bytes) -> bool:
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if data.startswith(b"BM"):
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
 
 
 @dataclass(slots=True)
@@ -163,17 +177,10 @@ class QzoneClient:
     @staticmethod
     def _decode_upload_image_base64(encoded: str, *, label: str) -> bytes:
         text = str(encoded or "").strip()
-        # A cheap preflight avoids allocating very large decoded buffers from
-        # data/base64 sources that can be supplied through LLM tool arguments.
-        estimated_size = (len(text) * 3) // 4
-        if estimated_size > MAX_UPLOAD_IMAGE_BYTES + 3:
-            raise QzoneParseError(f"{label}大小超过限制")
         try:
             data = base64.b64decode(text, validate=False)
         except Exception as exc:
             raise QzoneParseError(f"{label}解码失败") from exc
-        if len(data) > MAX_UPLOAD_IMAGE_BYTES:
-            raise QzoneParseError(f"{label}大小超过限制")
         return data
 
     @staticmethod
@@ -750,20 +757,10 @@ class QzoneClient:
                                 status_code=response.status_code,
                                 detail={"url": current_url, "text": text[:500]},
                             )
-                        length = response.headers.get("content-length")
-                        try:
-                            if length and int(length) > MAX_UPLOAD_IMAGE_BYTES:
-                                raise QzoneParseError("图片大小超过限制", detail={"url": current_url})
-                        except ValueError:
-                            pass
                         chunks: list[bytes] = []
-                        total = 0
                         async for chunk in response.aiter_bytes():
                             if not chunk:
                                 continue
-                            total += len(chunk)
-                            if total > MAX_UPLOAD_IMAGE_BYTES:
-                                raise QzoneParseError("图片大小超过限制", detail={"url": current_url})
                             chunks.append(chunk)
                         content_type = response.headers.get("content-type", "").split(";", 1)[0]
                         data = b"".join(chunks)
@@ -781,9 +778,6 @@ class QzoneClient:
         def read_local_image() -> bytes:
             if not path.exists() or not path.is_file():
                 raise QzoneParseError("图片文件不存在", detail={"path": source})
-            stat = path.stat()
-            if stat.st_size > MAX_UPLOAD_IMAGE_BYTES:
-                raise QzoneParseError("图片大小超过限制", detail={"path": source})
             return path.read_bytes()
 
         data = await asyncio.to_thread(read_local_image)
@@ -824,6 +818,11 @@ class QzoneClient:
         data, filename, mime_type = await self._load_image_source(item.to_dict())
         if not data:
             raise QzoneParseError("图片内容为空或无法读取", detail={"name": filename})
+        if not _looks_like_supported_image_bytes(data):
+            raise QzoneParseError(
+                "图片内容不是可上传的图片文件",
+                detail={"name": filename, "mime_type": mime_type},
+            )
 
         encoded_bytes = await asyncio.to_thread(base64.b64encode, data)
         encoded = encoded_bytes.decode("ascii")

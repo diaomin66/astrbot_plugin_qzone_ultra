@@ -90,6 +90,10 @@ def _query_int(request: web.Request, key: str, default: int = 0) -> int:
     return _coerce_int(request.query.get(key), default, field=key)
 
 
+def _query_bool(request: web.Request, key: str, default: bool = False) -> bool:
+    return _coerce_bool(request.query.get(key), default)
+
+
 def _body_int(body: dict[str, Any], key: str, default: int = 0) -> int:
     return _coerce_int(body.get(key), default, field=key)
 
@@ -364,7 +368,15 @@ class QzoneDaemonService:
             return True
         return exc.status_code is not None and exc.status_code >= 500
 
-    async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
+    async def list_feeds(
+        self,
+        *,
+        hostuin: int = 0,
+        limit: int = 5,
+        cursor: str = "",
+        scope: str = "",
+        record_recent: bool = True,
+    ) -> dict[str, Any]:
         self._ensure_session_ready()
         if limit <= 0:
             limit = 5
@@ -428,7 +440,8 @@ class QzoneDaemonService:
             page_round += 1
 
         visible_items = items[:limit]
-        self.recent_feed_entries = visible_items
+        if record_recent:
+            self.recent_feed_entries = visible_items
         return {
             "scope": scope,
             "hostuin": hostuin,
@@ -824,6 +837,7 @@ class QzoneDaemonService:
         unlike: bool = False,
         latest: bool = False,
         index: int = 0,
+        fast: bool = False,
     ) -> dict[str, Any]:
         self._ensure_session_ready()
         hostuin, fid, appid, curkey = await self._resolve_recent_feed_reference(
@@ -838,6 +852,45 @@ class QzoneDaemonService:
             raise QzoneParseError("没有指定要点赞的说说")
 
         target_liked = not unlike
+        if fast:
+            payload = self._normalize_action_payload(
+                await self.client.like_post(hostuin, fid, appid=appid, curkey=curkey, like=target_liked)
+            )
+
+            touched_entries: set[int] = set()
+
+            def apply_fast_like(entry: FeedEntry | None) -> None:
+                if entry is None:
+                    return
+                entry_id = id(entry)
+                if entry_id in touched_entries:
+                    return
+                touched_entries.add(entry_id)
+                was_liked = bool(entry.liked)
+                if was_liked != target_liked:
+                    entry.like_count = max(
+                        0,
+                        int(entry.like_count or 0) + (1 if target_liked else -1),
+                    )
+                entry.liked = target_liked
+
+            cached_entry = self.client.feed_cache.get((hostuin, fid))
+            apply_fast_like(cached_entry)
+            for entry in self.recent_feed_entries:
+                if entry.hostuin == hostuin and entry.fid == fid:
+                    apply_fast_like(entry)
+                    break
+            self._set_success(defer_save=True)
+            return {
+                "action": "unlike" if unlike else "like",
+                "liked": target_liked,
+                "verified": False,
+                "already": False,
+                "operation_status": "accepted_pending_verification",
+                "message": payload.get("msg") or payload.get("message") or "",
+                "raw": payload,
+            }
+
         before_entry = await self._refresh_like_entry(hostuin, fid, appid)
         if before_entry is not None and before_entry.liked == target_liked:
             self._set_success(defer_save=True)
@@ -1028,6 +1081,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 limit=_query_int(request, "limit", 5),
                 cursor=cursor,
                 scope=scope,
+                record_recent=_query_bool(request, "record_recent", True),
             ),
         )
 
@@ -1124,6 +1178,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 unlike=_body_bool(body, "unlike", False),
                 latest=_body_bool(body, "latest", False),
                 index=_body_int(body, "index", 0),
+                fast=_body_bool(body, "fast", False),
             ),
         )
 

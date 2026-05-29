@@ -9,6 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -240,6 +241,10 @@ class QzoneDaemonController:
         self._incompatible_daemon: tuple[int, str] | None = None
 
     def _runtime(self):
+        state = self.store.read()
+        if state.runtime.secret and state.runtime.daemon_port:
+            return state.runtime
+
         def update(state):
             ensure_state_secret(state)
             if not state.runtime.daemon_port:
@@ -290,6 +295,29 @@ class QzoneDaemonController:
             detail["log_tail"] = log_tail
         return detail
 
+    def _open_daemon_log_file(self):
+        try:
+            log_path = self._daemon_log_path()
+            return log_path, log_path.open("a", encoding="utf-8", buffering=1)
+        except OSError as primary_exc:
+            fallback_dir = Path(tempfile.gettempdir()) / "astrbot_qzone_daemon_logs"
+            fallback_path = fallback_dir / f"daemon-{os.getpid()}.log"
+            try:
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                log.warning(
+                    "qzone daemon log is not writable, using fallback log %s: %s",
+                    fallback_path,
+                    primary_exc,
+                )
+                return fallback_path, fallback_path.open("a", encoding="utf-8", buffering=1)
+            except OSError as fallback_exc:
+                log.warning(
+                    "qzone daemon log is not writable and fallback log failed; using os.devnull: primary=%s fallback=%s",
+                    primary_exc,
+                    fallback_exc,
+                )
+                return None, open(os.devnull, "w", encoding="utf-8", buffering=1)
+
     def _record_daemon_start_error(self, exc: DaemonUnavailableError, *, port: int) -> None:
         self._invalidate_health_cache()
 
@@ -329,16 +357,18 @@ class QzoneDaemonController:
             return 0
 
     def _health_payload_is_compatible(self, payload: dict[str, Any]) -> bool:
+        data = self._health_data(payload)
         return (
             self._health_payload_is_qzone_daemon(payload)
             and self._bridge_api_version_from_health(payload) >= BRIDGE_API_VERSION
+            and str(data.get("daemon_version") or "") == BRIDGE_VERSION
         )
 
     async def _stop_incompatible_daemon(self, port: int, secret: str) -> None:
         if self._incompatible_daemon != (int(port or 0), secret):
             return
         self._incompatible_daemon = None
-        log.warning("qzone daemon bridge API is stale; restarting daemon on port %s", port)
+        log.warning("qzone daemon version or bridge API is stale; restarting daemon on port %s", port)
         if await self._request_daemon_shutdown(port, secret):
             await self._wait_for_port_release(port, 3.0)
         self._invalidate_health_cache()
@@ -370,10 +400,11 @@ class QzoneDaemonController:
         env["QZONE_BRIDGE_PLUGIN_ROOT"] = str(self.plugin_root)
         env["QZONE_BRIDGE_SECRET"] = runtime.secret
         kwargs["env"] = env
-        log_path = self._daemon_log_path()
-        log_file = log_path.open("a", encoding="utf-8", buffering=1)
+        log_path, log_file = self._open_daemon_log_file()
         try:
             log_file.write(f"\n[{now_iso()}] starting qzone daemon on 127.0.0.1:{port}\n")
+            if log_path is not None:
+                log_file.write(f"log_path={log_path}\n")
             kwargs["stdout"] = log_file
             kwargs["stderr"] = log_file
             return subprocess.Popen(cmd, cwd=str(self.plugin_root), **kwargs)
@@ -708,11 +739,25 @@ class QzoneDaemonController:
             self.store.update(update)
             return await self.get_status()
 
-    async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
+    async def list_feeds(
+        self,
+        *,
+        hostuin: int = 0,
+        limit: int = 5,
+        cursor: str = "",
+        scope: str = "",
+        record_recent: bool = True,
+    ) -> dict[str, Any]:
         return await self._request(
             "GET",
             "/feeds",
-            params={"hostuin": hostuin, "limit": limit, "cursor": cursor, "scope": scope},
+            params={
+                "hostuin": hostuin,
+                "limit": limit,
+                "cursor": cursor,
+                "scope": scope,
+                "record_recent": str(bool(record_recent)).lower(),
+            },
         )
 
     async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311, busi_param: str = "") -> dict[str, Any]:
@@ -812,6 +857,7 @@ class QzoneDaemonController:
         unlike: bool = False,
         latest: bool = False,
         index: int = 0,
+        fast: bool = False,
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
@@ -824,6 +870,7 @@ class QzoneDaemonController:
                 "unlike": unlike,
                 "latest": latest,
                 "index": index,
+                "fast": fast,
             },
         )
 

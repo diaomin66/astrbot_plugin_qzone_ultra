@@ -35,6 +35,39 @@
         "_special": "select_provider",
         "hint": "留空时使用当前会话默认提供商。"
       },
+      "comment_pipeline_enabled": {
+        "description": "Auto-comment decision pipeline",
+        "type": "bool",
+        "default": true,
+        "hint": "Enable judgment, reasoning, and execution stages before scheduled auto-comments."
+      },
+      "comment_judgment_provider_id": {
+        "description": "Auto-comment judgment LLM provider",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "Optional provider used to decide whether a feed is appropriate to comment on."
+      },
+      "comment_reasoning_provider_id": {
+        "description": "Auto-comment reasoning LLM provider",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "Optional provider used to plan relationship stance and tone before writing."
+      },
+      "comment_execution_provider_id": {
+        "description": "Auto-comment execution LLM provider",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "Optional provider used to write the final auto-comment. Empty uses comment_provider_id."
+      },
+      "comment_skip_checkins": {
+        "description": "Skip low-signal check-ins",
+        "type": "bool",
+        "default": true,
+        "hint": "Skip short check-in style posts during the judgment stage."
+      },
       "comment_prompt": {
         "description": "评论说说提示词",
         "type": "text",

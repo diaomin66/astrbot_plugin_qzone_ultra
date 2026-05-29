@@ -62,7 +62,7 @@ class RuntimeState:
     secret: str = ""
     started_at: str = ""
     last_seen_at: str = ""
-    version: str = "0.4.2"
+    version: str = "0.5.0"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -76,7 +76,7 @@ class RuntimeState:
             secret=str(data.get("secret") or ""),
             started_at=str(data.get("started_at") or ""),
             last_seen_at=str(data.get("last_seen_at") or ""),
-            version=str(data.get("version") or "0.4.2"),
+            version=str(data.get("version") or "0.5.0"),
         )
 
 

@@ -310,12 +310,21 @@ class QzoneLLM:
         max_len = int(getattr(self.settings, "comment_max_length", 60) or 60)
         return truncate(cleaned, max_len)
 
-    async def generate_comment_text(self, event: Any, post: QzonePost) -> str:
+    async def generate_comment_text(
+        self,
+        event: Any,
+        post: QzonePost,
+        *,
+        provider_id: str = "",
+        reasoning: str = "",
+    ) -> str:
         prompt = f"{self.settings.comment_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n{self._comment_context(post)}"
+        if reasoning:
+            prompt = f"{prompt}\n\nPipeline reasoning:\n{truncate(reasoning, 500)}"
         text = await self.generate_text(
             event,
             prompt,
-            provider_id=self.settings.comment_provider_id,
+            provider_id=provider_id or self.settings.comment_provider_id,
             system_prompt=PERSONA_SYSTEM_PROMPT,
             prefer_current_provider=True,
         )

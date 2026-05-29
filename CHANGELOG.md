@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0 - 2026-05-29
+
+- Added: A full AstrBot Pages surface for Qzone under `pages/qzone`, including feed browsing, detail view, publishing, image upload, likes, comments, replies, and safe self-post deletion.
+- Added: Browser-safe page APIs and controller wiring in `qzone_bridge/page_api.py`, with opaque post ids, redacted payloads, and AstrBot Pages bridge compatibility.
+- Added: An auto-comment pipeline in `qzone_bridge/auto_comment.py`, plus command/config/runtime wiring for staged judgment, reasoning, execution, and deduplicated persistence.
+- Improved: Local daemon compatibility, page/backend health checks, plugin-side security hardening, and Page-specific regression coverage across status/feed/detail/reply/upload flows.
+- Improved: The WebUI page UX with a redesigned three-pane layout, smoother detail/reply flows, round avatars, quantity-aware media layouts, and better image presentation for mixed aspect ratios.
+
+## v0.4.3 - 2026-05-27
+
+- Added: AstrBot WebUI Pages experience under `pages/qzone`, with feed browsing, publishing, image upload, detail view, likes, comments, replies, and self-post deletion.
+- Added: Page backend APIs that reuse the existing daemon/controller path while redacting raw Qzone internals from the browser.
+- Added: WebUI-specific regression coverage for raw-field redaction, pending like verification, sanitized publish flow, and delete safeguards.
+
 ## v0.4.2 - 2026-05-23
 
 - 修复：开启定时任务管理员反馈后，如果没有单独配置管理群或插件管理员，会自动使用 AstrBot 全局管理员作为私聊通知目标，避免任务已成功但管理员收不到渲染图。

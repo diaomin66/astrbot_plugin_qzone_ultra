@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import inspect
 from dataclasses import asdict
@@ -12,10 +13,16 @@ import types
 import pytest
 
 from qzone_bridge.client import QzoneClient
+from qzone_bridge.auto_comment import (
+    AutoCommentPipeline,
+    AutoCommentPipelineConfig,
+    AutoCommentStateStore,
+)
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import QzoneBridgeError, QzoneCookieAcquireError, QzoneParseError, QzoneRequestError
 from qzone_bridge.models import BridgeState, SessionState
 from qzone_bridge.settings import PluginSettings
+from qzone_bridge.social import QzonePost
 from qzone_bridge.storage import StateStore
 from qzone_bridge import source_policy
 
@@ -139,6 +146,33 @@ def test_main_import_recovers_from_renderer_with_false_comment_section_contract(
 
         assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
         assert getattr(main._publish_renderer, "SUPPORTS_COMMENT_RESULT_SECTIONS", False) is True
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
+def test_main_import_recovers_from_stale_page_api_constructor(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.page_api as page_api
+
+    class _OldQzonePageApi:
+        def __init__(self, *, controller, post_service_factory, settings, status_provider=None):
+            self.controller = controller
+
+    try:
+        monkeypatch.setattr(page_api, "QzonePageApi", _OldQzonePageApi)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.QzonePageApi is not _OldQzonePageApi
+        assert "preload_scheduler" in inspect.signature(main.QzonePageApi).parameters
     finally:
         for name in list(sys.modules):
             if name == "qzone_bridge" or name.startswith("qzone_bridge."):
@@ -604,12 +638,36 @@ def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytes
     assert not source_policy.is_remote_media_url_allowed("https://media.example.test/a.png")
 
 
-def test_base64_upload_sources_are_size_limited_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_base64_upload_sources_do_not_apply_plugin_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     import qzone_bridge.client as client_module
 
-    monkeypatch.setattr(client_module, "MAX_UPLOAD_IMAGE_BYTES", 8)
-    with pytest.raises(QzoneParseError, match="大小超过限制"):
-        QzoneClient._decode_upload_image_base64("A" * 20, label="图片")
+    monkeypatch.setattr(client_module, "MAX_UPLOAD_IMAGE_BYTES", 8, raising=False)
+
+    assert QzoneClient._decode_upload_image_base64("A" * 20, label="图片") == b"\x00" * 15
+
+
+def test_upload_photo_rejects_forged_image_kind_before_network() -> None:
+    async def scenario() -> None:
+        client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
+        try:
+            async def fail_request(*args, **kwargs):
+                raise AssertionError("invalid image bytes should not reach QQ upload")
+
+            client._request_json = fail_request  # type: ignore[method-assign]
+            encoded = base64.b64encode(b"not really an image").decode("ascii")
+            with pytest.raises(QzoneParseError, match="图片内容"):
+                await client.upload_photo(
+                    {
+                        "kind": "image",
+                        "source": f"base64://{encoded}",
+                        "name": "fake.png",
+                        "mime_type": "image/png",
+                    }
+                )
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
 
 
 def test_daemon_secret_is_not_passed_in_argv(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2322,6 +2380,73 @@ def test_auto_comment_skips_candidate_when_detail_check_fails(
     assert any("no eligible posts" in item for item in captured["logs"])
 
 
+def test_auto_comment_once_skips_sensitive_posts_before_comment_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"comments": [], "logs": []}
+    entry = main.FeedEntry(
+        hostuin=11111,
+        fid="fid-sensitive",
+        appid=311,
+        summary="\u4f4f\u9662\u624b\u672f",
+        nickname="tester",
+    )
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def info(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+        def warning(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Controller:
+        async def list_feeds(self, *, hostuin=0, limit=5, cursor="", scope=""):
+            return {"items": [asdict(entry)]}
+
+        async def get_status(self, *, probe_daemon=False):
+            return {"login_uin": 99999}
+
+        async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311):
+            return {"entry": asdict(entry), "comments": [], "raw": entry.raw}
+
+    class _PostStore:
+        async def upsert_async(self, post):
+            return None
+
+    class _PostService:
+        async def comment_post(self, post, text):
+            captured["comments"].append((post.hostuin, post.fid, text))
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_generate(event, post):
+        raise AssertionError("sensitive post should be skipped before comment generation")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(comment_latest_count=1, max_feed_limit=20, like_when_comment=False)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._generate_comment_text = fake_generate
+    plugin._post_store = lambda: _PostStore()
+    plugin._post_service = lambda: _PostService()
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    asyncio.run(plugin._auto_comment_once())
+
+    assert captured["comments"] == []
+    assert not (tmp_path / "auto_comment_state.json").exists()
+    assert any("serious_or_sensitive_context" in item for item in captured["logs"])
+
+
 def test_active_feed_scope_uses_home_timeline_without_defaulting_items_to_login_uin() -> None:
     from qzone_bridge.daemon import QzoneDaemonService
     from qzone_bridge.models import BridgeState
@@ -2368,9 +2493,163 @@ def test_render_feed_card_limit_is_loaded_from_config() -> None:
     assert settings.render_feed_card_limit == 3
 
 
+def test_page_status_profile_fetch_is_independent_from_publish_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def get_stranger_info(self, **kwargs):
+            return {"nickname": "Tester", "avatar": "https://example.test/avatar.png"}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(render_publish_result=False, render_remote_timeout=0.01)
+    plugin._publisher_profile_cache = None
+    plugin._publisher_profile_preload_task = None
+    plugin._onebot_client = _Bot()
+    plugin._context = None
+
+    enriched = asyncio.run(plugin._status_with_live_profile({"login_uin": 10001, "cookie_count": 2}))
+
+    assert enriched["login_nickname"] == "Tester"
+    assert enriched["login_avatar"] == "https://example.test/avatar.png"
+    assert plugin._cached_profile_has_display_name(10001) is True
+
+
 def test_comment_latest_count_is_loaded_from_trigger_config() -> None:
     settings = PluginSettings.from_mapping({"trigger": {"comment_latest_count": 3}})
     assert settings.comment_latest_count == 3
+
+
+def test_auto_comment_pipeline_config_is_loaded_from_webui_schema_mapping() -> None:
+    settings = PluginSettings.from_mapping(
+        {
+            "llm": {
+                "comment_pipeline_enabled": False,
+                "comment_judgment_provider_id": "judge-provider",
+                "comment_reasoning_provider_id": "reason-provider",
+                "comment_execution_provider_id": "execute-provider",
+                "comment_skip_checkins": False,
+            }
+        }
+    )
+
+    assert settings.comment_pipeline_enabled is False
+    assert settings.comment_judgment_provider_id == "judge-provider"
+    assert settings.comment_reasoning_provider_id == "reason-provider"
+    assert settings.comment_execution_provider_id == "execute-provider"
+    assert settings.comment_skip_checkins is False
+
+
+def test_standard_data_dir_falls_back_to_plugin_data_and_migrates_auto_comment_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    plugin_root = tmp_path / "plugin"
+    legacy_dir = plugin_root / "data" / "qzone"
+    legacy_dir.mkdir(parents=True)
+    (plugin_root / "metadata.yaml").write_text("name: astrbot_plugin_qzone_ultra\n", encoding="utf-8")
+    (legacy_dir / "auto_comment_state.json").write_text('{"commented":["111:fid"]}\n', encoding="utf-8")
+
+    monkeypatch.setattr(main, "_star_tools_data_dir", lambda plugin_name: None)
+
+    data_dir = main._standard_data_dir(plugin_root)
+
+    assert data_dir == plugin_root / "data" / "plugin_data" / "astrbot_plugin_qzone_ultra"
+    assert (data_dir / "auto_comment_state.json").read_text(encoding="utf-8") == '{"commented":["111:fid"]}\n'
+    assert (data_dir / ".legacy-qzone-migration.json").exists()
+
+
+def test_auto_comment_state_store_uses_atomic_json_payload(tmp_path: Path) -> None:
+    store = AutoCommentStateStore(tmp_path / "auto_comment_state.json", max_items=2)
+
+    store.write_keys({"333:fid-3", "111:fid-1", "222:fid-2"})
+
+    assert store.read_keys() == {"222:fid-2", "333:fid-3"}
+    saved = (tmp_path / "auto_comment_state.json").read_text(encoding="utf-8")
+    assert "commented" in saved
+    assert "111:fid-1" not in saved
+
+
+def test_auto_comment_pipeline_runs_judgment_reasoning_and_execution() -> None:
+    post = QzonePost(hostuin=11111, fid="fid-1", summary="normal day", nickname="tester")
+    calls: list[tuple[str, str]] = []
+    pipeline = AutoCommentPipeline(
+        AutoCommentPipelineConfig(
+            judgment_provider_id="judge-provider",
+            reasoning_provider_id="reason-provider",
+            execution_provider_id="execute-provider",
+        )
+    )
+
+    async def generate_text(prompt: str, provider_id: str, system_prompt: str) -> str:
+        calls.append((provider_id, prompt))
+        if provider_id == "judge-provider":
+            return '{"action":"comment","reason":"safe"}'
+        return "friendly classmate tone"
+
+    async def execute_comment(reasoning: str) -> str:
+        calls.append(("execute", reasoning))
+        return "Looks nice"
+
+    result = asyncio.run(
+        pipeline.run(
+            post,
+            generate_text=generate_text,
+            execute_comment=execute_comment,
+        )
+    )
+
+    assert result.should_comment is True
+    assert result.comment_text == "Looks nice"
+    assert calls[0][0] == "judge-provider"
+    assert calls[1][0] == "reason-provider"
+    assert calls[2] == ("execute", "friendly classmate tone")
+
+
+def test_auto_comment_pipeline_skips_sensitive_context_before_execution() -> None:
+    post = QzonePost(hostuin=11111, fid="fid-1", summary="\u4f4f\u9662\u624b\u672f", nickname="tester")
+
+    async def generate_text(prompt: str, provider_id: str, system_prompt: str) -> str:
+        raise AssertionError("judgment provider should not be called for heuristic skip")
+
+    async def execute_comment(reasoning: str) -> str:
+        raise AssertionError("execution should not run for heuristic skip")
+
+    result = asyncio.run(
+        AutoCommentPipeline(AutoCommentPipelineConfig()).run(
+            post,
+            generate_text=generate_text,
+            execute_comment=execute_comment,
+        )
+    )
+
+    assert result.should_comment is False
+    assert result.skip_reason == "serious_or_sensitive_context"
+
+
+def test_disabled_auto_comment_pipeline_keeps_legacy_direct_generation() -> None:
+    post = QzonePost(hostuin=11111, fid="fid-1", summary="\u4f4f\u9662\u624b\u672f", nickname="tester")
+
+    async def generate_text(prompt: str, provider_id: str, system_prompt: str) -> str:
+        raise AssertionError("disabled pipeline should not call judgment or reasoning providers")
+
+    async def execute_comment(reasoning: str) -> str:
+        assert reasoning == ""
+        return "legacy direct comment"
+
+    result = asyncio.run(
+        AutoCommentPipeline(AutoCommentPipelineConfig(enabled=False)).run(
+            post,
+            generate_text=generate_text,
+            execute_comment=execute_comment,
+        )
+    )
+
+    assert result.should_comment is True
+    assert result.comment_text == "legacy direct comment"
+    assert result.judgment == "disabled"
 
 
 def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number() -> None:
