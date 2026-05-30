@@ -28,6 +28,19 @@
         "default": "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。",
         "hint": "用于 写说说/写稿 和定时自动发说说。"
       },
+      "news_provider_id": {
+        "description": "新闻说说用的 LLM 提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时优先使用写说说提供商，再回退当前会话默认提供商。"
+      },
+      "news_prompt": {
+        "description": "新闻说说提示词",
+        "type": "text",
+        "default": "从候选新闻中选一条你觉得适合发 QQ 空间的话题，写一段原创短评。不要直接复制新闻标题，不要贴链接，不要编造标题之外的细节，简短、有观点、像自然说说。",
+        "hint": "用于定时 Google News RSS 新闻说说和 新闻说说预览。"
+      },
       "comment_provider_id": {
         "description": "评论说说用的 LLM 提供商",
         "type": "string",
@@ -150,6 +163,23 @@
         },
         "hint": "围绕基准时间随机前后浮动；0 表示严格按基准时间。"
       },
+      "news_cron": {
+        "description": "新闻自动发说说的基准触发时间",
+        "type": "string",
+        "default": "",
+        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用；例如 30 8 * * * 表示每天 8:30。"
+      },
+      "news_offset": {
+        "description": "新闻自动发说说的随机偏移秒数",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 1
+        },
+        "hint": "围绕新闻发布基准时间随机前后浮动；0 表示严格按基准时间。"
+      },
       "comment_cron": {
         "description": "自动评论的基准触发时间",
         "type": "string",
@@ -195,6 +225,77 @@
         "type": "bool",
         "default": false,
         "hint": "评说说和自动评论成功后是否顺手点赞。"
+      }
+    }
+  },
+  "news": {
+    "description": "Google News RSS 新闻说说配置",
+    "type": "object",
+    "items": {
+      "scopes": {
+        "description": "新闻范围",
+        "type": "list",
+        "default": [
+          "china"
+        ],
+        "hint": "可填 china/world/mixed，也支持 中国/国际/混合；mixed 会同时获取中国和国际新闻。"
+      },
+      "keywords": {
+        "description": "新闻关键词",
+        "type": "list",
+        "default": [],
+        "hint": "可选；每个关键词会额外请求 Google News RSS 搜索源。"
+      },
+      "custom_rss_urls": {
+        "description": "自定义 Google News RSS 地址",
+        "type": "list",
+        "default": [],
+        "hint": "可选；仅允许 https://news.google.com/rss 开头的 RSS 地址。"
+      },
+      "max_candidates": {
+        "description": "候选新闻数量",
+        "type": "int",
+        "default": 12,
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        },
+        "hint": "每次交给 LLM 选择和改写的最新新闻候选数量。"
+      },
+      "recency_hours": {
+        "description": "新闻新鲜度小时数",
+        "type": "int",
+        "default": 36,
+        "slider": {
+          "min": 1,
+          "max": 168,
+          "step": 1
+        },
+        "hint": "只使用这个时间范围内的 RSS 新闻；0 表示不按发布时间过滤。"
+      },
+      "once_per_day": {
+        "description": "每天最多发布一次新闻说说",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，同一天新闻定时任务只会成功发布一次。"
+      },
+      "max_post_length": {
+        "description": "新闻说说最大长度",
+        "type": "int",
+        "default": 180,
+        "slider": {
+          "min": 40,
+          "max": 500,
+          "step": 10
+        },
+        "hint": "LLM 生成的新闻说说会截断到这个长度。"
+      },
+      "trust_env": {
+        "description": "RSS 请求使用系统代理",
+        "type": "bool",
+        "default": true,
+        "hint": "仅影响 Google News RSS 请求，不影响 QQ 空间 Cookie 请求；国内环境通常需要开启系统代理。"
       }
     }
   },

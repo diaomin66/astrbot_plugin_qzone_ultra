@@ -5,8 +5,10 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from datetime import datetime
 from typing import Any
 
+from .news import NewsItem
 from .social import QzoneComment, QzonePost
 from .utils import truncate
 
@@ -29,6 +31,15 @@ COMMENT_OUTPUT_RULES = (
     "- 沿用当前 AstrBot 人格和当前聊天语气。\n"
     "- 只输出最终评论内容，一句就好。\n"
     "- 不要输出 qzone_comment_post、函数调用、JSON、Markdown 代码块、字段名、参数或解释。\n"
+)
+
+NEWS_OUTPUT_RULES = (
+    "生成要求：\n"
+    "- 沿用当前 AstrBot 人格和当前聊天语气。\n"
+    "- 从候选新闻中选一条，写一段原创 QQ 空间说说短评。\n"
+    "- 可以自然提到新闻主题，但不要逐字复制标题，不要贴链接，不要编造标题之外的细节。\n"
+    "- 只输出最终可发布的说说正文。\n"
+    "- 不要输出序号、来源列表、qzone_publish_post、/qzone、函数调用、JSON、Markdown 代码块、字段名、参数或解释。\n"
 )
 
 INSTRUCTION_MARKERS = (
@@ -57,6 +68,8 @@ INSTRUCTION_MARKERS = (
     "参数",
     "json",
     "markdown",
+    "http://",
+    "https://",
 )
 
 
@@ -290,6 +303,43 @@ class QzoneLLM:
             prefer_current_provider=True,
         )
         return self._clean_generated_text(text, fallback=str(topic or ""))
+
+    @staticmethod
+    def _news_item_line(index: int, item: NewsItem) -> str:
+        published = ""
+        if item.published_at:
+            try:
+                published = datetime.fromtimestamp(item.published_at).strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                published = ""
+        parts = [f"{index}. {item.title}"]
+        if item.source:
+            parts.append(f"来源：{item.source}")
+        if published:
+            parts.append(f"时间：{published}")
+        if item.scope:
+            parts.append(f"范围：{item.scope}")
+        return "；".join(parts)
+
+    async def generate_news_post_text(self, event: Any, items: list[NewsItem]) -> str:
+        lines = [self._news_item_line(index, item) for index, item in enumerate(items[:20], start=1)]
+        prompt = (
+            f"{self.settings.news_prompt}\n\n{NEWS_OUTPUT_RULES}\n\n"
+            "候选新闻：\n"
+            + "\n".join(lines)
+        )
+        provider_id = self.settings.news_provider_id or self.settings.post_provider_id
+        text = await self.generate_text(
+            event,
+            prompt,
+            provider_id=provider_id,
+            system_prompt=PERSONA_SYSTEM_PROMPT,
+            prefer_current_provider=True,
+        )
+        cleaned = self._clean_generated_text(text, fields=("content", "post", "text", "message"))
+        cleaned = re.sub(r"https?://\S+", "", cleaned).strip()
+        max_len = int(getattr(self.settings, "news_max_post_length", 180) or 180)
+        return truncate(cleaned, max_len)
 
     def _comment_context(self, post: QzonePost) -> str:
         lines = [f"说说内容：{post.summary or '(空)'}"]

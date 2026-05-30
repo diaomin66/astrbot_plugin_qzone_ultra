@@ -612,6 +612,15 @@ from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneC
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
 from qzone_bridge.models import FeedEntry
+from qzone_bridge.news import (
+    GoogleNewsRSSClient,
+    NewsItem,
+    filter_recent_news,
+    google_news_rss_urls,
+    is_news_copy_like,
+    merge_news_items,
+    normalize_news_scopes,
+)
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
@@ -2592,6 +2601,121 @@ class QzoneStablePlugin(Star):
     def _auto_comment_key(self, post: QzonePost | FeedEntry) -> str:
         return f"{int(getattr(post, 'hostuin', 0) or 0)}:{getattr(post, 'fid', '')}"
 
+    def _news_publish_state_path(self) -> Path:
+        return self.data_dir / "news_publish_state.json"
+
+    def _load_news_publish_state(self) -> dict[str, Any]:
+        path = self._news_publish_state_path()
+        if not path.exists():
+            return {"published": []}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"published": []}
+        if not isinstance(payload, dict):
+            return {"published": []}
+        published = payload.get("published")
+        if not isinstance(published, list):
+            payload["published"] = []
+        return payload
+
+    def _save_news_publish_state(self, payload: dict[str, Any]) -> None:
+        path = self._news_publish_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        items = [item for item in payload.get("published") or [] if isinstance(item, dict)]
+        payload["published"] = items[-500:]
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _news_today_key() -> str:
+        return datetime.now().date().isoformat()
+
+    def _news_published_ids(self, state: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for item in state.get("published") or []:
+            if not isinstance(item, dict):
+                continue
+            ids.update(str(value) for value in item.get("candidate_ids") or [] if value)
+            if item.get("id"):
+                ids.add(str(item["id"]))
+        return ids
+
+    def _news_scope_values(self, scope_override: str = "") -> list[str]:
+        if str(scope_override or "").strip():
+            return normalize_news_scopes(scope_override)
+        return list(getattr(self.settings, "news_scopes", None) or ["china"])
+
+    async def _news_candidates(self, *, scope_override: str = "", seen_ids: set[str] | None = None) -> list[NewsItem]:
+        urls = google_news_rss_urls(
+            scopes=self._news_scope_values(scope_override),
+            keywords=list(getattr(self.settings, "news_keywords", []) or []),
+            custom_urls=list(getattr(self.settings, "news_custom_rss_urls", []) or []),
+        )
+        client = GoogleNewsRSSClient(
+            timeout=float(getattr(self.settings, "request_timeout", 15.0) or 15.0),
+            user_agent=str(getattr(self.settings, "user_agent", "") or ""),
+            trust_env=bool(getattr(self.settings, "news_trust_env", False)),
+        )
+        items = await client.fetch_items(urls)
+        recent = filter_recent_news(items, recency_hours=int(getattr(self.settings, "news_recency_hours", 36) or 36))
+        return merge_news_items(
+            recent,
+            limit=int(getattr(self.settings, "news_max_candidates", 12) or 12),
+            seen_ids=seen_ids or set(),
+        )
+
+    async def _generate_news_post_text(self, event: AstrMessageEvent | None, items: list[NewsItem]) -> str:
+        return await self._llm_adapter().generate_news_post_text(event, items)
+
+    async def _generate_original_news_post_text(
+        self,
+        event: AstrMessageEvent | None,
+        items: list[NewsItem],
+    ) -> str:
+        for attempt in range(2):
+            text = (await self._generate_news_post_text(event, items)).strip()
+            if not text:
+                return ""
+            if not is_news_copy_like(text, items):
+                return text
+            logger.warning("qzone news publish generated copy-like text on attempt %s; retrying", attempt + 1)
+        return ""
+
+    @staticmethod
+    def _news_items_summary(items: list[NewsItem], *, limit: int = 3) -> str:
+        lines: list[str] = []
+        for item in items[:limit]:
+            source = f" - {item.source}" if item.source else ""
+            lines.append(f"- {truncate(item.title, 80)}{source}")
+        return "\n".join(lines)
+
+    def _record_news_publish(
+        self,
+        state: dict[str, Any],
+        *,
+        items: list[NewsItem],
+        post: PostPayload,
+        payload: dict[str, Any],
+    ) -> None:
+        today = self._news_today_key()
+        published = [item for item in state.get("published") or [] if isinstance(item, dict)]
+        primary = items[0] if items else NewsItem(title="")
+        published.append(
+            {
+                "date": today,
+                "id": primary.item_id,
+                "candidate_ids": [item.item_id for item in items if item.item_id],
+                "title": primary.title,
+                "source": primary.source,
+                "fid": str(payload.get("fid") or ""),
+                "content": truncate(post.content, 220),
+                "published_at": datetime.now().isoformat(),
+            }
+        )
+        state["last_date"] = today
+        state["published"] = published
+        self._save_news_publish_state(state)
+
     async def _chat_history_context(self, event: AstrMessageEvent | None = None) -> str:
         bot = self._capture_onebot_client(event)
         if bot is None:
@@ -2757,6 +2881,17 @@ class QzoneStablePlugin(Star):
                     self._scheduled_loop("publish", self.settings.publish_cron, self.settings.publish_offset, self._auto_publish_once)
                 )
             )
+        if getattr(self.settings, "news_cron", ""):
+            self._scheduled_tasks.append(
+                asyncio.create_task(
+                    self._scheduled_loop(
+                        "news",
+                        self.settings.news_cron,
+                        self.settings.news_offset,
+                        self._auto_news_publish_once,
+                    )
+                )
+            )
         if self.settings.comment_cron:
             self._scheduled_tasks.append(
                 asyncio.create_task(
@@ -2798,6 +2933,41 @@ class QzoneStablePlugin(Star):
             len(post.content),
         )
         await self._notify_admin_publish_result(post, payload, "定时自动发布完成")
+
+    async def _auto_news_publish_once(self) -> None:
+        logger.info("qzone scheduled news publish started")
+        state = self._load_news_publish_state()
+        today = self._news_today_key()
+        if bool(getattr(self.settings, "news_once_per_day", True)) and state.get("last_date") == today:
+            logger.info("qzone scheduled news publish skipped: already published today")
+            return
+
+        items = await self._news_candidates(seen_ids=self._news_published_ids(state))
+        if not items:
+            logger.info("qzone scheduled news publish skipped: no fresh news candidates")
+            return
+
+        text = await self._generate_original_news_post_text(None, items)
+        if not text.strip():
+            logger.info("qzone scheduled news publish skipped: generated content is empty or copy-like")
+            return
+
+        post = PostPayload(content=text.strip(), media=[])
+        await self._ensure_cookie_ready()
+        await self._ensure_daemon()
+        payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+        self._record_news_publish(state, items=items, post=post, payload=payload)
+        logger.info(
+            "qzone scheduled news publish succeeded fid=%s text_length=%s candidates=%s",
+            payload.get("fid") or "",
+            len(post.content),
+            len(items),
+        )
+        summary = self._news_items_summary(items, limit=1)
+        message = "新闻自动发布完成"
+        if summary:
+            message = f"{message}\n参考新闻：\n{summary}"
+        await self._notify_admin_publish_result(post, payload, message)
 
     def _scheduled_comment_target_count(self) -> int:
         configured = int(getattr(self.settings, "comment_latest_count", 1) or 1)
@@ -3453,6 +3623,37 @@ class QzoneStablePlugin(Star):
         draft = await self._create_draft(event, post, anonymous=False)
         await self._notify_review_target(event, draft, "有一条 AI 写稿等待审核")
         yield await self._markdown_result(event, f"已生成稿件 #{draft.id}，可用 过稿 {draft.id} 发布。", subdir="drafts")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("新闻说说预览")
+    async def preview_news_feed(self, event: AstrMessageEvent):
+        """Preview an original Qzone post generated from Google News RSS candidates."""
+
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以预览新闻说说。")
+            return
+        scope_text = self._message_after_command(self._event_text(event), ("新闻说说预览",))
+        try:
+            items = await self._news_candidates(scope_override=scope_text, seen_ids=set())
+            if not items:
+                yield self._command_result(event, "没有获取到可用新闻。")
+                return
+            text = await self._generate_original_news_post_text(event, items)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        except Exception as exc:
+            logger.warning("qzone news preview failed: %s", exc)
+            yield self._command_result(event, "新闻说说预览失败。")
+            return
+        if not text.strip():
+            yield self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
+            return
+        summary = self._news_items_summary(items)
+        response = f"新闻说说预览：\n{text.strip()}"
+        if summary:
+            response = f"{response}\n\n候选新闻：\n{summary}"
+        yield self._command_result(event, response)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("删说说")

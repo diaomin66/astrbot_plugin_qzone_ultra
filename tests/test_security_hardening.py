@@ -4,6 +4,7 @@ import asyncio
 import base64
 import importlib
 import inspect
+import json
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -2257,6 +2258,124 @@ def test_auto_publish_once_notifies_admin_with_rendered_result(
     assert any("scheduled publish succeeded" in item for item in captured["logs"])
 
 
+def test_auto_news_publish_once_publishes_and_records_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"logs": []}
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def warning(self, *args, **kwargs): ...
+
+        def exception(self, *args, **kwargs): ...
+
+        def info(self, message, *args, **kwargs):
+            captured["logs"].append(message % args if args else str(message))
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {"fid": "fid-news", "message": "ok"}
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_candidates(**kwargs):
+        captured["candidate_kwargs"] = kwargs
+        return [
+            main.NewsItem(
+                title="航天员返回地球后最想洗头",
+                source="羊城晚报",
+                link="https://news.google.com/rss/articles/example",
+                published_at=1772250185,
+                scope="china",
+                item_id="news-1",
+            )
+        ]
+
+    async def fake_generate(event, items):
+        captured["generate_items"] = items
+        return "人在太空待久了，回到地面第一件小事都很具体。"
+
+    async def fake_notify(post, payload, message):
+        captured["notified"] = {
+            "post": post,
+            "payload": payload,
+            "message": message,
+        }
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(news_once_per_day=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._news_candidates = fake_candidates
+    plugin._generate_original_news_post_text = fake_generate
+    plugin._notify_admin_publish_result = fake_notify
+    monkeypatch.setattr(main, "logger", _Logger())
+
+    asyncio.run(plugin._auto_news_publish_once())
+
+    assert captured["publish_kwargs"] == {
+        "content": "人在太空待久了，回到地面第一件小事都很具体。",
+        "content_sanitized": True,
+    }
+    assert captured["candidate_kwargs"] == {"seen_ids": set()}
+    assert captured["notified"]["payload"]["fid"] == "fid-news"
+    assert captured["notified"]["post"].content == "人在太空待久了，回到地面第一件小事都很具体。"
+    assert "新闻自动发布完成" in captured["notified"]["message"]
+
+    state = json.loads((tmp_path / "news_publish_state.json").read_text(encoding="utf-8"))
+    assert state["last_date"] == plugin._news_today_key()
+    assert state["published"][0]["candidate_ids"] == ["news-1"]
+    assert state["published"][0]["fid"] == "fid-news"
+    assert any("scheduled news publish succeeded" in item for item in captured["logs"])
+
+
+def test_auto_news_publish_once_skips_after_daily_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(news_once_per_day=True)
+    plugin.data_dir = tmp_path
+    (tmp_path / "news_publish_state.json").write_text(
+        json.dumps({"last_date": plugin._news_today_key(), "published": []}),
+        encoding="utf-8",
+    )
+
+    async def fail_candidates(**kwargs):
+        raise AssertionError("already-published day should not fetch RSS")
+
+    plugin._news_candidates = fail_candidates
+
+    asyncio.run(plugin._auto_news_publish_once())
+
+
+def test_generate_original_news_post_text_retries_copy_like_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    item = main.NewsItem(title="航天员返回地球后最想洗头", source="羊城晚报", item_id="news-1")
+    responses = ["航天员返回地球后最想洗头", "回到地面后，最想念的也许就是那些日常小事。"]
+
+    async def fake_generate(event, items):
+        return responses.pop(0)
+
+    plugin._generate_news_post_text = fake_generate
+
+    text = asyncio.run(plugin._generate_original_news_post_text(None, [item]))
+
+    assert text == "回到地面后，最想念的也许就是那些日常小事。"
+    assert responses == []
+
+
 def test_notify_admin_publish_result_sends_rendered_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2819,6 +2938,71 @@ def test_disabled_auto_comment_pipeline_keeps_legacy_direct_generation() -> None
     assert result.should_comment is True
     assert result.comment_text == "legacy direct comment"
     assert result.judgment == "disabled"
+
+
+def test_news_settings_are_loaded_from_config() -> None:
+    settings = PluginSettings.from_mapping(
+        {
+            "llm": {"news_provider_id": "news-provider", "news_prompt": "写原创新闻短评"},
+            "trigger": {"news_cron": "30 8 * * *", "news_offset": 60},
+            "news": {
+                "scopes": ["china", "international"],
+                "keywords": ["科技"],
+                "custom_rss_urls": ["https://news.google.com/rss/search?q=test"],
+                "max_candidates": 8,
+                "recency_hours": 24,
+                "once_per_day": False,
+                "max_post_length": 120,
+                "trust_env": True,
+            },
+        }
+    )
+
+    assert settings.news_provider_id == "news-provider"
+    assert settings.news_prompt == "写原创新闻短评"
+    assert settings.news_cron == "30 8 * * *"
+    assert settings.news_offset == 60
+    assert settings.news_scopes == ["china", "world"]
+    assert settings.news_keywords == ["科技"]
+    assert settings.news_custom_rss_urls == ["https://news.google.com/rss/search?q=test"]
+    assert settings.news_max_candidates == 8
+    assert settings.news_recency_hours == 24
+    assert settings.news_once_per_day is False
+    assert settings.news_max_post_length == 120
+    assert settings.news_trust_env is True
+    assert PluginSettings.from_mapping({}).news_trust_env is True
+
+
+def test_google_news_rss_parser_cleans_titles_and_sources() -> None:
+    from qzone_bridge.news import parse_google_news_rss
+
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss><channel><item>
+      <title>航天员返回地球后最想洗头 - 羊城晚报</title>
+      <link>https://news.google.com/rss/articles/example</link>
+      <source url="https://example.com">羊城晚报</source>
+      <pubDate>Sat, 30 May 2026 03:43:05 GMT</pubDate>
+    </item></channel></rss>
+    """
+
+    items = parse_google_news_rss(xml, scope="china")
+
+    assert len(items) == 1
+    assert items[0].title == "航天员返回地球后最想洗头"
+    assert items[0].source == "羊城晚报"
+    assert items[0].link == "https://news.google.com/rss/articles/example"
+    assert items[0].published_at > 0
+    assert items[0].scope == "china"
+    assert items[0].item_id
+
+
+def test_news_copy_like_detection_rejects_titles() -> None:
+    from qzone_bridge.news import NewsItem, is_news_copy_like
+
+    items = [NewsItem(title="航天员返回地球后最想洗头", source="羊城晚报")]
+
+    assert is_news_copy_like("航天员返回地球后最想洗头", items)
+    assert not is_news_copy_like("人在太空待久了，回到地面第一件小事都能变成很具体的幸福。", items)
 
 
 def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number() -> None:

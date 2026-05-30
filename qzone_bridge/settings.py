@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .news import normalize_news_scopes
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -110,17 +112,32 @@ class PluginSettings:
     comment_max_length: int = 60
     reply_provider_id: str = ""
     reply_prompt: str = "这条帖子收到了一条评论，请自然回复此条评论，不要解释。"
+    news_provider_id: str = ""
+    news_prompt: str = (
+        "从候选新闻中选一条你觉得适合发 QQ 空间的话题，写一段原创短评。"
+        "不要直接复制新闻标题，不要贴链接，不要编造标题之外的细节，简短、有观点、像自然说说。"
+    )
     ignore_groups: list[str] = field(default_factory=list)
     ignore_users: list[str] = field(default_factory=list)
     post_max_msg: int = 500
     publish_cron: str = ""
     publish_offset: int = 0
+    news_cron: str = ""
+    news_offset: int = 0
     comment_cron: str = ""
     comment_offset: int = 0
     comment_latest_count: int = 1
     read_prob: float = 0.0
     send_admin: bool = False
     like_when_comment: bool = False
+    news_scopes: list[str] = field(default_factory=lambda: ["china"])
+    news_keywords: list[str] = field(default_factory=list)
+    news_custom_rss_urls: list[str] = field(default_factory=list)
+    news_max_candidates: int = 12
+    news_recency_hours: int = 36
+    news_once_per_day: bool = True
+    news_max_post_length: int = 180
+    news_trust_env: bool = True
     cookies_str: str = ""
     show_name: bool = True
 
@@ -166,6 +183,16 @@ class PluginSettings:
             comment_max_length=int(_nested(mapping, "llm", "comment_max_length", 60) or 60),
             reply_provider_id=str(_nested(mapping, "llm", "reply_provider_id", "") or ""),
             reply_prompt=str(_nested(mapping, "llm", "reply_prompt", cls.reply_prompt) or cls.reply_prompt),
+            news_provider_id=str(
+                _nested(
+                    mapping,
+                    "llm",
+                    "news_provider_id",
+                    _nested(mapping, "llm", "post_provider_id", ""),
+                )
+                or ""
+            ),
+            news_prompt=str(_nested(mapping, "llm", "news_prompt", cls.news_prompt) or cls.news_prompt),
             ignore_groups=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_groups", []))],
             ignore_users=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_users", []))],
             post_max_msg=int(_nested(mapping, "source", "post_max_msg", 500) or 500),
@@ -176,6 +203,16 @@ class PluginSettings:
                     "trigger",
                     "publish_offset",
                     _nested(mapping, "trigger", "publish_offset_minutes", 0),
+                )
+                or 0
+            ),
+            news_cron=str(_nested(mapping, "trigger", "news_cron", "") or ""),
+            news_offset=int(
+                _nested(
+                    mapping,
+                    "trigger",
+                    "news_offset",
+                    _nested(mapping, "trigger", "news_offset_minutes", 0),
                 )
                 or 0
             ),
@@ -193,6 +230,16 @@ class PluginSettings:
             read_prob=float(_nested(mapping, "trigger", "read_prob", 0.0) or 0.0),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
+            news_scopes=normalize_news_scopes(_nested(mapping, "news", "scopes", ["china"])),
+            news_keywords=[str(item).strip() for item in _as_list(_nested(mapping, "news", "keywords", [])) if str(item).strip()],
+            news_custom_rss_urls=[
+                str(item).strip() for item in _as_list(_nested(mapping, "news", "custom_rss_urls", [])) if str(item).strip()
+            ],
+            news_max_candidates=max(1, int(_nested(mapping, "news", "max_candidates", 12) or 12)),
+            news_recency_hours=max(0, int(_nested(mapping, "news", "recency_hours", 36) or 36)),
+            news_once_per_day=_as_bool(_nested(mapping, "news", "once_per_day", True), True),
+            news_max_post_length=max(40, int(_nested(mapping, "news", "max_post_length", 180) or 180)),
+            news_trust_env=_as_bool(_nested(mapping, "news", "trust_env", True), True),
             cookies_str=str(_pick(mapping, "cookies_str", "") or ""),
             show_name=_as_bool(_pick(mapping, "show_name", True), True),
         )
