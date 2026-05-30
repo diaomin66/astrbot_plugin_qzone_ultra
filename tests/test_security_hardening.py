@@ -3005,6 +3005,62 @@ def test_news_copy_like_detection_rejects_titles() -> None:
     assert not is_news_copy_like("人在太空待久了，回到地面第一件小事都能变成很具体的幸福。", items)
 
 
+def test_news_candidates_default_to_trust_env_true(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Client:
+        def __init__(self, *, timeout: float, user_agent: str, trust_env: bool) -> None:
+            captured["timeout"] = timeout
+            captured["user_agent"] = user_agent
+            captured["trust_env"] = trust_env
+
+        async def fetch_items(self, urls):
+            captured["urls"] = urls
+            return []
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.data_dir = tmp_path
+    plugin.settings = types.SimpleNamespace(
+        request_timeout=15.0,
+        user_agent="UA",
+        news_keywords=[],
+        news_custom_rss_urls=[],
+        news_recency_hours=36,
+        news_max_candidates=12,
+        news_scopes=["china"],
+    )
+    monkeypatch.setattr(main, "GoogleNewsRSSClient", _Client)
+
+    result = asyncio.run(plugin._news_candidates(seen_ids=set()))
+
+    assert result == []
+    assert captured["trust_env"] is True
+
+
+def test_public_error_text_includes_news_fetch_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    exc = main.QzoneBridgeError(
+        "Google News RSS 获取失败",
+        detail={
+            "trust_env": False,
+            "errors": [
+                {
+                    "message": "ConnectError: [Errno 11001] getaddrinfo failed",
+                    "url": "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+                }
+            ],
+        },
+    )
+
+    text = plugin._error_text(exc)
+
+    assert "Google News RSS 获取失败" in text
+    assert "未使用系统代理" in text
+    assert "ConnectError" in text
+
+
 def test_qzone_post_nickname_prefers_matching_owner_and_never_briefs_qq_number() -> None:
     from qzone_bridge.models import FeedEntry
     from qzone_bridge.social import QzoneComment, QzonePost, extract_nickname, post_from_entry
