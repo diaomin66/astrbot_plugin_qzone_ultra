@@ -218,7 +218,7 @@ class GoogleNewsRSSClient:
 
     async def fetch_items(self, urls: list[tuple[str, str]]) -> list[NewsItem]:
         items: list[NewsItem] = []
-        errors: list[Exception] = []
+        errors: list[dict[str, Any]] = []
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),
             trust_env=self.trust_env,
@@ -232,10 +232,32 @@ class GoogleNewsRSSClient:
                     response.raise_for_status()
                     items.extend(parse_google_news_rss(response.text, scope=scope))
                 except (httpx.HTTPError, QzoneParseError) as exc:
-                    errors.append(exc)
+                    errors.append(self._error_detail(exc, url=url, scope=scope))
         if not items and errors:
-            raise QzoneRequestError("Google News RSS 获取失败", detail={"errors": [str(exc) for exc in errors[:3]]})
+            raise QzoneRequestError("Google News RSS 获取失败", detail={"errors": errors[:3], "trust_env": self.trust_env})
         return items
+
+    @staticmethod
+    def _error_detail(exc: Exception, *, url: str, scope: str) -> dict[str, Any]:
+        message = str(exc).strip()
+        if not message:
+            cause = getattr(exc, "__cause__", None)
+            if cause is not None:
+                message = str(cause).strip()
+        if not message:
+            message = exc.__class__.__name__
+        detail: dict[str, Any] = {
+            "scope": scope,
+            "url": url,
+            "message": f"{exc.__class__.__name__}: {message}",
+        }
+        request = getattr(exc, "request", None)
+        if request is not None and getattr(request, "url", None):
+            detail["url"] = str(request.url)
+        response = getattr(exc, "response", None)
+        if response is not None and getattr(response, "status_code", None):
+            detail["status_code"] = int(response.status_code)
+        return detail
 
 
 def _child_text(item: ElementTree.Element, name: str) -> str:

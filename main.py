@@ -242,12 +242,32 @@ def _public_error_detail_parts(detail: Any) -> list[str]:
         parts.append(f"地址 {_redact_url(str(url))}")
     if detail.get("log_path"):
         parts.append("daemon 日志可在插件数据目录查看")
+    trust_env = detail.get("trust_env")
+    if trust_env is False:
+        parts.append("未使用系统代理")
     attempts = detail.get("attempts")
     if isinstance(attempts, list) and attempts:
         parts.append(f"启动尝试 {len(attempts)} 次")
         last_attempt = attempts[-1]
         if isinstance(last_attempt, dict):
             parts.extend(_public_error_detail_parts(last_attempt))
+    errors = detail.get("errors")
+    if isinstance(errors, list) and errors:
+        first_error = errors[0]
+        if isinstance(first_error, dict):
+            reason = _public_error_reason(first_error.get("message"))
+            if reason:
+                parts.append(reason)
+            error_url = first_error.get("url")
+            if error_url:
+                parts.append(f"地址 {_redact_url(str(error_url))}")
+            error_status = first_error.get("status_code")
+            if error_status is not None:
+                parts.append(f"HTTP {error_status}")
+        else:
+            reason = _public_error_reason(first_error)
+            if reason:
+                parts.append(reason)
     if detail.get("text") or detail.get("raw") or detail.get("log_tail"):
         parts.append("响应详情已隐藏")
     return parts
@@ -2654,7 +2674,7 @@ class QzoneStablePlugin(Star):
         client = GoogleNewsRSSClient(
             timeout=float(getattr(self.settings, "request_timeout", 15.0) or 15.0),
             user_agent=str(getattr(self.settings, "user_agent", "") or ""),
-            trust_env=bool(getattr(self.settings, "news_trust_env", False)),
+            trust_env=bool(getattr(self.settings, "news_trust_env", True)),
         )
         items = await client.fetch_items(urls)
         recent = filter_recent_news(items, recency_hours=int(getattr(self.settings, "news_recency_hours", 36) or 36))
