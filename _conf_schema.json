@@ -12,11 +12,11 @@
     "hint": "例如 C:\\styles\\my-style；留空则使用普通文本/内置发布结果渲染。"
   },
   "llm": {
-    "description": "LLM 模块配置",
+    "description": "大模型配置",
     "type": "object",
     "items": {
       "post_provider_id": {
-        "description": "写说说用的 LLM 提供商",
+        "description": "写说说用的大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
@@ -29,7 +29,7 @@
         "hint": "用于 写说说/写稿 和定时自动发说说。"
       },
       "news_provider_id": {
-        "description": "新闻说说用的 LLM 提供商",
+        "description": "新闻说说用的大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
@@ -39,47 +39,47 @@
         "description": "新闻说说提示词",
         "type": "text",
         "default": "从候选新闻中选一条你觉得适合发 QQ 空间的话题，写一段原创短评。不要直接复制新闻标题，不要贴链接，不要编造标题之外的细节，简短、有观点、像自然说说。",
-        "hint": "用于定时 Google News RSS 新闻说说和 新闻说说预览。"
+        "hint": "用于定时谷歌新闻 RSS 新闻说说和 新闻说说预览。"
       },
       "comment_provider_id": {
-        "description": "评论说说用的 LLM 提供商",
+        "description": "评论说说用的大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
         "hint": "留空时使用当前会话默认提供商。"
       },
       "comment_pipeline_enabled": {
-        "description": "Auto-comment decision pipeline",
+        "description": "自动评论决策流水线",
         "type": "bool",
         "default": true,
-        "hint": "Enable judgment, reasoning, and execution stages before scheduled auto-comments."
+        "hint": "开启后，定时自动评论会先经过判断、推理和执行三个阶段。"
       },
       "comment_judgment_provider_id": {
-        "description": "Auto-comment judgment LLM provider",
+        "description": "自动评论判断阶段大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "Optional provider used to decide whether a feed is appropriate to comment on."
+        "hint": "可选；用于判断一条说说是否适合评论。"
       },
       "comment_reasoning_provider_id": {
-        "description": "Auto-comment reasoning LLM provider",
+        "description": "自动评论推理阶段大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "Optional provider used to plan relationship stance and tone before writing."
+        "hint": "可选；用于在写评论前规划关系立场和语气。"
       },
       "comment_execution_provider_id": {
-        "description": "Auto-comment execution LLM provider",
+        "description": "自动评论执行阶段大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "Optional provider used to write the final auto-comment. Empty uses comment_provider_id."
+        "hint": "可选；用于生成最终评论。留空时使用评论说说提供商。"
       },
       "comment_skip_checkins": {
-        "description": "Skip low-signal check-ins",
+        "description": "跳过低信息量打卡动态",
         "type": "bool",
         "default": true,
-        "hint": "Skip short check-in style posts during the judgment stage."
+        "hint": "判断阶段会跳过较短的打卡式说说，减少无意义评论。"
       },
       "comment_prompt": {
         "description": "评论说说提示词",
@@ -99,7 +99,7 @@
         "hint": "AI 生成评论和回评时会截断到这个长度。"
       },
       "reply_provider_id": {
-        "description": "回复评论用的 LLM 提供商",
+        "description": "回复评论用的大模型提供商",
         "type": "string",
         "default": "",
         "_special": "select_provider",
@@ -150,7 +150,7 @@
         "description": "自动发说说的基准触发时间",
         "type": "string",
         "default": "",
-        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用。"
+        "hint": "定时表达式：分 时 日 月 周。留空表示禁用。"
       },
       "publish_offset": {
         "description": "自动发说说的随机偏移秒数",
@@ -167,7 +167,7 @@
         "description": "新闻自动发说说的基准触发时间",
         "type": "string",
         "default": "",
-        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用；例如 30 8 * * * 表示每天 8:30。"
+        "hint": "定时表达式：分 时 日 月 周。留空表示禁用；例如 30 8 * * * 表示每天 8:30。"
       },
       "news_offset": {
         "description": "新闻自动发说说的随机偏移秒数",
@@ -184,7 +184,7 @@
         "description": "自动评论的基准触发时间",
         "type": "string",
         "default": "",
-        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用。"
+        "hint": "定时表达式：分 时 日 月 周。留空表示禁用。"
       },
       "comment_offset": {
         "description": "自动评论的随机偏移秒数",
@@ -229,7 +229,7 @@
     }
   },
   "news": {
-    "description": "Google News RSS 新闻说说配置",
+    "description": "谷歌新闻 RSS 新闻说说配置",
     "type": "object",
     "items": {
       "scopes": {
@@ -238,19 +238,19 @@
         "default": [
           "china"
         ],
-        "hint": "可填 china/world/mixed，也支持 中国/国际/混合；mixed 会同时获取中国和国际新闻。"
+        "hint": "可填 中国/国际/混合，也兼容 china/world/mixed；混合会同时获取中国和国际新闻。"
       },
       "keywords": {
         "description": "新闻关键词",
         "type": "list",
         "default": [],
-        "hint": "可选；每个关键词会额外请求 Google News RSS 搜索源。"
+        "hint": "可选；每个关键词会额外请求谷歌新闻 RSS 搜索源。"
       },
       "custom_rss_urls": {
-        "description": "自定义 Google News RSS 地址",
+        "description": "自定义谷歌新闻 RSS 地址",
         "type": "list",
         "default": [],
-        "hint": "可选；仅允许 https://news.google.com/rss 开头的 RSS 地址。"
+        "hint": "可选；仅允许谷歌新闻 RSS 地址，必须以 https://news.google.com/rss 开头。"
       },
       "max_candidates": {
         "description": "候选新闻数量",
@@ -261,7 +261,7 @@
           "max": 30,
           "step": 1
         },
-        "hint": "每次交给 LLM 选择和改写的最新新闻候选数量。"
+        "hint": "每次交给大模型选择和改写的最新新闻候选数量。"
       },
       "recency_hours": {
         "description": "新闻新鲜度小时数",
@@ -289,13 +289,13 @@
           "max": 500,
           "step": 10
         },
-        "hint": "LLM 生成的新闻说说会截断到这个长度。"
+        "hint": "大模型生成的新闻说说会截断到这个长度。"
       },
       "trust_env": {
         "description": "RSS 请求使用系统代理",
         "type": "bool",
         "default": true,
-        "hint": "仅影响 Google News RSS 请求，不影响 QQ 空间 Cookie 请求；国内环境通常需要开启系统代理。"
+        "hint": "仅影响谷歌新闻 RSS 请求，不影响 QQ 空间 Cookie 请求；国内环境通常需要开启系统代理。"
       }
     }
   },
@@ -309,7 +309,7 @@
     "description": "QQ 空间请求超时",
     "type": "float",
     "default": 15.0,
-    "hint": "兼容目标插件 timeout 配置；会映射到 request_timeout。"
+    "hint": "兼容旧版超时配置；会映射到请求超时时间。"
   },
   "show_name": {
     "description": "展示投稿者昵称",
@@ -318,85 +318,85 @@
     "hint": "匿名投稿仍会隐藏投稿者。"
   },
   "daemon_port": {
-    "description": "Local daemon port",
+    "description": "本地守护进程端口",
     "type": "int",
     "default": 18999,
-    "hint": "本地 daemon 监听端口。"
+    "hint": "本地守护进程监听端口。"
   },
   "keepalive_interval": {
-    "description": "Keepalive interval",
+    "description": "本地守护进程保活间隔",
     "type": "int",
     "default": 120,
-    "hint": "daemon 保活间隔，单位秒。"
+    "hint": "本地守护进程保活间隔，单位秒。"
   },
   "request_timeout": {
-    "description": "Request timeout",
+    "description": "请求超时时间",
     "type": "float",
     "default": 15.0,
-    "hint": "向 QQ 空间和 daemon 发请求的超时时间。"
+    "hint": "向 QQ 空间和本地守护进程发请求的超时时间。"
   },
   "start_timeout": {
-    "description": "Startup timeout",
+    "description": "本地守护进程启动等待时间",
     "type": "float",
     "default": 20.0,
-    "hint": "等待 daemon 启动成功的最长时间。"
+    "hint": "等待本地守护进程启动成功的最长时间。"
   },
   "public_feed_limit": {
-    "description": "Default feed limit",
+    "description": "默认说说拉取数量",
     "type": "int",
     "default": 5,
     "hint": "未指定条数时默认拉取的说说数量。"
   },
   "max_feed_limit": {
-    "description": "Max feed limit",
+    "description": "单次最多拉取说说数量",
     "type": "int",
     "default": 20,
     "hint": "单次最多允许拉取的说说数量。"
   },
   "auto_start_daemon": {
-    "description": "Auto start daemon",
+    "description": "自动启动本地守护进程",
     "type": "bool",
     "default": true,
-    "hint": "第一次使用时自动启动本地 daemon。"
+    "hint": "第一次使用时自动启动本地守护进程。"
   },
   "auto_bind_cookie": {
-    "description": "Auto bind cookie",
+    "description": "自动绑定 Cookie",
     "type": "bool",
     "default": true,
     "hint": "插件初始化、AstrBot 加载或首次捕获 aiocqhttp 客户端时，若登录态缺失会尝试从 OneBot 自动获取 Cookie；自动绑定最多重试 3 次，仍失败时请使用 /qzone autobind 或 /qzone bind。"
   },
   "cookie_domain": {
-    "description": "OneBot cookie domain",
+    "description": "OneBot Cookie 域名",
     "type": "text",
     "default": "user.qzone.qq.com",
     "hint": "向 OneBot 请求 Cookie 时使用的域名。"
   },
   "admin_uins": {
-    "description": "Admin QQ numbers",
+    "description": "管理员 QQ 号",
     "type": "text",
     "default": "",
     "hint": "多个 QQ 号用英文逗号分隔。"
   },
   "user_agent": {
-    "description": "Custom user-agent",
+    "description": "自定义请求标识",
     "type": "text",
     "default": "",
-    "hint": "自定义 QQ 空间请求头里的 User-Agent。"
+    "hint": "自定义 QQ 空间请求头里的浏览器标识。"
   },
   "render_publish_result": {
-    "description": "Render publish result image",
+    "description": "发布成功后渲染结果图",
     "type": "bool",
     "default": true,
     "hint": "发布说说成功后返回 QQ 空间风格渲染图。"
   },
   "render_result_width": {
-    "description": "Publish result image width",
+    "description": "发布结果图宽度",
     "type": "int",
     "default": 900,
     "hint": "发布结果渲染图宽度。"
   },
   "render_feed_card_limit": {
-    "description": "Feed card render limit",
+    "description": "说说卡片渲染数量上限",
     "type": "int",
     "default": 5,
     "slider": {
@@ -406,7 +406,7 @@
     "hint": "看/读/评/赞说说时单次最多渲染的说说卡片数量，避免范围过大拖慢响应。"
   },
   "render_remote_timeout": {
-    "description": "Publish result remote image timeout",
+    "description": "发布结果图远程资源超时",
     "type": "float",
     "default": 0.35,
     "hint": "发布结果图远程头像或图片预览的单资源超时。"

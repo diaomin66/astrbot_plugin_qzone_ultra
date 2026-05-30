@@ -2660,6 +2660,9 @@ class QzoneStablePlugin(Star):
     def _news_publish_state_path(self) -> Path:
         return self.data_dir / "news_publish_state.json"
 
+    def _news_candidates_cache_path(self) -> Path:
+        return self.data_dir / "news_candidates.json"
+
     def _load_news_publish_state(self) -> dict[str, Any]:
         path = self._news_publish_state_path()
         if not path.exists():
@@ -2683,6 +2686,54 @@ class QzoneStablePlugin(Star):
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     @staticmethod
+    def _news_item_from_dict(payload: Any) -> NewsItem | None:
+        if not isinstance(payload, dict):
+            return None
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return None
+        try:
+            published_at = int(payload.get("published_at") or 0)
+        except (TypeError, ValueError):
+            published_at = 0
+        return NewsItem(
+            title=title,
+            source=str(payload.get("source") or ""),
+            link=str(payload.get("link") or ""),
+            published_at=published_at,
+            scope=str(payload.get("scope") or ""),
+            item_id=str(payload.get("item_id") or ""),
+        )
+
+    def _save_news_candidates_cache(self, items: list[NewsItem], *, scope_text: str = "", requested_limit: int = 0) -> None:
+        path = self._news_candidates_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "scope": str(scope_text or ""),
+            "requested_limit": int(requested_limit or 0),
+            "items": [item.to_dict() for item in items],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _load_news_candidates_cache(self) -> tuple[list[NewsItem], dict[str, Any]]:
+        path = self._news_candidates_cache_path()
+        if not path.exists():
+            return [], {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return [], {}
+        if not isinstance(payload, dict):
+            return [], {}
+        items: list[NewsItem] = []
+        for raw_item in payload.get("items") or []:
+            item = self._news_item_from_dict(raw_item)
+            if item is not None:
+                items.append(item)
+        return items, payload
+
+    @staticmethod
     def _news_today_key() -> str:
         return datetime.now().date().isoformat()
 
@@ -2701,7 +2752,25 @@ class QzoneStablePlugin(Star):
             return normalize_news_scopes(scope_override)
         return list(getattr(self.settings, "news_scopes", None) or ["china"])
 
-    async def _news_candidates(self, *, scope_override: str = "", seen_ids: set[str] | None = None) -> list[NewsItem]:
+    @staticmethod
+    def _news_candidate_limit(value: int | None = None, *, default: int = 12) -> int:
+        try:
+            raw = int(value if value is not None else default)
+        except (TypeError, ValueError):
+            raw = default
+        return max(1, min(raw, 50))
+
+    async def _news_candidates(
+        self,
+        *,
+        scope_override: str = "",
+        seen_ids: set[str] | None = None,
+        limit: int | None = None,
+    ) -> list[NewsItem]:
+        effective_limit = self._news_candidate_limit(
+            limit,
+            default=int(getattr(self.settings, "news_max_candidates", 12) or 12),
+        )
         urls = google_news_rss_urls(
             scopes=self._news_scope_values(scope_override),
             keywords=list(getattr(self.settings, "news_keywords", []) or []),
@@ -2716,7 +2785,7 @@ class QzoneStablePlugin(Star):
         recent = filter_recent_news(items, recency_hours=int(getattr(self.settings, "news_recency_hours", 36) or 36))
         return merge_news_items(
             recent,
-            limit=int(getattr(self.settings, "news_max_candidates", 12) or 12),
+            limit=effective_limit,
             seen_ids=seen_ids or set(),
         )
 
@@ -2744,6 +2813,72 @@ class QzoneStablePlugin(Star):
             source = f" - {item.source}" if item.source else ""
             lines.append(f"- {truncate(item.title, 80)}{source}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _news_item_time_text(item: NewsItem) -> str:
+        if not item.published_at:
+            return ""
+        try:
+            return datetime.fromtimestamp(item.published_at).strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):
+            return ""
+
+    def _format_news_candidates(
+        self,
+        items: list[NewsItem],
+        *,
+        title: str = "新闻候选列表",
+        cache_info: dict[str, Any] | None = None,
+    ) -> str:
+        lines = [f"{title}（按发布时间从新到旧排序）"]
+        generated_at = str((cache_info or {}).get("generated_at") or "").strip()
+        if generated_at:
+            lines.append(f"生成时间：{generated_at[:19].replace('T', ' ')}")
+        for index, item in enumerate(items, start=1):
+            meta: list[str] = []
+            if item.source:
+                meta.append(f"来源：{item.source}")
+            time_text = self._news_item_time_text(item)
+            if time_text:
+                meta.append(f"时间：{time_text}")
+            if item.scope:
+                meta.append(f"范围：{item.scope}")
+            suffix = f"\n   {'；'.join(meta)}" if meta else ""
+            lines.append(f"{index}. {truncate(item.title, 90)}{suffix}")
+        lines.append("")
+        lines.append("发布：新闻说说 发布 <序号>；预览：新闻说说 预览 <序号>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_news_fetch_args(text: str, *, default_limit: int = 12) -> tuple[int, str]:
+        raw = str(text or "").strip()
+        limit = default_limit
+        match = re.search(r"\d+", raw)
+        if match:
+            limit = int(match.group(0))
+            raw = (raw[: match.start()] + " " + raw[match.end() :]).strip()
+        scope_text = re.sub(r"\s+", " ", raw).strip()
+        return QzoneStablePlugin._news_candidate_limit(limit, default=default_limit), scope_text
+
+    @staticmethod
+    def _parse_news_selection(text: str, *, default: int = 1) -> int:
+        match = re.search(r"-?\d+", str(text or ""))
+        if not match:
+            return default
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _selected_news_items(items: list[NewsItem], index: int) -> list[NewsItem]:
+        if not items:
+            return []
+        if index < 0:
+            index = len(items) + index + 1
+        if index < 1 or index > len(items):
+            return []
+        return [items[index - 1]]
 
     def _record_news_publish(
         self,
@@ -3453,6 +3588,11 @@ class QzoneStablePlugin(Star):
         """QQ 空间管理命令组，可绑定 Cookie、查看状态和管理说说。"""
         pass
 
+    @filter.command_group("新闻说说")
+    def news_feed(self):
+        """Google News RSS 新闻说说命令组。"""
+        pass
+
     @filter.on_astrbot_loaded()
     async def qzone_on_astrbot_loaded(self):
         """AstrBot 加载完成后启动定时任务，并预热 Qzone Cookie。"""
@@ -3702,36 +3842,159 @@ class QzoneStablePlugin(Star):
         await self._notify_review_target(event, draft, "有一条 AI 写稿等待审核")
         yield await self._markdown_result(event, f"已生成稿件 #{draft.id}，可用 过稿 {draft.id} 发布。", subdir="drafts")
 
+    async def _fetch_news_candidates_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以获取新闻候选。")
+        default_limit = int(getattr(self.settings, "news_max_candidates", 12) or 12)
+        limit, scope_text = self._parse_news_fetch_args(arg_text, default_limit=default_limit)
+        try:
+            state = self._load_news_publish_state()
+            items = await self._news_candidates(
+                scope_override=scope_text,
+                seen_ids=self._news_published_ids(state),
+                limit=limit,
+            )
+            if not items:
+                return self._command_result(event, "没有获取到可用新闻。")
+            self._save_news_candidates_cache(items, scope_text=scope_text, requested_limit=limit)
+            return self._command_result(event, self._format_news_candidates(items))
+        except QzoneBridgeError as exc:
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            logger.warning("qzone news candidates fetch failed: %s", exc)
+            return self._command_result(event, "新闻候选获取失败。")
+
+    async def _preview_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以预览新闻说说。")
+        arg_text = str(arg_text or "").strip()
+        items: list[NewsItem] = []
+        cache_info: dict[str, Any] = {}
+        try:
+            if re.fullmatch(r"-?\d+", arg_text):
+                cached_items, cache_info = self._load_news_candidates_cache()
+                items = self._selected_news_items(cached_items, self._parse_news_selection(arg_text))
+                if not cached_items:
+                    return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
+                if not items:
+                    return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
+            else:
+                items = await self._news_candidates(scope_override=arg_text, seen_ids=set())
+                if not items:
+                    return self._command_result(event, "没有获取到可用新闻。")
+            text = await self._generate_original_news_post_text(event, items)
+        except QzoneBridgeError as exc:
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            logger.warning("qzone news preview failed: %s", exc)
+            return self._command_result(event, "新闻说说预览失败。")
+        if not text.strip():
+            return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
+        summary = self._news_items_summary(items)
+        response = f"新闻说说预览：\n{text.strip()}"
+        if cache_info:
+            response = f"{response}\n\n来源：最近一次新闻候选缓存"
+        if summary:
+            response = f"{response}\n\n候选新闻：\n{summary}"
+        return self._command_result(event, response)
+
+    async def _publish_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以发布新闻说说。")
+        cached_items, _cache_info = self._load_news_candidates_cache()
+        if not cached_items:
+            return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
+        selection = self._parse_news_selection(arg_text)
+        items = self._selected_news_items(cached_items, selection)
+        if not items:
+            return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
+
+        profile_task: asyncio.Task | None = None
+        try:
+            text = await self._generate_original_news_post_text(event, items)
+            if not text.strip():
+                return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
+            post = PostPayload(content=text.strip(), media=[])
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            profile_task = self._schedule_publisher_profile(event)
+            payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+            if payload.get("fid"):
+                await self._post_store().upsert_async(
+                    QzonePost(
+                        hostuin=self._self_id(event),
+                        fid=str(payload.get("fid") or ""),
+                        appid=311,
+                        summary=post.content,
+                        images=[],
+                    )
+                )
+            state = self._load_news_publish_state()
+            self._record_news_publish(state, items=items, post=post, payload=payload)
+        except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            logger.warning("qzone news publish command failed: %s", exc)
+            return self._command_result(event, "新闻说说发布失败。")
+        return await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @news_feed.command("帮助")
+    async def news_feed_help(self, event: AstrMessageEvent):
+        """查看新闻说说命令组用法。"""
+        text = "\n".join(
+            [
+                "新闻说说命令",
+                "新闻说说 获取 [数量] [中国/国际/混合]：获取并缓存候选新闻，按发布时间排序。",
+                "新闻说说 预览 [序号/中国/国际/混合]：预览大模型生成的原创新闻说说，不发布。",
+                "新闻说说 发布 <序号>：选择缓存候选新闻，交给大模型生成原创说说并发布。",
+                "兼容命令：获取新闻、新闻列表、新闻说说预览、发布新闻说说。",
+            ]
+        )
+        yield self._command_result(event, text)
+
+    @news_feed.command("获取")
+    async def news_feed_fetch(self, event: AstrMessageEvent):
+        """获取并缓存 Google News RSS 候选新闻。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 获取", "新闻说说获取"))
+        yield await self._fetch_news_candidates_for_command(event, arg_text)
+
+    @news_feed.command("预览")
+    async def news_feed_preview(self, event: AstrMessageEvent):
+        """按缓存序号或范围预览新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 预览", "新闻说说预览"))
+        yield await self._preview_news_feed_for_command(event, arg_text)
+
+    @news_feed.command("发布")
+    async def news_feed_publish(self, event: AstrMessageEvent):
+        """按缓存序号发布一条 LLM 原创新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 发布", "新闻说说发布"))
+        yield await self._publish_news_feed_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("获取新闻", alias={"新闻列表"})
+    async def fetch_news_feed(self, event: AstrMessageEvent):
+        """获取并缓存 Google News RSS 候选新闻。"""
+        arg_text = self._message_after_command(self._event_text(event), ("获取新闻", "新闻列表"))
+        yield await self._fetch_news_candidates_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发布新闻说说", alias={"发新闻说说"})
+    async def publish_selected_news_feed(self, event: AstrMessageEvent):
+        """按缓存序号发布一条 LLM 原创新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("发布新闻说说", "发新闻说说"))
+        yield await self._publish_news_feed_for_command(event, arg_text)
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("新闻说说预览")
     async def preview_news_feed(self, event: AstrMessageEvent):
         """Preview an original Qzone post generated from Google News RSS candidates."""
 
-        if not self._is_admin(event):
-            yield self._command_result(event, "只有管理员可以预览新闻说说。")
-            return
-        scope_text = self._message_after_command(self._event_text(event), ("新闻说说预览",))
-        try:
-            items = await self._news_candidates(scope_override=scope_text, seen_ids=set())
-            if not items:
-                yield self._command_result(event, "没有获取到可用新闻。")
-                return
-            text = await self._generate_original_news_post_text(event, items)
-        except QzoneBridgeError as exc:
-            yield self._command_result(event, self._error_text(exc))
-            return
-        except Exception as exc:
-            logger.warning("qzone news preview failed: %s", exc)
-            yield self._command_result(event, "新闻说说预览失败。")
-            return
-        if not text.strip():
-            yield self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
-            return
-        summary = self._news_items_summary(items)
-        response = f"新闻说说预览：\n{text.strip()}"
-        if summary:
-            response = f"{response}\n\n候选新闻：\n{summary}"
-        yield self._command_result(event, response)
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说预览",))
+        yield await self._preview_news_feed_for_command(event, arg_text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("删说说")
@@ -4041,6 +4304,9 @@ class QzoneStablePlugin(Star):
                 "赞说说 [@用户] [序号/范围]",
                 "发说说 <内容> [图片]",
                 "写说说/写稿 <主题> [图片]",
+                "新闻说说 获取 [数量] [中国/国际/混合]",
+                "新闻说说 预览 [序号/中国/国际/混合]",
+                "新闻说说 发布 <序号>",
                 "删说说 <序号>",
                 "回评/回复评论 <稿件ID> [评论序号]",
                 "投稿 <内容> [图片]",

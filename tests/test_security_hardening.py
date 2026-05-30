@@ -2409,6 +2409,121 @@ def test_auto_news_publish_once_skips_after_daily_success(
     asyncio.run(plugin._auto_news_publish_once())
 
 
+def test_news_fetch_command_caches_custom_candidate_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "新闻说说 获取 2 混合"
+
+        def is_admin(self):
+            return True
+
+        def get_sender_id(self):
+            return 12345
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    async def fake_candidates(**kwargs):
+        captured["kwargs"] = kwargs
+        return [
+            main.NewsItem(title="第一条新闻", source="来源甲", published_at=1772250185, scope="china", item_id="news-1"),
+            main.NewsItem(title="第二条新闻", source="来源乙", published_at=1772240000, scope="world", item_id="news-2"),
+        ]
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=[], news_max_candidates=12)
+    plugin.data_dir = tmp_path
+    plugin._news_candidates = fake_candidates
+
+    async def collect_results():
+        results = []
+        async for item in plugin.news_feed_fetch(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["kwargs"] == {"scope_override": "混合", "seen_ids": set(), "limit": 2}
+    assert results[0]["type"] == "plain"
+    assert "1. 第一条新闻" in results[0]["text"]
+    assert "2. 第二条新闻" in results[0]["text"]
+    assert "新闻说说 发布 <序号>" in results[0]["text"]
+    cache = json.loads((tmp_path / "news_candidates.json").read_text(encoding="utf-8"))
+    assert cache["requested_limit"] == 2
+    assert [item["item_id"] for item in cache["items"]] == ["news-1", "news-2"]
+
+
+def test_news_publish_command_uses_cached_selection_and_records_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        message_str = "新闻说说 发布 2"
+
+        def is_admin(self):
+            return True
+
+        def get_sender_id(self):
+            return 12345
+
+        def get_self_id(self):
+            return 998877
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {"fid": "fid-news-manual", "message": "ok"}
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_generate(event, items):
+        captured["generate_items"] = items
+        return "这条新闻适合写成一段原创短评。"
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=[], render_publish_result=False)
+    plugin.data_dir = tmp_path
+    plugin.posts = main.PostStore(tmp_path / "posts.json")
+    plugin.controller = _Controller()
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._generate_original_news_post_text = fake_generate
+    plugin._save_news_candidates_cache(
+        [
+            main.NewsItem(title="第一条新闻", source="来源甲", item_id="news-1"),
+            main.NewsItem(title="第二条新闻", source="来源乙", item_id="news-2"),
+        ],
+        requested_limit=2,
+    )
+
+    async def collect_results():
+        results = []
+        async for item in plugin.news_feed_publish(_Event()):
+            results.append(item)
+        return results
+
+    results = asyncio.run(collect_results())
+
+    assert captured["generate_items"][0].item_id == "news-2"
+    assert captured["publish_kwargs"] == {"content": "这条新闻适合写成一段原创短评。", "content_sanitized": True}
+    assert "发布结果" in results[0]["text"]
+    state = json.loads((tmp_path / "news_publish_state.json").read_text(encoding="utf-8"))
+    assert state["published"][0]["candidate_ids"] == ["news-2"]
+    assert state["published"][0]["fid"] == "fid-news-manual"
+
+
 def test_generate_original_news_post_text_retries_copy_like_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3023,6 +3138,28 @@ def test_news_settings_are_loaded_from_config() -> None:
     assert settings.news_max_post_length == 120
     assert settings.news_trust_env is True
     assert PluginSettings.from_mapping({}).news_trust_env is True
+
+
+def test_conf_schema_user_facing_config_text_is_chinese() -> None:
+    schema_text = Path("_conf_schema.json").read_text(encoding="utf-8")
+    for fragment in (
+        "Auto-comment",
+        "Local daemon",
+        "Keepalive interval",
+        "Request timeout",
+        "Startup timeout",
+        "Default feed limit",
+        "Max feed limit",
+        "Auto start daemon",
+        "Auto bind cookie",
+        "Admin QQ numbers",
+        "Custom user-agent",
+        "Render publish result image",
+        "Publish result image width",
+        "Feed card render limit",
+        "Publish result remote image timeout",
+    ):
+        assert fragment not in schema_text
 
 
 def test_start_scheduled_tasks_can_add_news_after_existing_task(
