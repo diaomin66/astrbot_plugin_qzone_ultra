@@ -1571,6 +1571,35 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone admin post card render returned no image; sending text fallback")
         await self._send_admin_outgoing(bot, outgoing)
 
+    async def _notify_event_post_card(
+        self,
+        event: AstrMessageEvent,
+        post: QzonePost,
+        message: str,
+        *,
+        comment_text: str = "",
+    ) -> None:
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            logger.warning("qzone event post card notification skipped: no OneBot client")
+            return
+        try:
+            image_path = await self._render_qzone_post_card(post, comment_text=comment_text)
+        except TypeError as exc:
+            if "comment_text" not in str(exc):
+                raise
+            image_path = await self._render_qzone_post_card(post)
+        outgoing: Any = message
+        if image_path is not None:
+            logger.info("qzone event post card rendered path=%s", image_path)
+            outgoing = [
+                {"type": "text", "data": {"text": f"{message}\n"}},
+                {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+            ]
+        else:
+            logger.warning("qzone event post card render returned no image; sending text fallback")
+        await self._send_event_outgoing(bot, event, outgoing)
+
     async def _notify_admin_publish_result(
         self,
         post: PostPayload,
@@ -1702,6 +1731,30 @@ class QzoneStablePlugin(Star):
             logger.warning(
                 "qzone admin notification skipped: no target; configure manage_group/admin_uins or AstrBot admins_id"
             )
+        return 0
+
+    async def _send_event_outgoing(self, bot: Any, event: AstrMessageEvent, outgoing: Any) -> int:
+        group_id = self._group_id(event)
+        if group_id:
+            try:
+                await self._call_onebot_action(bot, "send_group_msg", group_id=group_id, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone event notification group send failed group_id=%s: %s", group_id, exc)
+                return 0
+            logger.info("qzone event notification sent to group_id=%s", group_id)
+            return 1
+
+        user_id = self._sender_id(event)
+        if user_id:
+            try:
+                await self._call_onebot_action(bot, "send_private_msg", user_id=user_id, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone event notification private send failed user_id=%s: %s", user_id, exc)
+                return 0
+            logger.info("qzone event notification sent to user_id=%s", user_id)
+            return 1
+
+        logger.warning("qzone event notification skipped: no current group or sender target")
         return 0
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
@@ -3198,7 +3251,13 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
-            await self._notify_admin_post_card(event, post, f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(content, 60)}")
+            comment_text = content.strip()
+            await self._notify_event_post_card(
+                event,
+                post,
+                f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                comment_text=comment_text,
+            )
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 

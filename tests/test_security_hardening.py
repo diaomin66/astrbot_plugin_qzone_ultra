@@ -493,6 +493,85 @@ def test_aiocqhttp_capture_schedules_auto_bind_when_auto_read_is_ignored(
     assert plugin._auto_bind_bootstrap_succeeded is True
 
 
+def test_aiocqhttp_capture_auto_comment_notifies_current_event_with_comment_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Bot:
+        pass
+
+    class _Event:
+        bot = _Bot()
+
+        def get_group_id(self):
+            return 4242
+
+        def get_sender_id(self):
+            return 5151
+
+    class _PostService:
+        async def comment_post(self, post, text):
+            captured["comment"] = (post.fid, text)
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_posts_for_event(event, prefixes, *, target_id=0, no_commented=False, no_self=False):
+        captured["post_lookup"] = {
+            "event": event,
+            "target_id": target_id,
+            "no_commented": no_commented,
+            "no_self": no_self,
+        }
+        return [main.QzonePost(hostuin=12345, fid="fid-1", summary="post", nickname="Alice")]
+
+    async def fake_generate(event, post):
+        captured["generate"] = (event, post.fid)
+        return "nice comment"
+
+    async def fake_notify(event, post, message, *, comment_text=""):
+        captured["notify"] = {
+            "event": event,
+            "fid": post.fid,
+            "message": message,
+            "comment_text": comment_text,
+        }
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        read_prob=1.0,
+        auto_bind_cookie=False,
+        ignore_groups=[],
+        ignore_users=[],
+        like_when_comment=False,
+    )
+    plugin._onebot_client = None
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._posts_for_event = fake_posts_for_event
+    plugin._generate_comment_text = fake_generate
+    plugin._post_service = lambda: _PostService()
+    plugin._notify_event_post_card = fake_notify
+
+    event = _Event()
+    asyncio.run(plugin.qzone_capture_aiocqhttp_client(event))
+
+    assert captured["post_lookup"] == {
+        "event": event,
+        "target_id": 5151,
+        "no_commented": True,
+        "no_self": True,
+    }
+    assert captured["comment"] == ("fid-1", "nice comment")
+    assert captured["generate"] == (event, "fid-1")
+    assert captured["notify"]["event"] is event
+    assert captured["notify"]["fid"] == "fid-1"
+    assert captured["notify"]["comment_text"] == "nice comment"
+    assert "nice comment" in captured["notify"]["message"]
+
+
 def test_terminate_cancels_auto_bind_bootstrap_task(monkeypatch: pytest.MonkeyPatch) -> None:
     main = _import_main_with_stubs(monkeypatch)
     closed = False
@@ -1862,6 +1941,96 @@ def test_auto_comment_admin_feedback_sends_rendered_card(monkeypatch: pytest.Mon
     assert "定时自动评论完成" in message[0]["data"]["text"]
     assert message[1]["type"] == "image"
     assert message[1]["data"]["file"].startswith("file:///")
+
+
+def test_auto_comment_event_feedback_sends_rendered_card_to_current_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Bot:
+        def __init__(self):
+            self.sent: list[dict[str, object]] = []
+
+        def send_group_msg(self, *, group_id: int, message):
+            self.sent.append({"group_id": group_id, "message": message})
+
+    class _Event:
+        bot = _Bot()
+
+        def get_group_id(self):
+            return 4242
+
+        def get_sender_id(self):
+            return 5151
+
+    async def fake_render_card(self, post, *, comment_text=""):
+        captured["comment_text"] = comment_text
+        path = tmp_path / "event-card.png"
+        path.write_bytes(b"png")
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace()
+    plugin._onebot_client = None
+    plugin._context = None
+    monkeypatch.setattr(main.QzoneStablePlugin, "_render_qzone_post_card", fake_render_card)
+
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="post", nickname="Alice")
+    event = _Event()
+    asyncio.run(plugin._notify_event_post_card(event, post, "auto comment done", comment_text="nice"))
+
+    assert captured["comment_text"] == "nice"
+    assert event.bot.sent
+    assert event.bot.sent[0]["group_id"] == 4242
+    message = event.bot.sent[0]["message"]
+    assert message[0]["type"] == "text"
+    assert "auto comment done" in message[0]["data"]["text"]
+    assert message[1]["type"] == "image"
+    assert message[1]["data"]["file"].startswith("file:///")
+
+
+def test_auto_comment_event_feedback_sends_private_when_no_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        def __init__(self):
+            self.sent: list[dict[str, object]] = []
+
+        def send_private_msg(self, *, user_id: int, message):
+            self.sent.append({"user_id": user_id, "message": message})
+
+    class _Event:
+        bot = _Bot()
+
+        def get_group_id(self):
+            return 0
+
+        def get_sender_id(self):
+            return 5151
+
+    async def fake_render_card(self, post, *, comment_text=""):
+        path = tmp_path / "event-card.png"
+        path.write_bytes(b"png")
+        return path
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace()
+    plugin._onebot_client = None
+    plugin._context = None
+    monkeypatch.setattr(main.QzoneStablePlugin, "_render_qzone_post_card", fake_render_card)
+
+    post = main.QzonePost(hostuin=12345, fid="fid-1", summary="post", nickname="Alice")
+    event = _Event()
+    asyncio.run(plugin._notify_event_post_card(event, post, "auto comment done", comment_text="nice"))
+
+    assert event.bot.sent
+    assert event.bot.sent[0]["user_id"] == 5151
 
 
 def test_auto_comment_admin_feedback_falls_back_to_astrbot_global_admins(
