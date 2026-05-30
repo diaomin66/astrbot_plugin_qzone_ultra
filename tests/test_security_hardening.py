@@ -182,6 +182,58 @@ def test_main_import_recovers_from_stale_page_api_constructor(monkeypatch: pytes
         sys.modules.pop("main", None)
 
 
+def test_main_import_recovers_from_stale_llm_without_news_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.llm as llm_module
+
+    try:
+        monkeypatch.delattr(llm_module.QzoneLLM, "generate_news_post_text", raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert callable(getattr(main.QzoneLLM, "generate_news_post_text", None))
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
+def test_main_import_recovers_from_stale_settings_without_news_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.settings as settings_module
+
+    class _OldPluginSettings:
+        __dataclass_fields__ = {"publish_cron": object(), "comment_cron": object()}
+
+        @classmethod
+        def from_mapping(cls, config):
+            return cls()
+
+    try:
+        monkeypatch.setattr(settings_module, "PluginSettings", _OldPluginSettings)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.PluginSettings is not _OldPluginSettings
+        assert "news_cron" in getattr(main.PluginSettings, "__dataclass_fields__", {})
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_tolerates_missing_optional_renderer_exports(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -2971,6 +3023,52 @@ def test_news_settings_are_loaded_from_config() -> None:
     assert settings.news_max_post_length == 120
     assert settings.news_trust_env is True
     assert PluginSettings.from_mapping({}).news_trust_env is True
+
+
+def test_start_scheduled_tasks_can_add_news_after_existing_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    async def run_case():
+        blocker = asyncio.Event()
+        started: list[tuple[str, str, int]] = []
+
+        async def fake_scheduled_loop(name, cron, offset, action):
+            started.append((name, cron, offset))
+            await blocker.wait()
+
+        plugin = object.__new__(main.QzoneStablePlugin)
+        plugin.settings = types.SimpleNamespace(
+            publish_cron="0 8 * * *",
+            publish_offset=0,
+            news_cron="",
+            news_offset=0,
+            comment_cron="",
+            comment_offset=0,
+        )
+        plugin._scheduled_tasks = []
+        plugin._scheduled_loop = fake_scheduled_loop
+
+        plugin._start_scheduled_tasks()
+        await asyncio.sleep(0)
+        assert started == [("publish", "0 8 * * *", 0)]
+
+        plugin.settings.news_cron = "30 8 * * *"
+        plugin.settings.news_offset = 60
+        plugin._start_scheduled_tasks()
+        await asyncio.sleep(0)
+
+        assert started == [("publish", "0 8 * * *", 0), ("news", "30 8 * * *", 60)]
+
+        plugin._start_scheduled_tasks()
+        await asyncio.sleep(0)
+        assert started == [("publish", "0 8 * * *", 0), ("news", "30 8 * * *", 60)]
+
+        blocker.set()
+        await asyncio.gather(*plugin._scheduled_tasks, return_exceptions=True)
+
+    asyncio.run(run_case())
 
 
 def test_google_news_rss_parser_cleans_titles_and_sources() -> None:

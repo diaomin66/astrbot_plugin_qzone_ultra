@@ -32,7 +32,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052901
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026053001
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -505,7 +505,9 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
 
     contract_methods = {
         "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
+        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text",)},
         "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
+        "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
         "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
     }
     for module_name, classes in contract_methods.items():
@@ -551,6 +553,40 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 return False
             for attribute in attributes:
                 if getattr(cls, attribute, None) is None:
+                    return False
+
+    contract_dataclass_fields = {
+        "qzone_bridge.settings": {
+            "PluginSettings": (
+                "news_cron",
+                "news_offset",
+                "news_provider_id",
+                "news_prompt",
+                "news_scopes",
+                "news_keywords",
+                "news_custom_rss_urls",
+                "news_max_candidates",
+                "news_recency_hours",
+                "news_once_per_day",
+                "news_max_post_length",
+                "news_trust_env",
+            )
+        },
+    }
+    for module_name, classes in contract_dataclass_fields.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, fields in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            dataclass_fields = getattr(cls, "__dataclass_fields__", None)
+            if not isinstance(dataclass_fields, dict):
+                return False
+            for field_name in fields:
+                if field_name not in dataclass_fields:
                     return False
 
     signature_contracts = {
@@ -2892,31 +2928,53 @@ class QzoneStablePlugin(Star):
     def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
         return cron_delay_seconds(cron, offset_seconds, now=datetime.now(), randint=random.randint)
 
-    def _start_scheduled_tasks(self) -> None:
-        if self._scheduled_tasks:
+    @staticmethod
+    def _scheduled_task_label(name: str) -> str:
+        return f"qzone-scheduled-{name}"
+
+    def _has_active_scheduled_task(self, name: str) -> bool:
+        label = self._scheduled_task_label(name)
+        for task in self._scheduled_tasks:
+            if task.done():
+                continue
+            get_name = getattr(task, "get_name", None)
+            if callable(get_name) and get_name() == label:
+                return True
+        return False
+
+    def _create_scheduled_task(self, name: str, cron: str, offset: int, action: Any) -> None:
+        if self._has_active_scheduled_task(name):
             return
+        coro = self._scheduled_loop(name, cron, offset, action)
+        label = self._scheduled_task_label(name)
+        try:
+            task = asyncio.create_task(coro, name=label)
+        except TypeError:
+            task = asyncio.create_task(coro)
+        self._scheduled_tasks.append(task)
+
+    def _start_scheduled_tasks(self) -> None:
+        self._scheduled_tasks = [task for task in self._scheduled_tasks if not task.done()]
         if self.settings.publish_cron:
-            self._scheduled_tasks.append(
-                asyncio.create_task(
-                    self._scheduled_loop("publish", self.settings.publish_cron, self.settings.publish_offset, self._auto_publish_once)
-                )
+            self._create_scheduled_task(
+                "publish",
+                self.settings.publish_cron,
+                self.settings.publish_offset,
+                self._auto_publish_once,
             )
         if getattr(self.settings, "news_cron", ""):
-            self._scheduled_tasks.append(
-                asyncio.create_task(
-                    self._scheduled_loop(
-                        "news",
-                        self.settings.news_cron,
-                        self.settings.news_offset,
-                        self._auto_news_publish_once,
-                    )
-                )
+            self._create_scheduled_task(
+                "news",
+                self.settings.news_cron,
+                self.settings.news_offset,
+                self._auto_news_publish_once,
             )
         if self.settings.comment_cron:
-            self._scheduled_tasks.append(
-                asyncio.create_task(
-                    self._scheduled_loop("comment", self.settings.comment_cron, self.settings.comment_offset, self._auto_comment_once)
-                )
+            self._create_scheduled_task(
+                "comment",
+                self.settings.comment_cron,
+                self.settings.comment_offset,
+                self._auto_comment_once,
             )
 
     async def _scheduled_loop(self, name: str, cron: str, offset: int, action: Any) -> None:
