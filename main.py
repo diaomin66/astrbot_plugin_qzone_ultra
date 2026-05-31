@@ -695,7 +695,7 @@ from qzone_bridge.render import (
     format_llm_feed_list,
     format_status,
 )
-from qzone_bridge.scheduler import cron_delay_seconds
+from qzone_bridge.scheduler import cron_schedule
 import qzone_bridge.selection as _selection
 from qzone_bridge.settings import PluginSettings
 import qzone_bridge.social as _social
@@ -923,6 +923,7 @@ class QzoneStablePlugin(Star):
         self._last_page_feed_preload_at = 0.0
         self._auto_bind_bootstrap_succeeded = False
         self._scheduled_tasks: list[asyncio.Task] = []
+        self._scheduled_task_slots: dict[str, datetime] = {}
         self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
         self._publisher_profile_preload_task: asyncio.Task | None = None
         self.drafts = DraftStore(self.data_dir / "drafts.json")
@@ -3061,7 +3062,7 @@ class QzoneStablePlugin(Star):
 
     @staticmethod
     def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
-        return cron_delay_seconds(cron, offset_seconds, now=datetime.now(), randint=random.randint)
+        return cron_schedule(cron, offset_seconds, now=datetime.now(), randint=random.randint).delay_seconds
 
     @staticmethod
     def _scheduled_task_label(name: str) -> str:
@@ -3080,6 +3081,7 @@ class QzoneStablePlugin(Star):
     def _create_scheduled_task(self, name: str, cron: str, offset: int, action: Any) -> None:
         if self._has_active_scheduled_task(name):
             return
+        self._scheduled_task_slots.pop(name, None)
         coro = self._scheduled_loop(name, cron, offset, action)
         label = self._scheduled_task_label(name)
         try:
@@ -3113,11 +3115,22 @@ class QzoneStablePlugin(Star):
             )
 
     async def _scheduled_loop(self, name: str, cron: str, offset: int, action: Any) -> None:
+        last_slot = self._scheduled_task_slots.get(name)
         while True:
-            delay = self._cron_delay_seconds(cron, offset)
+            schedule = cron_schedule(
+                cron,
+                offset,
+                now=datetime.now(),
+                randint=random.randint,
+                after=last_slot,
+            )
+            delay = schedule.delay_seconds
             if delay <= 0:
                 logger.info("qzone scheduled %s disabled: invalid cron=%s", name, cron)
                 return
+            last_slot = schedule.slot
+            if last_slot is not None:
+                self._scheduled_task_slots[name] = last_slot
             logger.info("qzone scheduled %s next run in %.1fs cron=%s offset=%s", name, delay, cron, offset)
             await asyncio.sleep(delay)
             try:
@@ -5263,6 +5276,7 @@ class QzoneStablePlugin(Star):
         if self._scheduled_tasks:
             await asyncio.gather(*self._scheduled_tasks, return_exceptions=True)
             self._scheduled_tasks.clear()
+        self._scheduled_task_slots.clear()
         if self._publisher_profile_preload_task is not None:
             self._publisher_profile_preload_task.cancel()
             await asyncio.gather(self._publisher_profile_preload_task, return_exceptions=True)

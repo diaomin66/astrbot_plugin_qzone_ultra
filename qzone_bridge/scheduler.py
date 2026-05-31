@@ -5,6 +5,34 @@ from __future__ import annotations
 import random
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import NamedTuple
+
+
+class CronSchedule(NamedTuple):
+    delay_seconds: float
+    slot: datetime | None
+
+
+def cron_schedule(
+    cron: str,
+    offset_seconds: int,
+    *,
+    now: datetime | None = None,
+    randint: Callable[[int, int], int] = random.randint,
+    after: datetime | None = None,
+) -> CronSchedule:
+    current = now or datetime.now()
+    base = after or current
+    slot = cron_next_after(cron, base)
+    if slot is None:
+        return CronSchedule(0.0, None)
+    target = slot
+    offset = int(offset_seconds or 0)
+    if offset > 0:
+        target += timedelta(seconds=randint(-offset, offset))
+        if target <= current:
+            target = current + timedelta(seconds=1)
+    return CronSchedule(max(1.0, (target - current).total_seconds()), slot)
 
 
 def cron_delay_seconds(
@@ -14,16 +42,7 @@ def cron_delay_seconds(
     now: datetime | None = None,
     randint: Callable[[int, int], int] = random.randint,
 ) -> float:
-    current = now or datetime.now()
-    target = cron_next_after(cron, current)
-    if target is None:
-        return 0.0
-    offset = int(offset_seconds or 0)
-    if offset > 0:
-        target += timedelta(seconds=randint(-offset, offset))
-        if target <= current:
-            target = current + timedelta(seconds=1)
-    return max(1.0, (target - current).total_seconds())
+    return cron_schedule(cron, offset_seconds, now=now, randint=randint).delay_seconds
 
 
 def cron_next_after(cron: str, now: datetime) -> datetime | None:
