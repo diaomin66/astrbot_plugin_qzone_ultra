@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import traceback
@@ -107,3 +108,5 @@ logger = get_logger("qzone_bridge")
 
 def configure_standalone_logging(default_level: str = "INFO") -> None:
     os.environ.setdefault("QZONE_DAEMON_LOG_LEVEL", default_level)
+    for noisy_logger in ("httpx", "httpcore", "aiohttp.access"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)

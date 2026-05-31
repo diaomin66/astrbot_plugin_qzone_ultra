@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -46,6 +48,7 @@ FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
 PUBLIC_HEALTH_METHODS = {"GET", "HEAD"}
 PUBLIC_HEALTH_PATHS = {"/", "/health"}
 AUTHENTICATED_REQUEST_KEY = "qzone_authenticated_request"
+FEED_CURSOR_PREFIX = "qzpc_"
 LATEST_FEED_REFERENCES = {
     "latest",
     "newest",
@@ -100,6 +103,52 @@ def _body_int(body: dict[str, Any], key: str, default: int = 0) -> int:
 
 def _body_bool(body: dict[str, Any], key: str, default: bool = False) -> bool:
     return _coerce_bool(body.get(key), default)
+
+
+def _encode_feed_cursor(source: str, *, cursor: str = "", page: int = 0, num: int = 0) -> str:
+    payload = {
+        "source": str(source or ""),
+        "cursor": str(cursor or ""),
+        "page": max(0, int(page or 0)),
+        "num": max(0, int(num or 0)),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return FEED_CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_feed_cursor(value: str) -> dict[str, Any]:
+    text = str(value or "").strip()
+    if not text:
+        return {"source": "", "cursor": "", "page": 0, "num": 0}
+    if not text.startswith(FEED_CURSOR_PREFIX):
+        return {"source": "", "cursor": text, "page": 0, "num": 0}
+    encoded = text[len(FEED_CURSOR_PREFIX):]
+    try:
+        padded = encoded + ("=" * (-len(encoded) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception as exc:
+        raise QzoneParseError("动态分页游标无效，请刷新页面后重试。") from exc
+    if not isinstance(payload, dict):
+        raise QzoneParseError("动态分页游标无效，请刷新页面后重试。")
+    return {
+        "source": str(payload.get("source") or ""),
+        "cursor": str(payload.get("cursor") or ""),
+        "page": _coerce_int(payload.get("page"), 0, field="cursor.page"),
+        "num": _coerce_int(payload.get("num"), 0, field="cursor.num"),
+    }
+
+
+def _feed_entry_ref(entry: FeedEntry) -> tuple[int, str, int]:
+    return (int(entry.hostuin or 0), str(entry.fid or ""), int(entry.appid or 0))
+
+
+def _feed_page_visit_key(source: str, cursor: str, page: int, num: int) -> tuple[str, str, int, int]:
+    source = str(source or "")
+    if source == "legacy_feeds":
+        return (source, "", max(1, int(page or 1)), max(1, int(num or 1)))
+    if source == "legacy_recent":
+        return (source, str(cursor or ""), max(1, int(page or 1)), max(1, int(num or 1)))
+    return (source, str(cursor or ""), 0, 0)
 
 
 async def _bridge_response(service: "QzoneDaemonService", action) -> web.Response:
@@ -390,13 +439,29 @@ class QzoneDaemonService:
                 raise QzoneNeedsRebind()
             hostuin = session_uin
         scope = scope or ("self" if hostuin == session_uin else "profile")
+        cursor_state = _decode_feed_cursor(cursor)
+        cursor_source = str(cursor_state.get("source") or "")
+        cursor_value = str(cursor_state.get("cursor") or "")
+        cursor_page = max(0, _coerce_int(cursor_state.get("page"), 0, field="cursor.page"))
+        cursor_num = max(0, _coerce_int(cursor_state.get("num"), 0, field="cursor.num"))
         items: list[FeedEntry] = []
-        next_cursor = cursor or ""
+        next_cursor = ""
         has_more = False
         page_round = 0
+        seen_item_refs: set[tuple[int, str, int]] = set()
+        visited_pages: set[tuple[str, str, int, int]] = set()
         while len(items) < limit and page_round < 6:
-            if scope in {"self", "active"}:
-                if page_round == 0 and not next_cursor:
+            page_source = cursor_source
+            legacy_page = max(1, cursor_page or 1)
+            legacy_num = max(1, cursor_num or limit)
+            if page_source == "legacy_recent":
+                legacy_begin_time = max(0, _coerce_int(cursor_value, 0, field="cursor.cursor"))
+                payload = await self.client.legacy_recent_feeds(page=legacy_page, begin_time=legacy_begin_time)
+            elif page_source == "legacy_feeds":
+                payload = await self.client.legacy_feeds(hostuin, page=legacy_page, num=legacy_num)
+            elif scope in {"self", "active"}:
+                page_source = "modern_active"
+                if not cursor_value:
                     try:
                         payload = unwrap_payload(await self.client.index())
                     except (QzoneRequestError, QzoneParseError) as exc:
@@ -405,38 +470,117 @@ class QzoneDaemonService:
                         log.warning("qzone %s feed primary fetch failed, using legacy fallback: %s", scope, exc)
                         try:
                             if scope == "active":
+                                page_source = "legacy_recent"
+                                legacy_page = 1
                                 payload = await self.client.legacy_recent_feeds()
                             else:
-                                payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
+                                page_source = "legacy_feeds"
+                                legacy_page = 1
+                                legacy_num = limit
+                                payload = await self.client.legacy_feeds(hostuin, page=legacy_page, num=legacy_num)
                         except (QzoneRequestError, QzoneParseError) as legacy_exc:
                             log.warning("qzone msglist feed fallback failed, using recent feed fallback: %s", legacy_exc)
+                            page_source = "legacy_recent"
+                            legacy_page = 1
                             payload = await self.client.legacy_recent_feeds()
                 else:
-                    payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
-                feedpage = payload
+                    payload = unwrap_payload(await self.client.get_active_feeds(cursor_value))
             else:
-                if page_round == 0 and not next_cursor:
+                page_source = "modern_profile"
+                if not cursor_value:
                     try:
                         payload = await self.client.profile(hostuin)
                     except (QzoneRequestError, QzoneParseError) as exc:
                         if not self._should_fallback_feed_fetch(exc):
                             raise
                         log.warning("qzone profile feed primary fetch failed, using legacy fallback: %s", exc)
-                        payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
+                        page_source = "legacy_feeds"
+                        legacy_page = 1
+                        legacy_num = limit
+                        payload = await self.client.legacy_feeds(hostuin, page=legacy_page, num=legacy_num)
                 else:
-                    payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
-                feedpage = payload
+                    payload = unwrap_payload(await self.client.get_feeds(hostuin, cursor_value))
+
+            page_key = _feed_page_visit_key(page_source, cursor_value, legacy_page, legacy_num)
+            if page_key in visited_pages:
+                has_more = False
+                next_cursor = ""
+                break
+            visited_pages.add(page_key)
 
             default_hostuin = 0 if scope == "active" else hostuin
-            feedpage, page_items = extract_feed_page(feedpage, default_hostuin=default_hostuin)
+            feedpage, page_items = extract_feed_page(payload, default_hostuin=default_hostuin)
             if not isinstance(feedpage, dict):
                 break
-            self.client.cache_feed_page(default_hostuin, page_items)
-            items.extend(page_items)
-            has_more = feed_page_has_more(feedpage)
-            next_cursor = feed_page_cursor(feedpage)
+            new_page_items: list[FeedEntry] = []
+            for item in page_items:
+                item_ref = _feed_entry_ref(item)
+                if not item_ref[0] or not item_ref[1]:
+                    continue
+                if item_ref in seen_item_refs:
+                    continue
+                seen_item_refs.add(item_ref)
+                new_page_items.append(item)
+            self.client.cache_feed_page(default_hostuin, new_page_items)
+            items.extend(new_page_items)
+            if page_items and not new_page_items:
+                has_more = False
+                next_cursor = ""
+                break
+            raw_cursor = feed_page_cursor(feedpage)
+            if page_source in {"legacy_recent", "legacy_feeds"}:
+                has_more = bool(new_page_items) and (
+                    feed_page_has_more(feedpage)
+                    or page_source == "legacy_recent"
+                    or len(new_page_items) >= min(max(1, limit), legacy_num)
+                )
+                legacy_cursor_value = ""
+                if page_source == "legacy_recent":
+                    times = [int(item.created_at or 0) for item in new_page_items if int(item.created_at or 0) > 0]
+                    if times:
+                        legacy_cursor_value = str(min(times))
+                    else:
+                        has_more = False
+                next_cursor = (
+                    _encode_feed_cursor(
+                        page_source,
+                        cursor=legacy_cursor_value,
+                        page=legacy_page + 1,
+                        num=legacy_num,
+                    )
+                    if has_more
+                    else ""
+                )
+            else:
+                has_more = feed_page_has_more(feedpage) and bool(raw_cursor)
+                next_cursor = (
+                    _encode_feed_cursor(page_source, cursor=raw_cursor)
+                    if has_more
+                    else ""
+                )
             if not has_more or not next_cursor:
                 break
+            if page_source == "legacy_recent":
+                break
+            next_cursor_state = _decode_feed_cursor(next_cursor)
+            next_cursor_source = str(next_cursor_state.get("source") or "")
+            next_cursor_value = str(next_cursor_state.get("cursor") or "")
+            next_cursor_page = max(0, _coerce_int(next_cursor_state.get("page"), 0, field="cursor.page"))
+            next_cursor_num = max(0, _coerce_int(next_cursor_state.get("num"), 0, field="cursor.num"))
+            next_page_key = _feed_page_visit_key(
+                next_cursor_source,
+                next_cursor_value,
+                next_cursor_page,
+                next_cursor_num,
+            )
+            if next_page_key in visited_pages:
+                has_more = False
+                next_cursor = ""
+                break
+            cursor_source = next_cursor_source
+            cursor_value = next_cursor_value
+            cursor_page = next_cursor_page
+            cursor_num = next_cursor_num
             page_round += 1
 
         visible_items = items[:limit]
@@ -448,7 +592,7 @@ class QzoneDaemonService:
             "items": [asdict(item) for item in visible_items],
             "has_more": has_more,
             "cursor": next_cursor,
-            "count": min(len(items), limit),
+            "count": len(visible_items),
         }
 
     def _detail_payload_from_entry(self, entry: FeedEntry) -> dict[str, Any]:
@@ -664,11 +808,11 @@ class QzoneDaemonService:
             "raw": payload,
         }
 
-    async def delete_post(self, *, fid: str, appid: int = 311) -> dict[str, Any]:
+    async def delete_post(self, *, fid: str, appid: int = 311, created_at: int = 0) -> dict[str, Any]:
         if not str(fid or "").strip():
             raise QzoneParseError("说说 fid 不能为空")
         self._ensure_session_ready()
-        payload = unwrap_payload(await self.client.delete_post(str(fid), appid=appid))
+        payload = unwrap_payload(await self.client.delete_post(str(fid), appid=appid, created_at=created_at))
         if not isinstance(payload, dict):
             raise QzoneParseError("删除说说返回格式异常")
         self._set_success(defer_save=True)
@@ -1019,7 +1163,7 @@ SHUTDOWN_EVENT_APP_KEY = web.AppKey("qzone_shutdown_event", asyncio.Event)
 
 
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
-    app = web.Application(client_max_size=32 * 1024 * 1024)
+    app = web.Application(client_max_size=128 * 1024 * 1024)
     app[SERVICE_APP_KEY] = service
     if shutdown_event is not None:
         app[SHUTDOWN_EVENT_APP_KEY] = shutdown_event
@@ -1108,17 +1252,28 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
         )
 
     async def post(request: web.Request) -> web.Response:
-        body = await _json_body(request)
-        content = str(body.get("content") or "")
-        media = body.get("media") or body.get("attachments") or body.get("photos") or []
-        return await _bridge_response(
-            service,
-            lambda: service.publish_post(
+        async def action() -> dict[str, Any]:
+            body = await _json_body(request)
+            if not body and int(request.content_length or 0) > 0:
+                raise QzoneParseError(
+                    "发布请求体为空或无法解析，请重新选择图片后再发布。",
+                    detail={
+                        "content_length": int(request.content_length or 0),
+                        "content_type": request.headers.get("content-type", ""),
+                    },
+                )
+            content = str(body.get("content") or "")
+            media = body.get("media") or body.get("attachments") or body.get("photos") or []
+            return await service.publish_post(
                 content=content,
                 sync_weibo=_body_bool(body, "sync_weibo", False),
                 media=media,
                 content_sanitized=_body_bool(body, "content_sanitized", False),
-            ),
+            )
+
+        return await _bridge_response(
+            service,
+            action,
         )
 
     async def comment(request: web.Request) -> web.Response:
@@ -1163,6 +1318,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             lambda: service.delete_post(
                 fid=str(body.get("fid") or ""),
                 appid=_body_int(body, "appid", 311),
+                created_at=_body_int(body, "created_at", 0),
             ),
         )
 

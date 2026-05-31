@@ -16,7 +16,15 @@ import httpx
 
 from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .astrbot_logging import get_logger
-from .media import QZONE_MAX_IMAGES, is_supported_image, normalize_media_item, source_name
+from .media import (
+    QZONE_MAX_IMAGES,
+    QZONE_MIN_IMAGE_SIDE,
+    image_dimensions_from_bytes,
+    is_supported_image,
+    looks_like_supported_image_bytes,
+    normalize_media_item,
+    source_name,
+)
 from .models import FeedEntry, SessionState
 from .parser import (
     cookie_header,
@@ -63,20 +71,6 @@ IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
 IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
 IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-
-
-def _looks_like_supported_image_bytes(data: bytes) -> bool:
-    if data.startswith(b"\xff\xd8\xff"):
-        return True
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return True
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return True
-    if data.startswith(b"BM"):
-        return True
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return True
-    return False
 
 
 @dataclass(slots=True)
@@ -600,7 +594,8 @@ class QzoneClient:
         )
         return payload
 
-    async def legacy_recent_feeds(self, page: int = 1) -> dict[str, Any]:
+    async def legacy_recent_feeds(self, page: int = 1, *, begin_time: int = 0) -> dict[str, Any]:
+        begin_time = max(0, int(begin_time or 0))
         payload = await self._request_json(
             "GET",
             "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more",
@@ -615,7 +610,7 @@ class QzoneClient:
                 "aisortEndTime": 0,
                 "aisortOffset": 0,
                 "aisortBeginTime": 0,
-                "begintime": 0,
+                "begintime": begin_time,
                 "format": "json",
                 "useutf8": 1,
                 "outputhtmlfeed": 1,
@@ -818,10 +813,17 @@ class QzoneClient:
         data, filename, mime_type = await self._load_image_source(item.to_dict())
         if not data:
             raise QzoneParseError("图片内容为空或无法读取", detail={"name": filename})
-        if not _looks_like_supported_image_bytes(data):
+        if not looks_like_supported_image_bytes(data):
             raise QzoneParseError(
                 "图片内容不是可上传的图片文件",
                 detail={"name": filename, "mime_type": mime_type},
+            )
+        dimensions = image_dimensions_from_bytes(data)
+        if dimensions is not None and min(dimensions) < QZONE_MIN_IMAGE_SIDE:
+            width, height = dimensions
+            raise QzoneParseError(
+                f"图片尺寸过小，请选择至少 {QZONE_MIN_IMAGE_SIDE}×{QZONE_MIN_IMAGE_SIDE} 的图片。",
+                detail={"name": filename, "width": width, "height": height},
             )
 
         encoded_bytes = await asyncio.to_thread(base64.b64encode, data)
@@ -1059,7 +1061,8 @@ class QzoneClient:
         )
         return payload
 
-    async def delete_post(self, fid: str, *, appid: int = 311) -> dict[str, Any]:
+    async def delete_post(self, fid: str, *, appid: int = 311, created_at: int = 0) -> dict[str, Any]:
+        feeds_time = int(created_at or time.time())
         payload = await self._request_json(
             "POST",
             QZONE_DELETE_URL,
@@ -1070,7 +1073,7 @@ class QzoneClient:
                 "feedsFlag": 0,
                 "feedsKey": fid,
                 "feedsAppid": appid,
-                "feedsTime": int(time.time()),
+                "feedsTime": feeds_time,
                 "fupdate": 1,
                 "ref": "feeds",
                 "format": "json",

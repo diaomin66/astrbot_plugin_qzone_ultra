@@ -17,6 +17,29 @@ def test_page_header_removes_brand_block() -> None:
     assert 'id="statusText"' not in html
     assert 'id="accountName"' in html
     assert 'id="accountMeta"' in html
+    assert '<script src="/api/plugin/page/bridge-sdk.js"></script>' in html
+
+
+def test_page_theme_uses_astrbot_context_not_system_fallback() -> None:
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
+
+    assert "prefers-color-scheme" not in css
+    assert "prefers-color-scheme" not in app
+    assert "themeFromDocument" not in app
+    assert "themeFromParentStorage" not in app
+    assert '"uiTheme"' in app
+    assert "v-theme--dark" in app
+    assert "::root" not in css
+    assert ':root[data-theme="dark"]' in css
+    assert '|| "light"' in app
+
+
+def test_page_upload_preview_accepts_local_blob_urls() -> None:
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+
+    assert 'source.startsWith("blob:")' in app
+    assert "delete payload.preview_url" in app
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for the frontend smoke test")
@@ -168,6 +191,9 @@ account.className = "account";
 const accountAvatar = new Element("account-avatar");
 accountAvatar.className = "avatar";
 account.append(accountAvatar);
+const documentRoot = new Element("document-root");
+documentRoot.dataset = {};
+documentRoot.style = {};
 
 const tabs = ["friends", "self", "profile"].map((scope) => {
   const tab = new Element(`tab-${scope}`);
@@ -176,6 +202,7 @@ const tabs = ["friends", "self", "profile"].map((scope) => {
 });
 
 globalThis.document = {
+  documentElement: documentRoot,
   body: new Element("body"),
   getElementById(id) {
     return elements.get(id) || null;
@@ -193,8 +220,12 @@ globalThis.document = {
   },
 };
 
+const windowHandlers = new Map();
 let promptCalls = 0;
+let confirmCalls = 0;
 let replyPayload = null;
+let deletePayload = null;
+let publishPayload = null;
 let detailResolve;
 const detailPromise = new Promise((resolve) => {
   detailResolve = resolve;
@@ -207,7 +238,8 @@ const feedPost = {
   created_at: 1710000000,
   stats: { likes: 3, comments: 1 },
   liked: false,
-  images: [],
+  images: ["https://qzone.example.test/photo.jpg"],
+  can_delete: true,
   comments: [
     {
       id: "comment-1",
@@ -222,16 +254,23 @@ const feedPost = {
 globalThis.window = {
   setTimeout,
   clearTimeout,
+  requestAnimationFrame(handler) {
+    return setTimeout(handler, 0);
+  },
+  addEventListener(name, handler) {
+    windowHandlers.set(name, handler);
+  },
   prompt() {
     promptCalls += 1;
     return "should not be used";
   },
   confirm() {
+    confirmCalls += 1;
     return true;
   },
-  AstrBotPluginPage: {
+    AstrBotPluginPage: {
     ready() {
-      return Promise.resolve({ pluginName: "astrbot_plugin_qzone_ultra", pageName: "qzone" });
+      return Promise.resolve({ pluginName: "astrbot_plugin_qzone_ultra", pageName: "qzone", uiTheme: "PurpleThemeDark" });
     },
     apiGet(endpoint) {
       if (endpoint === "page/status") {
@@ -264,6 +303,22 @@ globalThis.window = {
           },
         });
       }
+      if (endpoint === "page/delete") {
+        deletePayload = body;
+        return Promise.resolve({ message: "ok" });
+      }
+      if (endpoint === "page/publish") {
+        publishPayload = body;
+        return Promise.resolve({
+          post: {
+            ...feedPost,
+            id: "post_new",
+            content: body.content,
+            images: [],
+            comments: [],
+          },
+        });
+      }
       return Promise.resolve({});
     },
     upload(endpoint, file) {
@@ -272,8 +327,10 @@ globalThis.window = {
       }
       return Promise.resolve({
         media: {
+          upload_id: "upload-token-1",
           name: file.name,
-          data_url: "data:image/png;base64,AA==",
+          mime_type: "image/png",
+          size: 1234,
         },
       });
     },
@@ -282,6 +339,21 @@ globalThis.window = {
 
 await import(pathToFileURL(process.argv[2]).href);
 await new Promise((resolve) => setTimeout(resolve, 30));
+
+if (documentRoot.dataset.theme !== "dark" || documentRoot.style.colorScheme !== "dark" || !documentRoot.classList.contains("v-theme--dark")) {
+  throw new Error(`theme did not follow bridge context: ${documentRoot.dataset.theme}/${documentRoot.style.colorScheme}`);
+}
+windowHandlers.get("message")?.({
+  data: {
+    channel: "astrbot-plugin-page",
+    kind: "context",
+    context: { uiTheme: "PurpleTheme" },
+  },
+});
+await new Promise((resolve) => setTimeout(resolve, 30));
+if (documentRoot.dataset.theme !== "light" || documentRoot.style.colorScheme !== "light" || !documentRoot.classList.contains("v-theme--light")) {
+  throw new Error(`theme did not follow AstrBot theme update: ${documentRoot.dataset.theme}/${documentRoot.style.colorScheme}`);
+}
 
 if (elements.get("accountName").textContent !== "Tester") {
   throw new Error(`account nickname fallback failed: ${elements.get("accountName").textContent}`);
@@ -314,6 +386,10 @@ detailButton.handlers.click();
 
 if (elements.get("detailContent").hidden) {
   throw new Error("cached detail was not rendered immediately");
+}
+const detailMedia = elements.get("detailContent").querySelector(".detail-media");
+if (!detailMedia || !detailMedia.querySelector("img")) {
+  throw new Error("detail image media was not rendered");
 }
 if (!byText(elements.get("detailContent"), "回复")) {
   throw new Error("cached comments were not rendered before network detail finished");
@@ -361,6 +437,37 @@ await new Promise((resolve) => setTimeout(resolve, 30));
 
 if (elements.get("mediaStrip").children.length !== 1) {
   throw new Error("unwrapped upload payload was not accepted");
+}
+elements.get("publishContent").value = "with image";
+await elements.get("publishForm").handlers.submit({ preventDefault() {} });
+await new Promise((resolve) => setTimeout(resolve, 30));
+if (!publishPayload || publishPayload.content !== "with image") {
+  throw new Error(`publish payload was missing: ${JSON.stringify(publishPayload)}`);
+}
+if (publishPayload.media?.[0]?.upload_id !== "upload-token-1") {
+  throw new Error(`upload token was not preserved for publish: ${JSON.stringify(publishPayload)}`);
+}
+if ("preview_url" in publishPayload.media[0] || "previewUrl" in publishPayload.media[0]) {
+  throw new Error(`preview url leaked into publish payload: ${JSON.stringify(publishPayload)}`);
+}
+
+const deleteButton = byText(elements.get("detailContent"), "删除");
+if (!deleteButton) throw new Error("delete button was not rendered");
+deleteButton.handlers.click();
+if (confirmCalls !== 0) {
+  throw new Error("delete still used native confirm");
+}
+if (deletePayload) {
+  throw new Error("delete should require a second in-page confirmation click");
+}
+const confirmDeleteButton = byText(elements.get("detailContent"), "再次点击确认删除");
+if (!confirmDeleteButton) {
+  throw new Error("second-click delete confirmation was not rendered");
+}
+confirmDeleteButton.handlers.click();
+await new Promise((resolve) => setTimeout(resolve, 0));
+if (!deletePayload || deletePayload.id !== "post_1") {
+  throw new Error(`delete payload was wrong: ${JSON.stringify(deletePayload)}`);
 }
 ''',
         encoding="utf-8",

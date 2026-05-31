@@ -14,6 +14,7 @@ from .source_policy import is_windows_drive_path
 
 
 QZONE_MAX_IMAGES = 9
+QZONE_MIN_IMAGE_SIDE = 16
 QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
@@ -85,6 +86,74 @@ def _is_url(value: str) -> bool:
 
 def _is_base64_source(value: str) -> bool:
     return value.startswith("base64://") or value.startswith("data:")
+
+
+def looks_like_supported_image_bytes(data: bytes) -> bool:
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if data.startswith(b"BM"):
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def image_dimensions_from_bytes(data: bytes) -> tuple[int, int] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data.startswith(b"BM") and len(data) >= 26:
+        width = abs(int.from_bytes(data[18:22], "little", signed=True))
+        height = abs(int.from_bytes(data[22:26], "little", signed=True))
+        return width, height
+    if data.startswith(b"\xff\xd8\xff"):
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            while index < len(data) and data[index] == 0xFF:
+                index += 1
+            if index >= len(data):
+                return None
+            marker = data[index]
+            index += 1
+            if marker in {0xD8, 0xD9}:
+                continue
+            if index + 2 > len(data):
+                return None
+            segment_length = int.from_bytes(data[index:index + 2], "big")
+            if segment_length < 2 or index + segment_length > len(data):
+                return None
+            if marker in {
+                0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+            } and segment_length >= 7:
+                height = int.from_bytes(data[index + 3:index + 5], "big")
+                width = int.from_bytes(data[index + 5:index + 7], "big")
+                return width, height
+            index += segment_length
+    if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X" and len(data) >= 30:
+            width = 1 + int.from_bytes(data[24:27], "little")
+            height = 1 + int.from_bytes(data[27:30], "little")
+            return width, height
+        if chunk == b"VP8 " and len(data) >= 30:
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return width, height
+        if chunk == b"VP8L" and len(data) >= 25:
+            value = int.from_bytes(data[21:25], "little")
+            width = 1 + (value & 0x3FFF)
+            height = 1 + ((value >> 14) & 0x3FFF)
+            return width, height
+    return None
 
 
 def _is_local_source(value: str) -> bool:

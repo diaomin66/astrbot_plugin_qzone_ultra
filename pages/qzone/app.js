@@ -1,6 +1,7 @@
 ﻿const bridge = window.AstrBotPluginPage;
 const BRIDGE_READY_TIMEOUT_MS = 5000;
-const BRIDGE_REQUEST_TIMEOUT_MS = 20000;
+const BRIDGE_REQUEST_TIMEOUT_MS = 60000;
+const DETAIL_DRAWER_BREAKPOINT = 1200;
 
 const state = {
   context: null,
@@ -14,6 +15,8 @@ const state = {
   media: [],
   loading: false,
   pendingLikes: new Set(),
+  pendingDeletes: new Set(),
+  pendingDeleteConfirms: new Map(),
   knownAuthors: new Map(),
   replyTarget: null,
   replyDrafts: new Map(),
@@ -22,6 +25,8 @@ const state = {
   detailRequestSeq: 0,
   detailLoadingId: "",
 };
+
+let themeSyncBound = false;
 
 function queryOne(selector) {
   return typeof document.querySelector === "function" ? document.querySelector(selector) : null;
@@ -54,6 +59,90 @@ const el = {
   detailEmpty: document.getElementById("detailEmpty"),
   detailContent: document.getElementById("detailContent"),
 };
+
+function normalizeThemeHint(value) {
+  if (typeof value === "boolean") return value ? "dark" : "light";
+  const raw = text(value).trim().toLowerCase();
+  if (!raw) return "";
+  if (/(^|[\s_-])(dark|night|black)([\s_-]|$)/.test(raw) || raw === "dark" || raw.includes("dark")) return "dark";
+  if (/(^|[\s_-])(light|day|white)([\s_-]|$)/.test(raw) || raw === "light" || raw.includes("light")) return "light";
+  if (raw.includes("purpletheme")) return "light";
+  return "";
+}
+
+function themeFromObject(value, depth = 0) {
+  const direct = normalizeThemeHint(value);
+  if (direct || !value || typeof value !== "object" || depth > 2) return direct;
+  for (const key of ["theme", "themeMode", "uiTheme", "colorMode", "colorScheme", "appearance", "mode", "scheme", "name"]) {
+    const found = normalizeThemeHint(value[key]);
+    if (found) return found;
+  }
+  if (typeof value.dark === "boolean") return value.dark ? "dark" : "light";
+  for (const key of ["context", "settings", "config", "ui", "page", "dashboard"]) {
+    const found = themeFromObject(value[key], depth + 1);
+    if (found) return found;
+  }
+  return "";
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (!root || !theme) return;
+  root.dataset.theme = theme;
+  root.style.colorScheme = theme;
+  root.classList?.toggle("v-theme--dark", theme === "dark");
+  root.classList?.toggle("v-theme--light", theme === "light");
+  document.body?.classList?.toggle("v-theme--dark", theme === "dark");
+  document.body?.classList?.toggle("v-theme--light", theme === "light");
+}
+
+let themeSyncQueued = false;
+function queueThemeSync(hint = null) {
+  if (themeSyncQueued) return;
+  themeSyncQueued = true;
+  const run = () => {
+    themeSyncQueued = false;
+    syncTheme(hint);
+  };
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(run);
+  } else {
+    window.setTimeout(run, 0);
+  }
+}
+
+function syncTheme(hint = null) {
+  applyTheme(
+    themeFromObject(hint)
+    || themeFromObject(state.context)
+    || themeFromObject(bridge?.getContext?.())
+    || "light"
+  );
+}
+
+function bindThemeSync() {
+  if (themeSyncBound) return;
+  themeSyncBound = true;
+  syncTheme();
+  try {
+    const onContext = bridge?.onContext || bridge?.onContextChange;
+    onContext?.((nextContext) => {
+      state.context = { ...(state.context || {}), ...(nextContext || {}) };
+      queueThemeSync(nextContext);
+    });
+  } catch (_) {
+  }
+  window.addEventListener?.("message", (event) => {
+    const message = event?.data;
+    if (!message || typeof message !== "object") return;
+    const context = message.channel === "astrbot-plugin-page" && message.kind === "context"
+      ? message.context
+      : (themeFromObject(message) ? message : null);
+    if (!context || typeof context !== "object") return;
+    state.context = { ...(state.context || {}), ...(context || {}) };
+    queueThemeSync(context);
+  });
+}
 
 function text(value) {
   return String(value ?? "");
@@ -131,6 +220,40 @@ function rememberPosts(posts) {
   for (const post of posts || []) {
     rememberPostAuthors(post);
   }
+}
+
+function postKey(post) {
+  const author = post?.author || {};
+  return [
+    text(post?.id),
+    authorKey(author.uin || author.id),
+    text(post?.created_at),
+    text(post?.content),
+  ].join("|");
+}
+
+function dedupePosts(posts) {
+  const seen = new Set();
+  const result = [];
+  for (const post of posts || []) {
+    const key = postKey(post);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(post);
+  }
+  return result;
+}
+
+function mergeFeedPosts(currentPosts, incomingPosts) {
+  const merged = dedupePosts(currentPosts);
+  const seen = new Set(merged.map(postKey));
+  for (const post of incomingPosts || []) {
+    const key = postKey(post);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(post);
+  }
+  return merged;
 }
 
 function loginDisplayName() {
@@ -325,11 +448,39 @@ function renderSelectedIfNeeded(id) {
   }
 }
 
-function setNotice(message, tone = "info") {
-  el.notice.hidden = !message;
-  el.notice.textContent = message || "";
-  el.notice.dataset.tone = tone;
+
+function showToast(message, tone = "info") {
+  const container = document.getElementById("toastContainer");
+  if (!message) return;
+  if (!container) {
+    if (el.notice) {
+      el.notice.hidden = false;
+      el.notice.textContent = message;
+      el.notice.dataset.tone = tone;
+    }
+    return;
+  }
+
+  const toast = document.createElement("div");
+  toast.className = `toast ${tone}`;
+  toast.textContent = message;
+
+  container.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add("fade-out");
+    toast.addEventListener("animationend", () => {
+      toast.remove();
+    });
+  }, 3000);
 }
+
+function setNotice(message, tone = "info") {
+  if (message) {
+    showToast(message, tone);
+  }
+}
+
 
 async function withTimeout(promise, timeoutMs, message) {
   let timeoutId;
@@ -376,6 +527,37 @@ async function apiPost(endpoint, body = {}) {
   return normalizeBridgeResult(result, "请求失败");
 }
 
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(new Error("读取图片失败")));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadPageMedia(file) {
+  if (typeof bridge.upload === "function") {
+    try {
+      const result = await withTimeout(
+        bridge.upload("page/upload-media", file),
+        BRIDGE_REQUEST_TIMEOUT_MS,
+        "上传图片超时，请刷新页面后重试。"
+      );
+      return normalizeBridgeResult(result, "上传失败");
+    } catch (error) {
+      console.warn("qzone page upload bridge failed, falling back to JSON upload", error);
+    }
+  }
+  const dataUrl = await fileToDataUrl(file);
+  return apiPost("page/upload-media", {
+    name: file.name || "image.png",
+    content_type: file.type || "",
+    size: file.size || 0,
+    data_url: dataUrl,
+  });
+}
+
 function formatTime(value) {
   const timestamp = Number(value || 0);
   if (!timestamp) return "未知时间";
@@ -393,6 +575,80 @@ function scopeTitle() {
 function mediaLayoutClass(count) {
   const safeCount = Math.max(1, Math.min(Number(count || 0), 9));
   return `media-layout-${safeCount}`;
+}
+
+function mediaDisplaySource(item) {
+  const source = typeof item === "object" && item
+    ? text(item.preview_url || item.previewUrl || item.source || item.data_url || item.url)
+    : text(item);
+  if (!source) return "";
+  if (source.startsWith("base64://")) {
+    const mimeType = typeof item === "object" && item ? text(item.mime_type || item.content_type || "image/jpeg") : "image/jpeg";
+    return `data:${mimeType || "image/jpeg"};base64,${source.replace("base64://", "")}`;
+  }
+  return source;
+}
+
+function isVideoSource(url) {
+  return /\.(mp4|webm|ogg)(?:[?#].*)?$/i.test(text(url));
+}
+
+function createLocalPreviewUrl(file) {
+  try {
+    if (
+      typeof URL !== "undefined"
+      && typeof URL.createObjectURL === "function"
+      && typeof Blob !== "undefined"
+      && file instanceof Blob
+    ) {
+      return URL.createObjectURL(file);
+    }
+  } catch (_) {
+  }
+  return "";
+}
+
+function revokeLocalPreviewUrl(item) {
+  const url = text(item?.preview_url || item?.previewUrl);
+  if (!url.startsWith("blob:")) return;
+  try {
+    URL.revokeObjectURL?.(url);
+  } catch (_) {
+  }
+}
+
+function clearMediaQueue() {
+  for (const item of state.media || []) {
+    revokeLocalPreviewUrl(item);
+  }
+  state.media = [];
+}
+
+function uploadedMediaFromPayload(payload) {
+  const candidates = [
+    payload?.media,
+    payload?.data?.media,
+    payload?.payload?.media,
+    payload,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    if (candidate.media && typeof candidate.media === "object") return { ...candidate.media };
+    if (candidate.upload_id || candidate.source || candidate.data_url || candidate.url || candidate.path || candidate.file) {
+      return { ...candidate };
+    }
+  }
+  return null;
+}
+
+function mediaForPublish(item) {
+  const payload = { ...(item || {}) };
+  delete payload.preview_url;
+  delete payload.previewUrl;
+  if (text(payload.source).startsWith("blob:")) {
+    delete payload.source;
+  }
+  return payload;
 }
 
 
@@ -418,23 +674,84 @@ function renderTabs() {
   }
 }
 
+
 function renderMedia() {
-  el.mediaStrip.replaceChildren();
+  const container = document.getElementById("mediaStrip");
+  container.className = "media-preview-grid";
+  container.replaceChildren();
+
   for (const [index, item] of state.media.entries()) {
     const chip = document.createElement("div");
-    chip.className = "media-chip";
-    const name = document.createElement("span");
-    name.textContent = item.name || `图片 ${index + 1}`;
+    chip.className = "media-preview-item";
+
+    const source = mediaDisplaySource(item);
+    if (source.startsWith("data:") || source.startsWith("blob:") || source.startsWith("http://") || source.startsWith("https://")) {
+        const img = document.createElement("img");
+        img.src = source;
+        chip.appendChild(img);
+    } else {
+        const fallback = document.createElement("div");
+        fallback.style.background = "var(--surface-hover)";
+        fallback.style.width = "100%";
+        fallback.style.height = "100%";
+        fallback.style.display = "flex";
+        fallback.style.alignItems = "center";
+        fallback.style.justifyContent = "center";
+        fallback.style.fontSize = "12px";
+        fallback.textContent = "图片 " + (index + 1);
+        chip.appendChild(fallback);
+    }
+
     const remove = document.createElement("button");
     remove.type = "button";
-    remove.textContent = "移除";
+    remove.className = "media-preview-remove";
+    remove.textContent = "x";
+    remove.title = "移除图片";
+    remove.setAttribute("aria-label", "移除图片");
     remove.addEventListener("click", () => {
+      revokeLocalPreviewUrl(state.media[index]);
       state.media.splice(index, 1);
       renderMedia();
     });
-    chip.append(name, remove);
-    el.mediaStrip.append(chip);
+
+    chip.append(remove);
+    container.append(chip);
   }
+}
+function renderSkeletonFeed() {
+    el.feed.replaceChildren();
+    for (let i = 0; i < 3; i++) {
+        const card = document.createElement("article");
+        card.className = "post skeleton-card";
+        card.innerHTML = `
+            <div class="skeleton-head">
+                <div class="skeleton skeleton-avatar"></div>
+                <div class="skeleton-meta">
+                    <div class="skeleton skeleton-line short"></div>
+                    <div class="skeleton skeleton-line medium"></div>
+                </div>
+            </div>
+            <div class="skeleton skeleton-line long"></div>
+            <div class="skeleton skeleton-line medium"></div>
+        `;
+        el.feed.append(card);
+    }
+}
+
+function isDetailDrawerMode() {
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia(`(max-width: ${DETAIL_DRAWER_BREAKPOINT}px)`).matches;
+  }
+  return typeof window.innerWidth === "number" && window.innerWidth <= DETAIL_DRAWER_BREAKPOINT;
+}
+
+function clearDetailDrawerChrome() {
+  const pane = document.getElementById("detailPane");
+  const backdrop = document.getElementById("detailBackdrop");
+  const closeBtn = document.getElementById("detailCloseBtn");
+  pane?.classList.remove("visible");
+  backdrop?.classList.remove("visible");
+  if (closeBtn) closeBtn.hidden = true;
 }
 
 function renderFeed() {
@@ -456,6 +773,7 @@ function renderFeed() {
   }
 }
 
+
 function openLightbox(url) {
   let lightbox = document.getElementById("lightbox");
   if (!lightbox) {
@@ -463,36 +781,37 @@ function openLightbox(url) {
     lightbox.id = "lightbox";
     lightbox.className = "lightbox";
     
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "lightbox-close";
-    closeBtn.innerHTML = "×";
-    closeBtn.onclick = () => {
-      lightbox.classList.remove("visible");
-      setTimeout(() => lightbox.remove(), 300);
-    };
-    
-    lightbox.onclick = (e) => {
-      if (e.target === lightbox) {
-        lightbox.classList.remove("visible");
-        setTimeout(() => lightbox.remove(), 300);
-      }
-    };
-    
     document.body.appendChild(lightbox);
   }
   
+  const cleanup = () => {
+    lightbox.classList.remove("visible");
+    const video = lightbox.querySelector("video");
+    if (video) {
+        video.pause();
+        video.src = "";
+        video.removeAttribute("src");
+    }
+    setTimeout(() => {
+        lightbox.innerHTML = "";
+    }, 300);
+  };
+
+  lightbox.onclick = (e) => {
+    if (e.target === lightbox) {
+      cleanup();
+    }
+  };
+
   lightbox.innerHTML = "";
-  
+
   const closeBtn = document.createElement("button");
   closeBtn.className = "lightbox-close";
-  closeBtn.innerHTML = "×";
-  closeBtn.onclick = () => {
-    lightbox.classList.remove("visible");
-    setTimeout(() => lightbox.remove(), 300);
-  };
+  closeBtn.textContent = "x";
+  closeBtn.setAttribute("aria-label", "关闭预览");
+  closeBtn.onclick = cleanup;
   
   let mediaElement;
-  
   if (url.match(/\.(mp4|webm|ogg)$/i)) {
     mediaElement = document.createElement("video");
     mediaElement.src = url;
@@ -506,9 +825,47 @@ function openLightbox(url) {
   lightbox.appendChild(closeBtn);
   lightbox.appendChild(mediaElement);
   
-  // Force a reflow
-  void lightbox.offsetWidth;
+  void lightbox.offsetWidth; // Force reflow
   lightbox.classList.add("visible");
+}
+
+function renderMediaGrid(items, className = "post-media") {
+  const sources = (items || []).map(mediaDisplaySource).filter(Boolean).slice(0, 9);
+  if (!sources.length) return null;
+
+  const media = document.createElement("div");
+  media.className = `${className} media-grid ${mediaLayoutClass(sources.length)}`;
+  for (const url of sources) {
+    if (isVideoSource(url)) {
+      const video = document.createElement("video");
+      video.src = url;
+      video.className = "preview-video";
+      video.muted = true;
+      video.loop = true;
+      video.playsInline = true;
+      video.addEventListener("mouseenter", () => video.play().catch(() => {}));
+      video.addEventListener("mouseleave", () => {
+        video.pause();
+        video.currentTime = 0;
+      });
+      video.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openLightbox(url);
+      });
+      media.append(video);
+    } else {
+      const image = document.createElement("img");
+      image.loading = "lazy";
+      image.alt = "说说图片";
+      image.src = url;
+      image.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openLightbox(url);
+      });
+      media.append(image);
+    }
+  }
+  return media;
 }
 
 function renderPostCard(post) {
@@ -546,40 +903,8 @@ function renderPostCard(post) {
     card.append(body);
   }
 
-  if (post.images && post.images.length > 0) {
-    const images = document.createElement("div");
-    const mediaCount = post.images.length;
-    images.className = `post-media media-grid ${mediaLayoutClass(mediaCount)}`;
-    for (const url of post.images) {
-      if (url.match(/\.(mp4|webm|ogg)$/i)) {
-        const vid = document.createElement("video");
-        vid.src = url;
-        vid.className = "preview-video";
-        vid.muted = true;
-        vid.loop = true;
-        vid.playsInline = true;
-        vid.addEventListener("mouseenter", () => vid.play().catch(()=>{}));
-        vid.addEventListener("mouseleave", () => {
-          vid.pause();
-          vid.currentTime = 0;
-        });
-        vid.addEventListener("click", (e) => {
-          e.stopPropagation();
-          openLightbox(url);
-        });
-        images.append(vid);
-      } else {
-        const img = document.createElement("img");
-        img.loading = "lazy";
-        img.alt = "说说图片";
-        img.src = url;
-        img.addEventListener("click", (e) => {
-          e.stopPropagation();
-          openLightbox(url);
-        });
-        images.append(img);
-      }
-    }
+  const images = renderMediaGrid(post.images, "post-media");
+  if (images) {
     card.append(images);
   }
 
@@ -587,7 +912,7 @@ function renderPostCard(post) {
   actions.className = "post-actions";
   const like = document.createElement("button");
   like.type = "button";
-  like.className = post.liked ? "liked" : "";
+  like.className = `metric-action${post.liked ? " liked" : ""}`;
   like.disabled = state.pendingLikes.has(post.id);
   like.setAttribute?.("aria-busy", state.pendingLikes.has(post.id) ? "true" : "false");
   
@@ -604,6 +929,7 @@ function renderPostCard(post) {
 
   const comment = document.createElement("button");
   comment.type = "button";
+  comment.className = "metric-action";
   
   const commentIcon = document.createElement("span");
   commentIcon.innerHTML = "💬";
@@ -617,6 +943,7 @@ function renderPostCard(post) {
 
   const detail = document.createElement("button");
   detail.type = "button";
+  detail.className = "detail-action";
   detail.textContent = "查看详情";
   detail.addEventListener("click", () => openDetail(post.id));
   
@@ -669,9 +996,14 @@ function renderDetail(post, options = {}) {
     el.detailContent.append(content);
   }
 
+  const detailMedia = renderMediaGrid(post.images, "detail-media");
+  if (detailMedia) {
+    el.detailContent.append(detailMedia);
+  }
+
   const actions = document.createElement("div");
-    actions.className = "detail-actions";
-    titleHead.append(actions);
+  actions.className = "detail-actions";
+  titleHead.append(actions);
   const like = document.createElement("button");
   like.type = "button";
   like.textContent = post.liked ? "取消点赞" : "点赞";
@@ -680,15 +1012,17 @@ function renderDetail(post, options = {}) {
   like.addEventListener("click", () => toggleLike(post));
   actions.append(like);
   if (post.can_delete) {
+    const deleting = state.pendingDeletes.has(post.id);
+    const confirming = Number(state.pendingDeleteConfirms.get(post.id) || 0) > Date.now();
     const del = document.createElement("button");
     del.type = "button";
     del.className = "danger";
-    del.textContent = "删除";
+    del.textContent = deleting ? "删除中..." : confirming ? "再次点击确认删除" : "删除";
+    del.disabled = deleting;
+    del.setAttribute?.("aria-busy", deleting ? "true" : "false");
     del.addEventListener("click", () => deletePost(post));
     actions.append(del);
   }
-
-  // // // el.detailContent.append(actions);
 
   const comments = document.createElement("div");
   comments.className = "comments";
@@ -829,6 +1163,7 @@ function feedParams(next = false) {
 }
 
 async function loadFeed({ append = false } = {}) {
+  if (append && state.loading) return;
   if (state.scope === "profile" && !state.targetUin) {
     state.posts = [];
     state.cursor = "";
@@ -839,9 +1174,9 @@ async function loadFeed({ append = false } = {}) {
   }
   
   // Only show loading if we're completely empty, otherwise let the spinner handle it gracefully
+  state.loading = true;
   if (!append) {
-    state.loading = true;
-    renderFeed();
+    renderSkeletonFeed();
   } else {
     el.moreButton.textContent = "加载中...";
     el.moreButton.disabled = true;
@@ -849,9 +1184,15 @@ async function loadFeed({ append = false } = {}) {
   
   try {
     const data = await apiGet("page/feed", feedParams(append));
+    const incomingPosts = dedupePosts(data.items || []);
+    const previousCount = state.posts.length;
     state.cursor = data.cursor || "";
     state.hasMore = Boolean(data.has_more);
-    state.posts = append ? [...state.posts, ...(data.items || [])] : data.items || [];
+    state.posts = append ? mergeFeedPosts(state.posts, incomingPosts) : incomingPosts;
+    if (append && incomingPosts.length && state.posts.length === previousCount) {
+      state.hasMore = false;
+      state.cursor = "";
+    }
     rememberPosts(state.posts);
     renderStatus();
     setNotice("");
@@ -867,6 +1208,37 @@ async function loadFeed({ append = false } = {}) {
   }
 }
 
+function toggleDetailDrawer(visible) {
+    const pane = document.getElementById("detailPane");
+    const backdrop = document.getElementById("detailBackdrop");
+    const closeBtn = document.getElementById("detailCloseBtn");
+    if (!pane) return;
+    if (isDetailDrawerMode()) {
+        if (visible) {
+            pane.classList.add("visible");
+            if (closeBtn) closeBtn.hidden = false;
+            if (backdrop) backdrop.classList.add("visible");
+        } else {
+            pane.classList.remove("visible");
+            if (closeBtn) closeBtn.hidden = true;
+            if (backdrop) backdrop.classList.remove("visible");
+            state.selected = null;
+        }
+    } else {
+        clearDetailDrawerChrome();
+        // Desktop just scroll into view if needed
+        if (visible) {
+            pane.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
+        }
+    }
+}
+
+window.addEventListener?.("resize", () => {
+  if (!isDetailDrawerMode()) {
+    clearDetailDrawerChrome();
+  }
+});
+
 async function openDetail(id, focusComment = false) {
   const cached = currentPostById(id);
   const requestSeq = ++state.detailRequestSeq;
@@ -875,6 +1247,7 @@ async function openDetail(id, focusComment = false) {
     state.replyTarget = null;
   }
   state.detailLoadingId = id;
+  toggleDetailDrawer(true);
   if (cached) {
     renderDetail(cached, { loading: true });
     renderFeed();
@@ -893,6 +1266,9 @@ async function openDetail(id, focusComment = false) {
     rememberPostAuthors(merged);
     renderDetail(merged);
     renderFeed();
+    if (data.partial) {
+      setNotice(data.message || "详情接口响应较慢，已先显示缓存内容。", "warn");
+    }
     if (focusComment) {
       setTimeout(() => {
         el.detailContent.querySelector(".comment-form textarea")?.focus();
@@ -1089,18 +1465,44 @@ async function sendReply(post, comment, content) {
 }
 
 async function deletePost(post) {
-  if (!window.confirm("确定删除这条说说吗？")) return;
+  if (state.pendingDeletes.has(post.id)) return;
+  const now = Date.now();
+  const confirmUntil = Number(state.pendingDeleteConfirms.get(post.id) || 0);
+  if (confirmUntil < now) {
+    const expiresAt = now + 6000;
+    state.pendingDeleteConfirms.set(post.id, expiresAt);
+    setNotice("再次点击删除按钮确认删除这条说说。", "warn");
+    renderSelectedIfNeeded(post.id);
+    window.setTimeout(() => {
+      if (Number(state.pendingDeleteConfirms.get(post.id) || 0) <= Date.now()) {
+        state.pendingDeleteConfirms.delete(post.id);
+        renderSelectedIfNeeded(post.id);
+      }
+    }, 6100);
+    return;
+  }
+  state.pendingDeleteConfirms.delete(post.id);
+  state.pendingDeletes.add(post.id);
+  setNotice("正在删除说说...");
+  renderSelectedIfNeeded(post.id);
   try {
     await apiPost("page/delete", { id: post.id });
     state.posts = state.posts.filter((item) => item.id !== post.id);
     state.selected = null;
+    state.replyTarget = null;
+    state.localVersions.delete(post.id);
+    state.pendingDeleteConfirms.delete(post.id);
     el.detailContent.hidden = true;
     el.detailEmpty.hidden = false;
     el.detailPane.classList.remove("has-selection");
+    clearDetailDrawerChrome();
     setNotice("说说已删除。", "success");
-    renderFeed();
   } catch (error) {
     setNotice(error.message || "删除失败", "error");
+  } finally {
+    state.pendingDeletes.delete(post.id);
+    renderFeed();
+    renderSelectedIfNeeded(post.id);
   }
 }
 
@@ -1115,9 +1517,10 @@ async function publish(event) {
   const originalText = el.publishButton.textContent;
   el.publishButton.textContent = "发布中...";
   try {
-    const data = await apiPost("page/publish", { content, media: state.media });
+    const media = state.media.map(mediaForPublish);
+    const data = await apiPost("page/publish", { content, media });
     el.publishContent.value = "";
-    state.media = [];
+    clearMediaQueue();
     renderMedia();
     if (data.post) {
       data.post.author = mergeAuthor(currentLoginAuthor(), data.post.author);
@@ -1144,14 +1547,17 @@ async function uploadFiles(files) {
       break;
     }
     try {
-      const result = await withTimeout(
-        bridge.upload("page/upload-media", file),
-        BRIDGE_REQUEST_TIMEOUT_MS,
-        "上传图片超时，请刷新页面后重试。"
-      );
-      const data = normalizeBridgeResult(result, "上传失败");
-      if (!data.media) throw new Error("上传失败");
-      state.media.push(data.media);
+      const data = await uploadPageMedia(file);
+      const media = uploadedMediaFromPayload(data);
+      if (!media) throw new Error("上传失败");
+      if (!media.source && media.data_url) {
+        media.source = media.data_url;
+      }
+      const previewUrl = createLocalPreviewUrl(file);
+      if (previewUrl) {
+        media.preview_url = previewUrl;
+      }
+      state.media.push(media);
     } catch (error) {
       setNotice(error.message || "图片上传失败", "error");
     }
@@ -1178,6 +1584,23 @@ function bindEvents() {
     renderTabs();
     await loadFeed();
   });
+
+  const closeBtn = document.getElementById("detailCloseBtn");
+  if (closeBtn) closeBtn.addEventListener("click", () => toggleDetailDrawer(false));
+  const backdrop = document.getElementById("detailBackdrop");
+  if (backdrop) backdrop.addEventListener("click", () => toggleDetailDrawer(false));
+
+  const contentInput = document.getElementById("publishContent");
+  const charCounter = document.getElementById("charCounter");
+  if (contentInput && charCounter) {
+      contentInput.addEventListener("input", () => {
+          const len = contentInput.value.length;
+          charCounter.textContent = `${len}/1200`;
+          if (len > 1100) charCounter.classList.add("warning");
+          else charCounter.classList.remove("warning");
+      });
+  }
+
   el.refreshButton.addEventListener("click", () => {
     state.cursor = "";
     state.posts = [];
@@ -1192,6 +1615,7 @@ function bindEvents() {
 }
 
 async function init() {
+  bindThemeSync();
   if (!bridge) {
     setNotice("没有检测到 AstrBot Pages bridge，请从 AstrBot WebUI 插件页面进入。", "error");
     return;
@@ -1203,6 +1627,7 @@ async function init() {
       BRIDGE_READY_TIMEOUT_MS,
       "初始化 AstrBot WebUI 桥接超时，请刷新页面后重试。"
     );
+    syncTheme(state.context);
   } catch (error) {
     setNotice(error.message || "桥接初始化失败", "error");
     return;

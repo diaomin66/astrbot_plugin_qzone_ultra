@@ -197,7 +197,7 @@ class QzonePostService:
         return await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid, unlike=unlike)
 
     async def delete_post(self, post: QzonePost) -> dict[str, Any]:
-        return await self.controller.delete_post(fid=post.fid, appid=post.appid)
+        return await self.controller.delete_post(fid=post.fid, appid=post.appid, created_at=post.created_at)
 
     @staticmethod
     def post_payload(post: QzonePost) -> dict[str, Any]:

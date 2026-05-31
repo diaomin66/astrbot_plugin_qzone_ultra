@@ -117,6 +117,9 @@ FEED_HTML_MARKUP_KEYS = (
     "message",
     "text",
 )
+IGNORED_FEED_APPIDS = {6600}
+OFFICIAL_QZONE_UINS = {20050606}
+OFFICIAL_QZONE_NICKNAMES = {"官方Qzone", "官方 Qzone", "官方QQ空间", "官方 QQ空间"}
 HTML_TIME_ATTR_KEYS = (
     "data-time",
     "data-abstime",
@@ -152,6 +155,17 @@ TEXT_RELATIVE_DAY_RE = re.compile(
     r"(?P<hour>\d{1,2})[:：](?P<minute>\d{1,2})(?:[:：](?P<second>\d{1,2}))?"
 )
 TEXT_RELATIVE_AGO_RE = re.compile(r"(?P<amount>\d{1,3})\s*(?P<unit>秒|分钟|小时|天)前")
+LEGACY_SUMMARY_TIME_LINE_RE = re.compile(
+    r"^(?:(?:今天|昨天|前天)\s*)?"
+    r"(?:\d{1,2}[:：]\d{2}(?::\d{2})?|\d{1,2}[/-]\d{1,2}\s+\d{1,2}[:：]\d{2})$"
+)
+LEGACY_SUMMARY_DATE_TIME_LINE_RE = re.compile(
+    r"^(?:20\d{2}[年/-])?\d{1,2}(?:月|[/-])\d{1,2}(?:日)?\s+\d{1,2}[:：]\d{2}(?::\d{2})?$"
+)
+LEGACY_SUMMARY_CHROME_LINE_RE = re.compile(
+    r"^(?:浏览\d+次|\+\d+|评论|转发|分享|赞|点赞|我也说一句|查看全文|收起全文|\d+条评论)$"
+)
+LEGACY_SUMMARY_LIKE_LINE_RE = re.compile(r"^.+共\d+人觉得很赞$")
 
 
 def _dig(value: Any, *keys: str) -> Any:
@@ -220,6 +234,33 @@ def _html_attr(markup: Any, name: str) -> str:
     if not match:
         return ""
     return html_lib.unescape(match.group(2) or match.group(3) or "").strip()
+
+
+def _html_class_text(markup: Any, class_name: str) -> str:
+    text = _text(markup)
+    if not text:
+        return ""
+    escaped_class = re.escape(class_name)
+    target_pattern = re.compile(
+        rf"<(?P<tag>[a-z0-9]+)\b[^>]*class\s*=\s*(?:\"[^\"]*\b{escaped_class}\b[^\"]*\"|'[^']*\b{escaped_class}\b[^']*')[^>]*>(?P<body>.*?)</(?P=tag)>",
+        re.S | re.I,
+    )
+    match = target_pattern.search(text)
+    if match:
+        return _html_to_text(match.group("body") or "")
+    pattern = re.compile(
+        r"<(?P<tag>[a-z0-9]+)\b(?P<attrs>[^>]*)\bclass\s*=\s*(?P<quote>['\"])(?P<class>.*?)(?P=quote)(?P<rest>[^>]*)>(?P<body>.*?)</(?P=tag)>",
+        re.S | re.I,
+    )
+    for match in pattern.finditer(text):
+        classes = html_lib.unescape(match.group("class") or "").split()
+        body = match.group("body") or ""
+        if class_name in classes:
+            return _html_to_text(body)
+        nested = _html_class_text(body, class_name)
+        if nested:
+            return nested
+    return ""
 
 
 def _html_markup_candidates(feed_item: dict[str, Any]) -> list[Any]:
@@ -431,6 +472,46 @@ def _clean_nickname_text(value: Any, *, hostuin: int = 0) -> str:
     return text
 
 
+def _looks_like_legacy_summary_chrome(line: str) -> bool:
+    compact = re.sub(r"\s+", " ", str(line or "")).strip()
+    if not compact:
+        return True
+    if LEGACY_SUMMARY_TIME_LINE_RE.fullmatch(compact):
+        return True
+    if LEGACY_SUMMARY_DATE_TIME_LINE_RE.fullmatch(compact):
+        return True
+    if LEGACY_SUMMARY_CHROME_LINE_RE.fullmatch(compact):
+        return True
+    if LEGACY_SUMMARY_LIKE_LINE_RE.fullmatch(compact):
+        return True
+    return False
+
+
+def _clean_summary_candidate(value: Any, feed_item: dict[str, Any]) -> str:
+    text = _html_to_text(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return text
+
+    hostuin = extract_hostuin(feed_item, 0)
+    nickname = _clean_nickname_text(feed_item.get("nickname") or feed_item.get("name") or "", hostuin=hostuin)
+    cleaned: list[str] = []
+    for line in lines:
+        if nickname and line.startswith(nickname):
+            rest = line[len(nickname):].strip()
+            if not rest or _looks_like_legacy_summary_chrome(rest):
+                continue
+        if _looks_like_legacy_summary_chrome(line):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
 def parse_cookie_text(cookie_text: str) -> dict[str, str]:
     cookie_text = cookie_text.strip()
     if not cookie_text:
@@ -598,10 +679,16 @@ def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
     html_markup = _html_markup_candidates(feed_item)
     candidates = [
         feed_item.get("uin"),
+        feed_item.get("opuin"),
+        feed_item.get("owneruin"),
+        feed_item.get("ownerUin"),
+        feed_item.get("fuin"),
         feed_item.get("hostuin"),
         feed_item.get("hostUin"),
         _html_attr(html_markup, "data-uin"),
+        _html_attr(html_markup, "data-opuin"),
         _html_attr(html_markup, "uin"),
+        _html_attr(html_markup, "opuin"),
         _dig(feed_item, "userinfo", "uin"),
         _dig(feed_item, "cell_userinfo", "uin"),
         _dig(feed_item, "cellUserInfo", "uin"),
@@ -675,14 +762,17 @@ def extract_summary_text(feed_item: dict[str, Any]) -> str:
         _text(feed_item.get("cellSummary")),
         _dig(feed_item, "original", "summary", "summary"),
         _text(feed_item.get("text")),
+        _html_class_text(feed_item.get("html"), "f-info"),
         _html_to_text(feed_item.get("html")),
     ]
     for key in FEED_HTML_MARKUP_KEYS:
         if key != "html":
+            candidates.append(_html_class_text(feed_item.get(key), "f-info"))
             candidates.append(_html_to_text(feed_item.get(key)))
     for candidate in candidates:
-        if candidate:
-            return truncate(str(candidate).strip(), 500)
+        cleaned = _clean_summary_candidate(candidate, feed_item)
+        if cleaned:
+            return truncate(cleaned, 500)
     return ""
 
 
@@ -831,17 +921,40 @@ def extract_feed_entry(
     )
 
 
+def is_ignored_feed_item(feed_item: dict[str, Any]) -> bool:
+    if not isinstance(feed_item, dict):
+        return True
+    html_markups = _html_markup_candidates(feed_item)
+    html_markup = html_markups[0] if html_markups else None
+    appid = _int(feed_item.get("appid") or _html_attr(html_markup, "data-appid") or 0, 0)
+    fid = extract_fid(feed_item)
+    hostuin = extract_hostuin(feed_item, 0)
+    nickname = _clean_nickname_text(feed_item.get("nickname") or feed_item.get("name") or "", hostuin=hostuin)
+    if appid in IGNORED_FEED_APPIDS:
+        return True
+    if fid.lower().startswith(("advertisement_", "advertise_", "ad_")):
+        return True
+    if hostuin in OFFICIAL_QZONE_UINS:
+        return True
+    if nickname in OFFICIAL_QZONE_NICKNAMES:
+        return True
+    if appid == 5000 and "qzone" in nickname.lower():
+        return True
+    return False
+
+
 def _looks_like_feed_page(value: dict[str, Any]) -> bool:
     return any(key in value for key in (*FEED_LIST_KEYS, *FEED_CURSOR_KEYS, *FEED_HAS_MORE_KEYS))
 
 
-def normalize_feed_page(payload: dict[str, Any]) -> dict[str, Any]:
+def normalize_feed_page(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, list):
+        return {"data": payload}
     if not isinstance(payload, dict):
         return {}
-    for key in FEED_CONTAINER_KEYS:
-        value = payload.get(key)
-        if isinstance(value, dict):
-            return value
+    for key in FEED_LIST_KEYS:
+        if isinstance(payload.get(key), list):
+            return payload
 
     data = payload.get("data")
     if isinstance(data, dict):
@@ -852,10 +965,17 @@ def normalize_feed_page(payload: dict[str, Any]) -> dict[str, Any]:
         if _looks_like_feed_page(data):
             return data
 
+    for key in FEED_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+
     return payload
 
 
-def extract_raw_feeds(feedpage: dict[str, Any]) -> list[Any]:
+def extract_raw_feeds(feedpage: Any) -> list[Any]:
+    if isinstance(feedpage, list):
+        return feedpage
     if not isinstance(feedpage, dict):
         return []
     raw_feeds: Any = []
@@ -887,8 +1007,8 @@ def feed_page_cursor(feedpage: dict[str, Any]) -> str:
     return ""
 
 
-def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> tuple[dict[str, Any], list[FeedEntry]]:
-    source_payload = payload if isinstance(payload, dict) else {}
+def extract_feed_page(payload: Any, *, default_hostuin: int = 0) -> tuple[dict[str, Any], list[FeedEntry]]:
+    source_payload = payload if isinstance(payload, dict) else {"data": payload} if isinstance(payload, list) else {}
     feedpage = normalize_feed_page(payload)
     if not isinstance(feedpage, dict):
         return {}, []
@@ -897,6 +1017,6 @@ def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> t
     items = [
         extract_feed_entry(item, default_hostuin=default_hostuin, nickname_context=nickname_context)
         for item in raw_feeds
-        if isinstance(item, dict)
+        if isinstance(item, dict) and not is_ignored_feed_item(item)
     ]
     return feedpage, items

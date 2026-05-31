@@ -32,7 +32,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026053001
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060101
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -524,6 +524,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                     return False
 
     contract_attributes = {
+        "qzone_bridge.page_api": ("PAGE_DETAIL_TIMEOUT_SECONDS", "PAGE_STATUS_TIMEOUT_SECONDS"),
         "qzone_bridge.publish_renderer": ("combine_rendered_post_cards", "SUPPORTS_COMMENT_RESULT_SECTIONS"),
         "qzone_bridge.social": ("extract_nickname",),
     }
@@ -1097,7 +1098,8 @@ class QzoneStablePlugin(Star):
             if hasattr(files, "get"):
                 upload = files.get("file") or files.get("image") or files.get("media")
             if upload is None:
-                raise QzoneBridgeError("没有收到图片文件")
+                body = await self._page_json_body()
+                return await self.page_api.upload_media_payload(body)
             data = await self._maybe_await(upload.read())
             return await self.page_api.upload_media(
                 filename=getattr(upload, "filename", "") or "image.jpg",

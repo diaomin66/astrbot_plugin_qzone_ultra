@@ -840,11 +840,11 @@ class QzoneDaemonController:
             },
         )
 
-    async def delete_post(self, *, fid: str, appid: int = 311) -> dict[str, Any]:
+    async def delete_post(self, *, fid: str, appid: int = 311, created_at: int = 0) -> dict[str, Any]:
         return await self._request(
             "POST",
             "/delete",
-            json_body={"fid": fid, "appid": appid},
+            json_body={"fid": fid, "appid": appid, "created_at": created_at},
         )
 
     async def like_post(

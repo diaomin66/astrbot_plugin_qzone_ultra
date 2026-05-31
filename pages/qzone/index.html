@@ -4,9 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>QQ空间Ultra</title>
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./style.css?v=20260531-theme-sync4" />
   </head>
   <body>
+    <div id="toastContainer" class="toast-container" aria-live="polite"></div>
     <main class="shell">
       <section class="rail">
         <div class="account" id="accountBox">
@@ -67,12 +68,13 @@
           </button>
         </div>
 
-        <div class="notice" id="notice" hidden></div>
         <div class="feed" id="feed"></div>
         <button id="moreButton" class="load-more" type="button" hidden>加载更多</button>
       </section>
 
+      <div id="detailBackdrop" class="detail-backdrop"></div>
       <aside class="detail" id="detailPane" aria-label="说说详情">
+        <button id="detailCloseBtn" class="detail-close-btn" aria-label="关闭详情" hidden><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
         <div class="detail-empty" id="detailEmpty">
           <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3; margin-bottom: 12px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
           <strong>选择一条说说</strong>
@@ -82,6 +84,7 @@
       </aside>
     </main>
 
-    <script type="module" src="./app.js"></script>
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+    <script type="module" src="./app.js?v=20260531-theme-sync4"></script>
   </body>
 </html>

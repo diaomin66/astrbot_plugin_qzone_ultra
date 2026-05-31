@@ -542,6 +542,17 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
         parsed = urlparse(source)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             return ""
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if "qlogo" in host or host in {"thirdqq.qlogo.cn", "q.qlogo.cn"}:
+            return ""
+        if "/headimg" in path or "/headimg_dl" in path:
+            return ""
+        if "qzone" in host and re.search(r"/qzone/\d+/\d+/50(?:[/?]|$)", path):
+            return ""
+        source = re.sub(r"/(?:a|m|s)(?=&)", "/b", source)
+        source = re.sub(r"([?&])(?:w|h)=\d+(?=&|$)", "", source)
+        source = source.replace("?&", "?").rstrip("?&")
         return source
 
     def image_url_key(source: str) -> str:
