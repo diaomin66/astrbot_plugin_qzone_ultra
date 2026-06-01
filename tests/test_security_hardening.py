@@ -1601,6 +1601,33 @@ def test_materialize_video_covers_downloads_trusted_message_video_url(
     assert Path(prepared.media[0].source).is_file()
 
 
+def test_materialize_video_sources_decodes_trusted_base64_video(tmp_path: Path) -> None:
+    from qzone_bridge import video as video_mod
+    from qzone_bridge.media import PostMedia, PostPayload
+
+    encoded = base64.b64encode(b"fake video bytes").decode("ascii")
+    post = PostPayload(
+        content="hello",
+        media=[
+            PostMedia(
+                kind="video",
+                source=f"base64://{encoded}",
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+
+    prepared = video_mod.materialize_video_sources(post, tmp_path / "sources")
+
+    assert prepared.media[0].source != post.media[0].source
+    assert prepared.media[0].trusted_local is True
+    path = Path(prepared.media[0].source)
+    assert path.is_file()
+    assert path.read_bytes() == b"fake video bytes"
+
+
 def test_local_media_repairs_drive_relative_video_path(tmp_path: Path) -> None:
     from qzone_bridge.local_media import resolve_trusted_local_media_path
 
@@ -2166,6 +2193,72 @@ def test_plugin_resolves_quoted_video_get_file_download_url(
     assert len(post.media) == 1
     assert post.media[0].kind == "video"
     assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert post.media[0].trusted_local is True
+
+
+def test_plugin_resolves_llonebot_video_get_file_base64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    encoded = base64.b64encode(b"fake video bytes").decode("ascii")
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.get_file_params: list[dict[str, str]] = []
+
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {
+                "data": {
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": "empty",
+                                "path": "empty",
+                                "url": "empty",
+                                "file_id": "video-file-id",
+                            },
+                        }
+                    ]
+                }
+            }
+
+        async def get_file(self, **params):
+            self.get_file_params.append(params)
+            assert params in (
+                {"file_id": "video-file-id"},
+                {"file": "video-file-id"},
+                {"type": "path", "file_id": "video-file-id"},
+                {"type": "url", "file_id": "video-file-id"},
+            )
+            return {
+                "data": {
+                    "base64": encoded,
+                    "file_name": "clip.mp4",
+                    "file_size": len(b"fake video bytes"),
+                }
+            }
+
+    bot = _Bot()
+    event = types.SimpleNamespace(
+        bot=bot,
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "post hello"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert bot.get_file_params
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == f"base64://{encoded}"
     assert post.media[0].trusted_local is True
 
 

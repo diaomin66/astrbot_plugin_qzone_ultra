@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import hashlib
 import os
@@ -151,6 +153,10 @@ def _needs_video_cover(item: PostMedia) -> bool:
 
 def _materialized_video_path(video: PostMedia, source: str, source_dir: Path) -> Path:
     parsed = urlparse(source)
+    if source.startswith("base64://") or parsed.scheme.lower() == "data":
+        if not video.trusted_local:
+            raise QzoneParseError("视频 base64 来源只允许来自 AstrBot/OneBot 消息附件")
+        return _decode_trusted_base64_video(video, source, source_dir)
     if parsed.scheme.lower() in {"http", "https"}:
         if not video.trusted_local:
             raise QzoneParseError("暂不支持远程视频直传，请引用消息视频后再发说说")
@@ -203,6 +209,57 @@ def _download_trusted_remote_video(video: PostMedia, source: str, source_dir: Pa
         with contextlib.suppress(OSError):
             temp_path.unlink()
     return target
+
+
+def _decode_trusted_base64_video(video: PostMedia, source: str, source_dir: Path) -> Path:
+    source_dir.mkdir(parents=True, exist_ok=True)
+    target = _base64_video_cache_path(video, source, source_dir)
+    if _valid_local_video_file(target, video):
+        return target
+
+    encoded = _encoded_video_base64(source)
+    if not encoded:
+        raise QzoneParseError("视频 base64 来源为空，无法提取封面", detail={"name": video.name or "video"})
+    if (len(encoded) * 3) // 4 > VIDEO_SOURCE_MAX_BYTES:
+        raise QzoneParseError("视频文件过大，无法提取封面", detail={"name": video.name or "video"})
+    padded = encoded + ("=" * ((4 - len(encoded) % 4) % 4))
+    try:
+        data = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise QzoneParseError("视频 base64 来源无效，无法提取封面", detail={"name": video.name or "video"}) from exc
+    if len(data) > VIDEO_SOURCE_MAX_BYTES:
+        raise QzoneParseError("视频文件过大，无法提取封面", detail={"name": video.name or "video"})
+
+    temp_path = _temp_video_path(source_dir, target.stem, target.suffix)
+    try:
+        temp_path.write_bytes(data)
+        if not _valid_local_video_file(temp_path, video):
+            raise QzoneParseError("视频 base64 解码结果无效，无法提取封面", detail={"name": video.name or "video"})
+        temp_path.replace(target)
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+    return target
+
+
+def _encoded_video_base64(source: str) -> str:
+    if source.startswith("base64://"):
+        return "".join(source[len("base64://") :].split())
+    if source.startswith("data:"):
+        header, separator, payload = source.partition(",")
+        if separator and ";base64" in header.lower():
+            return "".join(payload.split())
+    return ""
+
+
+def _base64_video_cache_path(video: PostMedia, source: str, source_dir: Path) -> Path:
+    digest = hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest()[:20]
+    name = video.name or source_name(source) or "video.mp4"
+    suffix = Path(name).suffix.lower()
+    if suffix not in QZONE_VIDEO_SUFFIXES:
+        suffix = ".mp4"
+    stem = _safe_stem(name or "video")
+    return source_dir / f"video_source_{digest}_{stem}{suffix}"
 
 
 def _remote_video_cache_path(video: PostMedia, source: str, source_dir: Path) -> Path:

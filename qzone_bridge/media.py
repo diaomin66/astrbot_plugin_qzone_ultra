@@ -119,7 +119,12 @@ MEDIA_LOCAL_SOURCE_KEYS = (
     "file_",
     "attachment_id",
 )
-MEDIA_SOURCE_KEYS = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS
+MEDIA_BASE64_SOURCE_KEYS = (
+    "base64",
+    "file_base64",
+    "fileBase64",
+)
+MEDIA_SOURCE_KEYS = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS + MEDIA_BASE64_SOURCE_KEYS
 COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
 COMMAND_PREFIX_CHARS = "/\uFF0F!\uFF01#\uFF03.\uFF0E\u3002~\uFF5E?\uFF1F"
 LEADING_SPACE_CHARS = " \t\r\n\f\v\u3000\ufeff\u200b\u200c\u200d"
@@ -164,6 +169,22 @@ def _is_base64_source(value: str) -> bool:
 def _is_placeholder_source(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return text in PLACEHOLDER_SOURCE_VALUES
+
+
+def base64_media_source(data: dict[str, Any]) -> str:
+    """Return a normalized base64:// media source from OneBot-style payloads."""
+
+    for key in MEDIA_BASE64_SOURCE_KEYS:
+        value = data.get(key)
+        if value is None or _is_placeholder_source(value):
+            continue
+        source = str(value).strip()
+        if not source:
+            continue
+        if _is_base64_source(source):
+            return normalize_source(source) or source
+        return f"base64://{''.join(source.split())}"
+    return ""
 
 
 def _cq_unescape(value: str) -> str:
@@ -773,6 +794,9 @@ def _choose_media_source(data: dict[str, Any], *, kind: str = "") -> str:
     for value in normalized:
         if _is_url(value):
             return value
+    source = base64_media_source(data)
+    if source:
+        return source
     return ""
 
 

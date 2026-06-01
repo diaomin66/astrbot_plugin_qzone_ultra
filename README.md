@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 ## Cookie 绑定
 
-推荐在 OneBot v11 / aiocqhttp 环境使用自动绑定：
+推荐在 OneBot v11 / aiocqhttp 环境使用自动绑定。这里按 AstrBot 的 aiocqhttp 适配器能力工作，不限定某一个协议端；LLOneBot、NapCat、Shamrock 等能接入 OneBot v11 反向 WebSocket 的实现都走同一套解析和兜底逻辑。
 
 ```text
 /qzone autobind
@@ -174,6 +174,6 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - daemon 无法启动：确认默认 `18999` 端口没有被占用，防火墙或安全软件已放行本地连接，并检查 AstrBot 日志。
 - 浏览器访问 `127.0.0.1:18999`：看到 `ok: true` 代表本地 daemon 端口可达；空或错误的 `X-Qzone-Secret` 仍会返回 401。如果需要 Cookie、QQ 号或完整状态，请使用 `/qzone status`。
 - 自动绑定失败：确认 AstrBot 使用的是 OneBot v11 / aiocqhttp，且适配器允许获取 Cookie。
-- 图片/视频发布失败：确认图片或引用的视频可被 AstrBot 正常读取；视频封面提取依赖系统 `ffmpeg` 或 `imageio-ffmpeg`。
+- 图片/视频发布失败：确认图片或引用的视频可被 AstrBot 正常读取；视频会优先使用 OneBot 返回的 `url/download_url/file_url/path/file_id`，再尝试 `get_file`、群/私聊文件直链和 base64 兜底；封面提取依赖系统 `ffmpeg` 或 `imageio-ffmpeg`。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。
 - 点赞成功但提示校验不确定：通常是 QQ 空间读回延迟，可稍后再查看目标说说。

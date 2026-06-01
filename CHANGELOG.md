@@ -2,6 +2,13 @@
 
 ## 未发布
 
+## v0.6.5 - 2026-06-01
+
+- 修复：aiocqhttp/OneBot 视频引用继续按协议字段兼容，不绑定 NapCat；`get_file` 现在会兼容 LLOneBot 的 `base64` 返回，以及 `file_id/file/fid/id`、OneBot v12 风格 `type=path/url` 等常见文件参数组合。
+- 修复：群/私聊文件直链兜底会同时尝试 `group_id/group`、`busid` 和 `file_id/file` 参数形态，优先覆盖 LLOneBot、NapCat、Shamrock 等协议端差异。
+- 新增：OneBot 返回 base64 视频时会先落盘到插件缓存，再按正常视频流程提取封面和渲染卡片，避免只返回 base64 时误报“视频文件不存在”。
+- 测试：补充 LLOneBot `get_file` base64 视频、base64 视频本地化、引用视频 fallback 参数组合回归用例。
+
 ## v0.6.4 - 2026-06-01
 
 - 修复：aiocqhttp/OneBot 视频引用不再只按 NapCat 字段解析，新增兼容 `download_url`、`file_url`、`media_url`、`cdn_url`、`file_path`、`absolute_path`、`local_path` 等协议端字段，覆盖 LLOneBot、NapCat、Shamrock 等常见返回组合。

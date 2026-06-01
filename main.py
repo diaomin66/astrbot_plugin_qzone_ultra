@@ -671,11 +671,13 @@ from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneC
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.local_media import resolve_trusted_local_media_path
 from qzone_bridge.media import (
+    MEDIA_BASE64_SOURCE_KEYS,
     MEDIA_LOCAL_SOURCE_KEYS,
     MEDIA_URL_SOURCE_KEYS,
     PostMedia,
     PostPayload,
     QZONE_VIDEO_SUFFIXES,
+    base64_media_source,
     collect_message_media,
     collect_post_payload,
     guess_mime_type,
@@ -2750,14 +2752,14 @@ class QzoneStablePlugin(Star):
         kind: str = "",
         require_existing_local: bool = False,
     ) -> str:
-        source_keys = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS
+        source_keys = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS + MEDIA_BASE64_SOURCE_KEYS
         for key in source_keys:
             source = cls._usable_media_source(data.get(key))
             if source:
                 if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
                     continue
                 return source
-        return ""
+        return base64_media_source(data)
 
     @staticmethod
     def _onebot_media_name(data: dict[str, Any], source: str = "") -> str:
@@ -2887,7 +2889,7 @@ class QzoneStablePlugin(Star):
         data: dict[str, Any],
     ) -> PostMedia | None:
         candidates: list[tuple[str, Any]] = []
-        for key in ("file_id", "fileId", "file", "file_unique", "fileUnique"):
+        for key in ("file_id", "fileId", "file", "file_unique", "fileUnique", "file_uuid", "fileUuid", "fid", "id"):
             value = data.get(key)
             if self._source_placeholder(value):
                 continue
@@ -2898,8 +2900,10 @@ class QzoneStablePlugin(Star):
                 candidates.append((key, text))
         param_sets: list[dict[str, Any]] = []
         for key, value in candidates:
-            if key in {"file_id", "fileId", "file_unique", "fileUnique"}:
+            if key in {"file_id", "fileId", "file_unique", "fileUnique", "file_uuid", "fileUuid", "fid", "id"}:
                 param_sets.append({"file_id": value})
+                param_sets.append({"type": "path", "file_id": value})
+                param_sets.append({"type": "url", "file_id": value})
             param_sets.append({"file": value})
         seen_params: set[tuple[tuple[str, str], ...]] = set()
         for params in param_sets:
@@ -2933,6 +2937,10 @@ class QzoneStablePlugin(Star):
             or data.get("fileId")
             or data.get("file_unique")
             or data.get("fileUnique")
+            or data.get("file_uuid")
+            or data.get("fileUuid")
+            or data.get("fid")
+            or data.get("id")
             or data.get("file")
             or ""
         ).strip()
@@ -2940,9 +2948,15 @@ class QzoneStablePlugin(Star):
             return None
         calls: list[tuple[str, dict[str, Any]]] = []
         group_id = self._group_id(event) if event is not None else 0
+        busid = data.get("busid") or data.get("bus_id") or data.get("busId")
         if group_id:
+            if not self._source_placeholder(busid):
+                calls.append(("get_group_file_url", {"group_id": group_id, "file_id": file_id, "busid": busid}))
+                calls.append(("get_group_file_url", {"group": group_id, "file_id": file_id, "busid": busid}))
             calls.append(("get_group_file_url", {"group_id": group_id, "file_id": file_id}))
+            calls.append(("get_group_file_url", {"group": group_id, "file_id": file_id}))
         calls.append(("get_private_file_url", {"file_id": file_id}))
+        calls.append(("get_private_file_url", {"file": file_id}))
         for action, params in calls:
             try:
                 payload = await self._query_onebot_action(bot, action, **params)
