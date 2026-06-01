@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060101
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060103
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -669,9 +669,11 @@ from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
 from qzone_bridge.llm import QzoneLLM
+from qzone_bridge.local_media import resolve_trusted_local_media_path
 from qzone_bridge.media import (
     PostMedia,
     PostPayload,
+    QZONE_VIDEO_SUFFIXES,
     collect_message_media,
     collect_post_payload,
     guess_mime_type,
@@ -2702,10 +2704,26 @@ class QzoneStablePlugin(Star):
         return ""
 
     @classmethod
-    def _onebot_source_from_data(cls, data: dict[str, Any]) -> str:
+    def _onebot_local_source_exists(cls, source: str, data: dict[str, Any], kind: str) -> bool:
+        if source.startswith(("http://", "https://", "base64://", "data:")):
+            return True
+        name = cls._onebot_media_name(data, source)
+        suffixes = QZONE_VIDEO_SUFFIXES if cls._onebot_segment_is_video(kind, {**data, "source": source}) else set()
+        return resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None
+
+    @classmethod
+    def _onebot_source_from_data(
+        cls,
+        data: dict[str, Any],
+        *,
+        kind: str = "",
+        require_existing_local: bool = False,
+    ) -> str:
         for key in ("url", "path", "source", "file", "file_", "file_path", "absolute_path", "abs_path"):
             source = cls._usable_media_source(data.get(key))
             if source:
+                if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
+                    continue
                 return source
         return ""
 
@@ -2729,9 +2747,18 @@ class QzoneStablePlugin(Star):
         return 0
 
     @classmethod
-    def _onebot_post_media(cls, kind: str, data: dict[str, Any], source: str) -> PostMedia | None:
+    def _onebot_post_media(
+        cls,
+        kind: str,
+        data: dict[str, Any],
+        source: str,
+        *,
+        require_existing_local: bool = False,
+    ) -> PostMedia | None:
         source = cls._usable_media_source(source)
         if not source:
+            return None
+        if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
             return None
         name = cls._onebot_media_name(data, source)
         mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name or source) or "")
@@ -2788,6 +2815,11 @@ class QzoneStablePlugin(Star):
                     "raw_message",
                     "raw_messages",
                     "message_segments",
+                    "media",
+                    "medias",
+                    "attachment",
+                    "attachments",
+                    "files",
                 ):
                     if key in owner:
                         segments.extend(self._iter_onebot_segments(owner.get(key), seen=seen, depth=depth + 1))
@@ -2851,8 +2883,8 @@ class QzoneStablePlugin(Star):
             result = self._onebot_data_payload(payload)
             if isinstance(result, dict):
                 merged = {**data, **result}
-                source = self._onebot_source_from_data(merged)
-                media = self._onebot_post_media(kind, merged, source)
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
                 if media is not None:
                     return media
         return None
@@ -2881,8 +2913,8 @@ class QzoneStablePlugin(Star):
             result = self._onebot_data_payload(payload)
             if isinstance(result, dict):
                 merged = {**data, **result}
-                source = self._onebot_source_from_data(merged)
-                media = self._onebot_post_media(kind, merged, source)
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
                 if media is not None:
                     return media
         return None
@@ -2900,8 +2932,8 @@ class QzoneStablePlugin(Star):
         data = self._onebot_segment_data(segment)
         if kind == "file" and not self._onebot_segment_is_video(kind, data):
             return None
-        source = self._onebot_source_from_data(data)
-        media = self._onebot_post_media(kind, data, source) if source else None
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
+        media = self._onebot_post_media(kind, data, source, require_existing_local=True) if source else None
         if media is not None:
             return media
         if kind in {"video", "file"}:
@@ -2927,9 +2959,9 @@ class QzoneStablePlugin(Star):
 
     async def _component_file_media(self, component: Any, kind: str) -> PostMedia | None:
         data = self._onebot_segment_data(component)
-        source = self._onebot_source_from_data(data)
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
         if source:
-            return self._onebot_post_media(kind, data, source)
+            return self._onebot_post_media(kind, data, source, require_existing_local=True)
         method_name = "get_file" if kind == "file" else "convert_to_file_path"
         method = getattr(component, method_name, None)
         if not callable(method):
@@ -2942,7 +2974,7 @@ class QzoneStablePlugin(Star):
             logger.debug("qzone component media materialize failed kind=%s: %s", kind, exc)
             return None
         media_kind = "video" if kind == "file" and self._onebot_segment_is_video(kind, data) else kind
-        return self._onebot_post_media(media_kind, data, str(resolved or ""))
+        return self._onebot_post_media(media_kind, data, str(resolved or ""), require_existing_local=True)
 
     async def _component_runtime_media(self, component: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
         if depth > 6 or component in (None, "", [], (), {}):

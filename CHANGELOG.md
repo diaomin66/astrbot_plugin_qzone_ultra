@@ -2,6 +2,12 @@
 
 ## 未发布
 
+## v0.6.3 - 2026-06-01
+
+- 修复：引用视频时不再把不存在的 NTQQ/OneBot 本地缓存路径（例如 `D:Documents\Tencent Files\...\Video\...\xxx.mp4`）直接当作可提取封面的文件；只有当前机器确实可读的本地视频路径才会进入发布流程。
+- 修复：aiocqhttp/OneBot 视频段同时带有坏 `path` 与可用 `url`、`file_id`、组件 `convert_to_file_path()` 时，现在会继续走可用来源，兼容 llbot、NapCat、Shamrock 等不同协议端字段组合。
+- 测试：补充不存在视频路径、坏路径优先级、`get_file` fallback、AstrBot `Reply.chain` 视频组件转换等回归用例，防止再次出现“视频文件不存在，无法提取封面”。
+
 ## v0.6.2 - 2026-06-01
 
 - 修复：引用视频现在按 aiocqhttp/OneBot 通用消息结构解析，不再只依赖某一个协议端；支持从结构化消息、CQ/raw_message、AstrBot `Reply.chain` 视频组件和 `get_msg` 返回体中提取真实视频源。

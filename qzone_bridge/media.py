@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
+from .local_media import resolve_trusted_local_media_path
 from .source_policy import is_windows_drive_path
 
 
@@ -613,7 +614,32 @@ def _component_text(component: Any) -> str:
     return ""
 
 
-def _choose_media_source(data: dict[str, Any]) -> str:
+def _source_needs_local_file(source: str) -> bool:
+    if not source or _is_url(source) or _is_base64_source(source):
+        return False
+    return _is_local_source(source) and _looks_like_path(source)
+
+
+def _local_media_source_exists(
+    source: str,
+    *,
+    kind: str = "",
+    name: str = "",
+    mime_type: str = "",
+) -> bool:
+    if not _source_needs_local_file(source):
+        return True
+    descriptor = {"kind": kind, "source": source, "name": name, "mime_type": mime_type}
+    if is_video_media(descriptor):
+        suffixes = QZONE_VIDEO_SUFFIXES
+    elif is_supported_image(descriptor):
+        suffixes = QZONE_IMAGE_SUFFIXES
+    else:
+        suffixes = QZONE_IMAGE_SUFFIXES | QZONE_VIDEO_SUFFIXES
+    return resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None
+
+
+def _choose_media_source(data: dict[str, Any], *, kind: str = "") -> str:
     candidates = [
         data.get("url"),
         data.get("path"),
@@ -624,18 +650,27 @@ def _choose_media_source(data: dict[str, Any]) -> str:
     ]
     normalized = [normalize_source(value) for value in candidates if value not in (None, "")]
     normalized = [value for value in normalized if value and not _is_placeholder_source(value)]
+    name = str(data.get("name") or data.get("filename") or data.get("file_name") or data.get("fileName") or "")
+    mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name) or "")
+    source_kind = kind or str(data.get("kind") or data.get("type") or "")
     for value in normalized:
-        if _is_base64_source(value) or (not _is_url(value) and _looks_like_path(value)):
+        if _is_base64_source(value):
             return value
     for value in normalized:
-        if _is_url(value) or _is_base64_source(value) or _looks_like_path(value):
+        if not _is_url(value) and _looks_like_path(value):
+            candidate_name = name or source_name(value)
+            candidate_mime = mime_type or guess_mime_type(candidate_name or value)
+            if _local_media_source_exists(value, kind=source_kind, name=candidate_name, mime_type=candidate_mime):
+                return value
+    for value in normalized:
+        if _is_url(value):
             return value
     return ""
 
 
 def _component_media(component: Any, kind: str, *, trusted_message: bool = False) -> PostMedia | None:
     data = _component_mapping(component)
-    source = _choose_media_source(data)
+    source = _choose_media_source(data, kind=kind)
     if not source:
         return None
     name = str(data.get("name") or data.get("filename") or data.get("file_name") or data.get("fileName") or source_name(source) or "")
@@ -658,6 +693,23 @@ def _component_media(component: Any, kind: str, *, trusted_message: bool = False
     elif is_video_media(media):
         media.kind = "video"
     return media
+
+
+def _reference_media_is_usable(item: PostMedia) -> bool:
+    if not item.source:
+        return False
+    if _is_url(item.source) or _is_base64_source(item.source):
+        return True
+    if item.kind == "video" or is_video_media(item):
+        return (
+            resolve_trusted_local_media_path(
+                item.source,
+                name=item.name or source_name(item.source),
+                suffixes=QZONE_VIDEO_SUFFIXES,
+            )
+            is not None
+        )
+    return True
 
 
 def _event_message_text(event: Any) -> str:
@@ -727,7 +779,11 @@ def _media_from_reference_field(value: Any, *, key: str) -> list[PostMedia]:
         values = value
     else:
         values = [value]
-    return normalize_media_list(values, default_kind=default_kind, trusted_local=True)
+    return [
+        item
+        for item in normalize_media_list(values, default_kind=default_kind, trusted_local=True)
+        if _reference_media_is_usable(item)
+    ]
 
 
 def _collect_referenced_media(
