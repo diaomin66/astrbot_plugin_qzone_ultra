@@ -2,6 +2,13 @@
 
 ## 未发布
 
+## v0.6.7 - 2026-06-01
+
+- 新增：实现 Tencent upload SDK 所需的最小 JCE/Tars 编解码层，覆盖 `AuthToken`、`FileControlReq`、`FileBatchControlReq/Rsp`、`FileUploadReq/Rsp`、`UploadVideoInfoReq/Rsp` 等已确认 schema。
+- 新增：`QzoneTencentVideoUploader` 支持按 `video_qzone` 协议发送控制包和分片包，并能解析最终 `sVid/iBusiNessType/vBusiNessData` 上传响应；没有 `vLoginData` 时会明确报缺少 QQ upload 二进制登录材料，不影响现有封面回退发布。
+- 文档：更新 daemon 原生视频发布逆向记录，标明 JCE 与 socket 上传层已落地，剩余阻塞点收敛为 `vLoginData/vLoginKey` 来源和消费 `sVid/vBusiNessData` 的最终 QQ 空间发布 RPC。
+- 测试：补充 JCE 字段 tag、嵌套 map/struct、上传响应解码、分片上传 fake socket 流程和 SHA1 校验回归用例。
+
 ## v0.6.6 - 2026-06-01
 
 - 新增：沉淀 QQ 空间 daemon 原生视频直发的 Tencent upload SDK 协议骨架，记录 `video_qzone`、`video.upqzfile.com:80`、控制包 cmd=1、分片包 cmd=2、PDU header offset 和 `0x04/0x05` 帧格式。

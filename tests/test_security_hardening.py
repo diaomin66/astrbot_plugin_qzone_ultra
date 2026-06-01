@@ -1905,8 +1905,10 @@ def test_qzone_video_upload_probe_documents_missing_daemon_requirements(tmp_path
     assert probe["file_cmd"] == TENCENT_UPLOAD_CMD_FILE
     assert probe["daemon_ready"] is False
     assert probe["video_readable"] is True
+    implemented = {item["name"] for item in probe["requirements"] if item["status"] == "implemented"}
     missing = {item["name"] for item in probe["requirements"] if item["status"] == "missing"}
-    assert {"jce_codec", "qq_upload_login_material", "native_publish_rpc"} <= missing
+    assert {"jce_codec", "socket_upload_client"} <= implemented
+    assert {"qq_upload_login_material", "native_publish_rpc"} <= missing
 
 
 def test_plugin_collects_quoted_video_from_onebot_get_msg(monkeypatch: pytest.MonkeyPatch) -> None:

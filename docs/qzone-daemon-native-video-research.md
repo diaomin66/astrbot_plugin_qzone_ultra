@@ -62,9 +62,9 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - <https://github.com/cxxsheng/Android_9.2.5_64/blob/main/smali_classes32/com/tencent/upload/utils/PduHeader%24OFFSET.smali>
 - <https://github.com/cxxsheng/Android_9.2.5_64/blob/main/smali_classes5/com/tencent/upload/uinterface/token/TokenProvider.smali>
 
-## 已落地到代码的协议骨架
+## 已落地到代码的上传协议层
 
-新增 `qzone_bridge/tencent_upload.py`，把当前已确认、可确定的协议常量和 PDU 帧编解码先固化为测试覆盖的基础模块：
+新增 `qzone_bridge/tencent_upload.py` 和 `qzone_bridge/jce.py`，把当前已确认、可确定的协议常量、PDU 帧、JCE schema 和上传客户端固化为测试覆盖的基础模块：
 
 - `QZONE_VIDEO_UPLOAD_APPID = "video_qzone"`
 - `QZONE_VIDEO_UPLOAD_HOST = "video.upqzfile.com"`
@@ -73,19 +73,22 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - `TENCENT_UPLOAD_CMD_CONTROL = 1`
 - `TENCENT_UPLOAD_CMD_FILE = 2`
 - `encode_upload_pdu()` / `decode_upload_pdu()` / `decode_upload_pdu_size()`
-- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项是 JCE 编码、QQ upload 二进制登录材料和最终发布 RPC。
+- `encode_upload_video_info_req()` / `decode_upload_video_info_rsp()`
+- `encode_file_batch_control_req()` / `decode_file_batch_control_rsp()`
+- `encode_file_upload_req()` / `decode_file_upload_rsp()`
+- `QzoneTencentVideoUploader`：可按控制包、分片包顺序走 socket/PDU/JCE 上传流程，成功响应里解析 `sVid/iBusiNessType/vBusiNessData`。
+- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项已经从编码层收敛为 QQ upload 二进制登录材料和最终发布 RPC。
 
-这一步还不是直发完成，但它把“已确认的 wire framing”从文档变成可回归测试的代码边界。后续只要补上 JCE/Tars schema 和 `vLoginData/vLoginKey` 来源，就可以把控制包与分片包接到 daemon socket 上传实现里，而不是继续只停留在文档推测。
+这一步还不是直发完成，但它把“已确认的 wire protocol”从文档变成可回归测试的代码边界。后续只要补上 `vLoginData/vLoginKey` 来源和最终发布 RPC，就可以把上传成功返回的 `sVid/vBusiNessData` 接到 daemon 原生发布里，而不是继续只停留在文档推测。
 
 ## 需要继续逆向的点
 
 要让 daemon 真正原生发视频，必须补齐以下协议，而不是复用图片说说接口：
 
-1. JCE/Tars 编解码：至少需要 `SLICE_UPLOAD/FileControlReq`、`SLICE_UPLOAD/FileUploadReq`、`SLICE_UPLOAD/AuthToken`、`FileUpload/UploadVideoInfoReq`、`FileUpload/UploadVideoInfoRsp` 的字段 tag 和编码行为。
-2. `vLoginData/vLoginKey` 的生成来源，尤其是 QQ 登录态、设备态、uin、skey/pt4_token 之外的二进制字段，以及 `ITokenEncryptor` 是否在 QQ/Qzone 运行时被替换。
-3. `vBusiNessData` 的结构，以及它和 `UploadVideoInfoRsp.sVid`、最终说说发布请求之间的关系。
-4. 视频封面、时长、宽高、转码/原画、`needProcess` 等字段在上传 SDK 与最终发布模型中的映射。
-5. 成功上传后最终发布说说的 RPC/CGI 请求体，确认它是否能在 PC Cookie 登录态下复现。
+1. `vLoginData/vLoginKey` 的生成来源，尤其是 QQ 登录态、设备态、uin、skey/pt4_token 之外的二进制字段，以及 `ITokenEncryptor` 是否在 QQ/Qzone 运行时被替换。
+2. `vBusiNessData` 的结构，以及它和 `UploadVideoInfoRsp.sVid`、最终说说发布请求之间的关系。
+3. 视频封面、时长、宽高、转码/原画、`needProcess` 等字段在上传 SDK 与最终发布模型中的映射。
+4. 成功上传后最终发布说说的 RPC/CGI 请求体，确认它是否能在 PC Cookie 登录态下复现。
 
 ## 当前实现策略
 
