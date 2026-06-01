@@ -3208,6 +3208,31 @@ def test_start_scheduled_tasks_can_add_news_after_existing_task(
     asyncio.run(run_case())
 
 
+def test_cron_schedule_skips_consumed_offset_slot() -> None:
+    from qzone_bridge.scheduler import cron_schedule
+
+    first = cron_schedule(
+        "30 8 * * *",
+        500,
+        now=datetime(2026, 5, 31, 8, 26, 17),
+        randint=lambda _start, _end: -500,
+    )
+
+    assert first.delay_seconds == 1.0
+    assert first.slot == datetime(2026, 5, 31, 8, 30)
+
+    second = cron_schedule(
+        "30 8 * * *",
+        500,
+        now=datetime(2026, 5, 31, 8, 26, 18),
+        randint=lambda _start, _end: -500,
+        after=first.slot,
+    )
+
+    assert second.slot == datetime(2026, 6, 1, 8, 30)
+    assert second.delay_seconds > 23 * 60 * 60
+
+
 def test_google_news_rss_parser_cleans_titles_and_sources() -> None:
     from qzone_bridge.news import parse_google_news_rss
 
