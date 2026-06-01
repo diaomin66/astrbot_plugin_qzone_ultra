@@ -98,6 +98,7 @@ class PluginSettings:
     render_result_width: int = 900
     render_feed_card_limit: int = 5
     render_remote_timeout: float = 0.35
+    native_video_publish: bool = True
     manage_group: int = 0
     pillowmd_style_dir: str = ""
     post_provider_id: str = ""
@@ -169,6 +170,7 @@ class PluginSettings:
             render_result_width=int(_pick(mapping, "render_result_width", 900) or 900),
             render_feed_card_limit=int(_pick(mapping, "render_feed_card_limit", 5) or 5),
             render_remote_timeout=float(_pick(mapping, "render_remote_timeout", 0.35) or 0.35),
+            native_video_publish=_as_bool(_pick(mapping, "native_video_publish", True), True),
             manage_group=int(_pick(mapping, "manage_group", 0) or 0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),

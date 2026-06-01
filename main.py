@@ -571,6 +571,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "news_once_per_day",
                 "news_max_post_length",
                 "news_trust_env",
+                "native_video_publish",
             )
         },
     }
@@ -669,6 +670,7 @@ from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneC
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
 from qzone_bridge.models import FeedEntry
+from qzone_bridge.native_video import NativeVideoPublishUnavailable, publish_native_video_post
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
     NewsItem,
@@ -2595,6 +2597,47 @@ class QzoneStablePlugin(Star):
             self.data_dir / "video_covers",
         )
 
+    async def _publish_post_payload(
+        self,
+        post: PostPayload,
+        *,
+        sync_weibo: bool = False,
+    ) -> tuple[PostPayload, dict[str, Any]]:
+        if getattr(self.settings, "native_video_publish", True):
+            try:
+                native_result = await asyncio.to_thread(
+                    publish_native_video_post,
+                    post,
+                    app_name="QQ空间Ultra",
+                )
+            except NativeVideoPublishUnavailable as exc:
+                logger.debug("native qzone video publish skipped: %s", exc)
+            else:
+                render_post = await self._prepare_publish_payload(post)
+                payload = {
+                    "fid": "",
+                    "message": native_result.message,
+                    "native_video": True,
+                    "status": "pending_user_confirm",
+                    "media_count": len(post.media) + len(post.attachments),
+                    "photo_count": len(render_post.media),
+                    "raw": {
+                        "native_video_uri": native_result.uri,
+                        "handler": native_result.handler,
+                        "video": native_result.video.to_dict(),
+                    },
+                }
+                return render_post, payload
+
+        render_post = await self._prepare_publish_payload(post)
+        payload = await self.controller.publish_post(
+            content=render_post.content,
+            sync_weibo=sync_weibo,
+            media=[item.to_dict() for item in render_post.media],
+            content_sanitized=True,
+        )
+        return render_post, payload
+
     async def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
         return await self.drafts.add_async(
             author_uin=self._sender_id(event),
@@ -3810,13 +3853,8 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
-            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post)
             if payload.get("fid"):
                 await self._post_store().upsert_async(
                     QzonePost(
@@ -4224,13 +4262,8 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
-            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post)
             published_fid = str(payload.get("fid") or "")
 
             def mark_published(current: DraftPost) -> None:
@@ -4491,13 +4524,8 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
-            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post)
         except QzoneBridgeError as exc:
             if profile_task is not None:
                 profile_task.cancel()
@@ -4664,12 +4692,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            post = await self._prepare_publish_payload(post)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post)
         except QzoneBridgeError as exc:
             llm_payload = self._llm_error_payload("qzone_publish_post", exc)
             return await self._ask_llm_tool_reply(
@@ -4919,13 +4942,7 @@ class QzoneStablePlugin(Star):
         )
         try:
             await self._ensure_cookie_ready(event)
-            post = await self._prepare_publish_payload(post)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                sync_weibo=sync_weibo,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, sync_weibo=sync_weibo)
         except QzoneBridgeError as exc:
             text = await self._ask_llm_tool_reply(
                 event,

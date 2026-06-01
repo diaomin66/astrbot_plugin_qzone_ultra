@@ -1575,6 +1575,143 @@ def test_daemon_publish_post_materializes_video_without_reference(
     assert payload["media_count"] == 1
 
 
+def test_native_qzone_video_publish_uri_encodes_opensdk_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import base64
+    from urllib.parse import parse_qs, urlparse
+
+    from qzone_bridge import native_video
+    from qzone_bridge.media import PostMedia
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 2345)
+
+    uri = native_video.build_native_qzone_video_publish_uri(
+        PostMedia(
+            kind="video",
+            source=str(source),
+            name="clip.mp4",
+            mime_type="video/mp4",
+            trusted_local=True,
+        ),
+        "hello",
+        app_name="QQ空间Ultra",
+    )
+    parsed = urlparse(uri)
+    params = parse_qs(parsed.query)
+
+    def decoded(key: str) -> str:
+        return base64.b64decode(params[key][0]).decode("utf-8")
+
+    assert parsed.scheme == "mqqapi"
+    assert parsed.netloc == "qzone"
+    assert parsed.path == "/publish"
+    assert params["src_type"] == ["app"]
+    assert decoded("req_type") == "4"
+    assert decoded("videoPath") == str(source)
+    assert decoded("videoDuration") == "2345"
+    assert decoded("videoSize") == str(source.stat().st_size)
+    assert decoded("description") == "hello"
+    assert decoded("app_name") == "QQ空间Ultra"
+
+
+def test_publish_native_video_post_launches_registered_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import native_video
+    from qzone_bridge.media import PostMedia, PostPayload
+
+    launched: dict[str, str] = {}
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    monkeypatch.setattr(native_video, "native_qzone_protocol_handler", lambda: '"QQ" "%1"')
+    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 1000)
+    monkeypatch.setattr(native_video, "open_native_qzone_uri", lambda uri: launched.setdefault("uri", uri))
+
+    post = PostPayload(
+        content="hello",
+        media=[
+            PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+
+    result = native_video.publish_native_video_post(post)
+
+    assert launched["uri"] == result.uri
+    assert result.handler == '"QQ" "%1"'
+    assert result.video.source == str(source)
+
+
+def test_plugin_publish_prefers_native_video_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    original = main.PostPayload(
+        content="hello",
+        media=[
+            main.PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+    cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
+    )
+
+    def fake_native(post, *, app_name=""):
+        assert post is original
+        assert app_name == "QQ空间Ultra"
+        return types.SimpleNamespace(
+            uri="mqqapi://qzone/publish?req_type=NA==",
+            video=original.media[0],
+            handler='"QQ" "%1"',
+            message="native opened",
+        )
+
+    async def fake_prepare(post):
+        assert post is original
+        return cover
+
+    class _Controller:
+        async def publish_post(self, **_kwargs):
+            raise AssertionError("cover fallback should not run when native handoff succeeds")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    monkeypatch.setattr(main, "publish_native_video_post", fake_native)
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
+
+    assert render_post is cover
+    assert payload["message"] == "native opened"
+    assert payload["native_video"] is True
+    assert payload["status"] == "pending_user_confirm"
+    assert payload["photo_count"] == 1
+    assert payload["raw"]["native_video_uri"].startswith("mqqapi://qzone/publish")
+
+
 def test_publish_renderer_draws_video_play_overlay() -> None:
     from PIL import Image, ImageDraw, ImageFont
 
