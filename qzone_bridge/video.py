@@ -16,8 +16,10 @@ from urllib.parse import urlparse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .errors import QzoneParseError
+from .local_media import is_recoverable_local_media_reference, resolve_trusted_local_media_path
 from .media import (
     QZONE_MIN_IMAGE_SIDE,
+    QZONE_VIDEO_SUFFIXES,
     PostMedia,
     PostPayload,
     is_supported_image,
@@ -105,11 +107,26 @@ def _trusted_local_video_path(video: PostMedia, source: str) -> Path:
     parsed = urlparse(source)
     if parsed.scheme.lower() in {"http", "https", "data"} or source.startswith("base64://"):
         raise QzoneParseError("暂不支持远程视频直传，请引用本地消息视频后再发说说")
-    if parsed.scheme and not source.startswith("file://") and not is_windows_drive_path(source):
+    if (
+        parsed.scheme
+        and not source.startswith("file://")
+        and not is_windows_drive_path(source)
+        and not is_recoverable_local_media_reference(source)
+    ):
         raise QzoneParseError("视频来源协议不受支持，无法提取封面")
     if not video.trusted_local:
         raise QzoneParseError("本地视频路径只允许来自 AstrBot 消息附件缓存")
-    return Path(source)
+    path = resolve_trusted_local_media_path(
+        source,
+        name=video.name or source_name(source),
+        suffixes=QZONE_VIDEO_SUFFIXES,
+    )
+    if path is None:
+        raise QzoneParseError(
+            "视频文件不存在，无法提取封面",
+            detail={"name": video.name or source_name(source), "source": source},
+        )
+    return path
 
 
 def _cover_path_for_video(path: Path, video: PostMedia, cover_dir: Path) -> Path:

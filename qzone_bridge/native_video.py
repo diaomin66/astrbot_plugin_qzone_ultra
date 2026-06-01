@@ -12,7 +12,16 @@ import sys
 from urllib.parse import urlencode, urlparse
 
 from .errors import QzoneParseError
-from .media import PostMedia, PostPayload, is_supported_image, is_video_media, normalize_source, source_name
+from .local_media import is_recoverable_local_media_reference, resolve_trusted_local_media_path
+from .media import (
+    QZONE_VIDEO_SUFFIXES,
+    PostMedia,
+    PostPayload,
+    is_supported_image,
+    is_video_media,
+    normalize_source,
+    source_name,
+)
 from .source_policy import is_windows_drive_path
 
 
@@ -132,15 +141,24 @@ def _trusted_local_video_path(video: PostMedia) -> Path:
     parsed = urlparse(source)
     if parsed.scheme.lower() in {"http", "https", "data"} or source.startswith("base64://"):
         raise NativeVideoPublishUnavailable("原生视频发布需要本地视频文件，远程视频已回退到封面发布")
-    if parsed.scheme and not source.startswith("file://") and not is_windows_drive_path(source):
+    if (
+        parsed.scheme
+        and not source.startswith("file://")
+        and not is_windows_drive_path(source)
+        and not is_recoverable_local_media_reference(source)
+    ):
         raise NativeVideoPublishUnavailable("视频来源协议不支持原生发布，已回退到封面发布")
     if not video.trusted_local:
         raise NativeVideoPublishUnavailable("本地视频路径只允许来自 AstrBot 消息附件缓存")
-    path = Path(source)
-    if not path.is_file():
+    path = resolve_trusted_local_media_path(
+        source,
+        name=video.name or source_name(source),
+        suffixes=QZONE_VIDEO_SUFFIXES,
+    )
+    if path is None:
         raise NativeVideoPublishUnavailable(
             "视频文件不存在，无法原生发布",
-            detail={"name": video.name or source_name(source)},
+            detail={"name": video.name or source_name(source), "source": source},
         )
     return path
 

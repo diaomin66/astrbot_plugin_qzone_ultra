@@ -1515,6 +1515,68 @@ def test_materialize_video_covers_replaces_video_with_trusted_cover(
         assert image.size == (320, 180)
 
 
+def test_materialize_video_covers_recovers_ntqq_cache_path_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    from qzone_bridge import local_media, video as video_mod
+    from qzone_bridge.media import PostMedia, PostPayload
+
+    root = tmp_path / "Tencent Files"
+    source = root / "3112333596" / "nt_qq" / "nt_data" / "Video" / "2026-06" / "OriV9" / "95d20307dfb960194a9210eff4824876.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fake video bytes")
+    monkeypatch.setattr(local_media, "_tencent_file_roots", lambda: [root])
+    seen: dict[str, Path] = {}
+
+    def fake_extract(path: Path, output_path: Path, *, name: str = "") -> None:
+        seen["path"] = path
+        Image.new("RGB", (320, 180), (42, 84, 126)).save(output_path)
+
+    monkeypatch.setattr(video_mod, "_extract_frame_with_ffmpeg", fake_extract)
+    damaged_source = (
+        "D:Documents\nATencent Files\\3112333596\\nt_qq\\nt_data\\Video\\2026-06\\OriV9\\"
+        f"{source.name}"
+    )
+    post = PostPayload(
+        content="hello",
+        media=[
+            PostMedia(
+                kind="video",
+                source=damaged_source,
+                name=source.name,
+                mime_type="video/mp4",
+                size=source.stat().st_size,
+                trusted_local=True,
+            )
+        ],
+    )
+
+    prepared = video_mod.materialize_video_covers(post, tmp_path / "covers")
+
+    assert seen["path"] == source
+    assert prepared.media[0].raw_type == "video"
+    assert Path(prepared.media[0].source).is_file()
+
+
+def test_local_media_repairs_drive_relative_video_path(tmp_path: Path) -> None:
+    from qzone_bridge.local_media import resolve_trusted_local_media_path
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    text = str(source)
+    if len(text) < 3 or text[1] != ":" or text[2] not in "\\/":
+        pytest.skip("Windows drive path required")
+    damaged = text[:2] + text[3:]
+
+    resolved = resolve_trusted_local_media_path(damaged, name=source.name, suffixes={".mp4"})
+
+    assert resolved is not None
+    assert resolved.samefile(source)
+
+
 def test_daemon_publish_post_materializes_video_without_reference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1616,6 +1678,44 @@ def test_native_qzone_video_publish_uri_encodes_opensdk_fields(
     assert decoded("videoSize") == str(source.stat().st_size)
     assert decoded("description") == "hello"
     assert decoded("app_name") == "QQ空间Ultra"
+
+
+def test_native_qzone_video_publish_uri_recovers_ntqq_cache_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import base64
+    from urllib.parse import parse_qs, urlparse
+
+    from qzone_bridge import local_media, native_video
+    from qzone_bridge.media import PostMedia
+
+    root = tmp_path / "Tencent Files"
+    source = root / "3112333596" / "nt_qq" / "nt_data" / "Video" / "2026-06" / "OriV9" / "95d20307dfb960194a9210eff4824876.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fake video bytes")
+    monkeypatch.setattr(local_media, "_tencent_file_roots", lambda: [root])
+    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 2345)
+    damaged_source = (
+        "D:Documents\nATencent Files\\3112333596\\nt_qq\\nt_data\\Video\\2026-06\\OriV9\\"
+        f"{source.name}"
+    )
+
+    uri = native_video.build_native_qzone_video_publish_uri(
+        PostMedia(
+            kind="video",
+            source=damaged_source,
+            name=source.name,
+            mime_type="video/mp4",
+            trusted_local=True,
+        ),
+        "hello",
+        app_name="QQ空间Ultra",
+    )
+    params = parse_qs(urlparse(uri).query)
+
+    assert base64.b64decode(params["videoPath"][0]).decode("utf-8") == str(source)
+    assert base64.b64decode(params["videoDuration"][0]).decode("utf-8") == "2345"
 
 
 def test_publish_native_video_post_launches_registered_handler(
