@@ -86,6 +86,40 @@ COMPONENT_STRING_RE = re.compile(
 )
 CQ_SEGMENT_RE = re.compile(r"\[CQ:([A-Za-z0-9_]+)((?:,[^\]]*)?)\]")
 PLACEHOLDER_SOURCE_VALUES = {"", "empty", "null", "none", "nil", "undefined", "false"}
+MEDIA_URL_SOURCE_KEYS = (
+    "url",
+    "download_url",
+    "downloadUrl",
+    "file_url",
+    "fileUrl",
+    "media_url",
+    "mediaUrl",
+    "origin_url",
+    "originUrl",
+    "original_url",
+    "originalUrl",
+    "cdn_url",
+    "cdnUrl",
+    "preview_url",
+    "previewUrl",
+)
+MEDIA_LOCAL_SOURCE_KEYS = (
+    "path",
+    "file_path",
+    "filePath",
+    "absolute_path",
+    "absolutePath",
+    "abs_path",
+    "absPath",
+    "local_path",
+    "localPath",
+    "source",
+    "src",
+    "file",
+    "file_",
+    "attachment_id",
+)
+MEDIA_SOURCE_KEYS = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS
 COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
 COMMAND_PREFIX_CHARS = "/\uFF0F!\uFF01#\uFF03.\uFF0E\u3002~\uFF5E?\uFF1F"
 LEADING_SPACE_CHARS = " \t\r\n\f\v\u3000\ufeff\u200b\u200c\u200d"
@@ -292,10 +326,25 @@ def normalize_source(value: Any) -> str:
 
 
 def _first_source_candidate(*values: Any) -> str:
-    for value in values:
-        source = normalize_source(value)
-        if source:
-            return source
+    normalized = [normalize_source(value) for value in values]
+    normalized = [value for value in normalized if value]
+    for value in normalized:
+        if _is_base64_source(value):
+            return value
+    for value in normalized:
+        if _is_url(value):
+            continue
+        with contextlib.suppress(OSError):
+            if Path(value).is_file():
+                return value
+    for value in normalized:
+        if _is_url(value):
+            return value
+    for value in normalized:
+        if not _is_url(value) and _looks_like_path(value):
+            return value
+    for value in normalized:
+        return value
     return ""
 
 
@@ -324,7 +373,21 @@ def is_supported_image(media: PostMedia | dict[str, Any]) -> bool:
         source = _first_source_candidate(
             media.get("source"),
             media.get("url"),
+            media.get("download_url"),
+            media.get("downloadUrl"),
+            media.get("file_url"),
+            media.get("fileUrl"),
+            media.get("media_url"),
+            media.get("mediaUrl"),
             media.get("path"),
+            media.get("file_path"),
+            media.get("filePath"),
+            media.get("absolute_path"),
+            media.get("absolutePath"),
+            media.get("abs_path"),
+            media.get("absPath"),
+            media.get("local_path"),
+            media.get("localPath"),
             media.get("file"),
             media.get("file_"),
         )
@@ -350,7 +413,21 @@ def is_video_media(media: PostMedia | dict[str, Any]) -> bool:
         source = _first_source_candidate(
             media.get("source"),
             media.get("url"),
+            media.get("download_url"),
+            media.get("downloadUrl"),
+            media.get("file_url"),
+            media.get("fileUrl"),
+            media.get("media_url"),
+            media.get("mediaUrl"),
             media.get("path"),
+            media.get("file_path"),
+            media.get("filePath"),
+            media.get("absolute_path"),
+            media.get("absolutePath"),
+            media.get("abs_path"),
+            media.get("absPath"),
+            media.get("local_path"),
+            media.get("localPath"),
             media.get("file"),
             media.get("file_"),
         )
@@ -408,7 +485,21 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
         source = _first_source_candidate(
             item.get("source"),
             item.get("url"),
+            item.get("download_url"),
+            item.get("downloadUrl"),
+            item.get("file_url"),
+            item.get("fileUrl"),
+            item.get("media_url"),
+            item.get("mediaUrl"),
             item.get("path"),
+            item.get("file_path"),
+            item.get("filePath"),
+            item.get("absolute_path"),
+            item.get("absolutePath"),
+            item.get("abs_path"),
+            item.get("absPath"),
+            item.get("local_path"),
+            item.get("localPath"),
             item.get("file"),
             item.get("file_"),
         )
@@ -550,8 +641,32 @@ def _component_mapping(component: Any) -> dict[str, Any]:
         "fileUnique",
         "file_name",
         "fileName",
+        "source",
+        "src",
         "url",
+        "download_url",
+        "downloadUrl",
+        "file_url",
+        "fileUrl",
+        "media_url",
+        "mediaUrl",
+        "origin_url",
+        "originUrl",
+        "original_url",
+        "originalUrl",
+        "cdn_url",
+        "cdnUrl",
+        "preview_url",
+        "previewUrl",
         "path",
+        "file_path",
+        "filePath",
+        "absolute_path",
+        "absolutePath",
+        "abs_path",
+        "absPath",
+        "local_path",
+        "localPath",
         "name",
         "filename",
         "thumb",
@@ -640,14 +755,7 @@ def _local_media_source_exists(
 
 
 def _choose_media_source(data: dict[str, Any], *, kind: str = "") -> str:
-    candidates = [
-        data.get("url"),
-        data.get("path"),
-        data.get("source"),
-        data.get("file"),
-        data.get("file_"),
-        data.get("attachment_id"),
-    ]
+    candidates = [data.get(key) for key in MEDIA_SOURCE_KEYS]
     normalized = [normalize_source(value) for value in candidates if value not in (None, "")]
     normalized = [value for value in normalized if value and not _is_placeholder_source(value)]
     name = str(data.get("name") or data.get("filename") or data.get("file_name") or data.get("fileName") or "")

@@ -2,6 +2,13 @@
 
 ## 未发布
 
+## v0.6.4 - 2026-06-01
+
+- 修复：aiocqhttp/OneBot 视频引用不再只按 NapCat 字段解析，新增兼容 `download_url`、`file_url`、`media_url`、`cdn_url`、`file_path`、`absolute_path`、`local_path` 等协议端字段，覆盖 LLOneBot、NapCat、Shamrock 等常见返回组合。
+- 修复：引用视频只有 `file_id` 或裸 `file=xxx.mp4` 时仍不会误当成本地路径；会优先使用真实 URL/可读本地文件，再走 `get_file`、`get_group_file_url`、`get_private_file_url` 兜底。
+- 文档：新增 QQ 空间 daemon 原生视频发布逆向记录，明确当前真视频直发需要复现 QQ 客户端的 `QZoneVideoUploadTask` / Tencent upload SDK 上传协议；现阶段 daemon 继续稳定回退为视频封面图发布。
+- 测试：补充协议端 `download_url`、对象 `file_url`、`get_file` 返回下载地址、群文件 URL 返回地址等回归用例。
+
 ## v0.6.3 - 2026-06-01
 
 - 修复：引用视频时不再把不存在的 NTQQ/OneBot 本地缓存路径（例如 `D:Documents\Tencent Files\...\Video\...\xxx.mp4`）直接当作可提取封面的文件；只有当前机器确实可读的本地视频路径才会进入发布流程。

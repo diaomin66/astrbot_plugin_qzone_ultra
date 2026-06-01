@@ -671,6 +671,8 @@ from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneC
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.local_media import resolve_trusted_local_media_path
 from qzone_bridge.media import (
+    MEDIA_LOCAL_SOURCE_KEYS,
+    MEDIA_URL_SOURCE_KEYS,
     PostMedia,
     PostPayload,
     QZONE_VIDEO_SUFFIXES,
@@ -2653,18 +2655,47 @@ class QzoneStablePlugin(Star):
             "message",
             "file_",
             "url",
+            "download_url",
+            "downloadUrl",
+            "file_url",
+            "fileUrl",
+            "media_url",
+            "mediaUrl",
+            "origin_url",
+            "originUrl",
+            "original_url",
+            "originalUrl",
+            "cdn_url",
+            "cdnUrl",
+            "preview_url",
+            "previewUrl",
             "path",
+            "file_path",
+            "filePath",
+            "absolute_path",
+            "absolutePath",
+            "abs_path",
+            "absPath",
+            "local_path",
+            "localPath",
+            "source",
+            "src",
             "name",
             "filename",
             "file_name",
+            "fileName",
             "mime",
             "mime_type",
             "size",
             "file_size",
+            "fileSize",
             "file_id",
+            "fileId",
             "file_unique",
+            "fileUnique",
             "id",
             "message_id",
+            "messageId",
             "seq",
             "chain",
         ):
@@ -2719,7 +2750,8 @@ class QzoneStablePlugin(Star):
         kind: str = "",
         require_existing_local: bool = False,
     ) -> str:
-        for key in ("url", "path", "source", "file", "file_", "file_path", "absolute_path", "abs_path"):
+        source_keys = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS
+        for key in source_keys:
             source = cls._usable_media_source(data.get(key))
             if source:
                 if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
@@ -2896,7 +2928,14 @@ class QzoneStablePlugin(Star):
         data: dict[str, Any],
         event: AstrMessageEvent | None,
     ) -> PostMedia | None:
-        file_id = str(data.get("file_id") or data.get("fileId") or data.get("file") or "").strip()
+        file_id = str(
+            data.get("file_id")
+            or data.get("fileId")
+            or data.get("file_unique")
+            or data.get("fileUnique")
+            or data.get("file")
+            or ""
+        ).strip()
         if not file_id or self._source_placeholder(file_id):
             return None
         calls: list[tuple[str, dict[str, Any]]] = []
