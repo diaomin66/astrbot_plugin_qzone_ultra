@@ -18,12 +18,30 @@ from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import configure_standalone_logging, get_logger
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .local_media import resolve_trusted_local_media_path
 from .media import (
     QZONE_MAX_IMAGES,
+    QZONE_VIDEO_SUFFIXES,
+    PostMedia,
+    PostPayload,
     media_reference_text,
     normalize_media_list,
+    normalize_source,
     sanitize_publish_content,
     split_publishable_images,
+    source_name,
+)
+from .native_video import _probe_video_duration_ms, native_video_candidate
+from .tencent_upload import (
+    QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+    QzoneNativeVideoCredentialError,
+    QzoneTencentVideoUploader,
+    QzoneTencentVideoUploadError,
+    TencentUploadPduError,
+    TencentUploadProtocolError,
+    encode_video_shuoshuo_upload_finish_uni_attribute,
+    qzone_video_upload_credentials_configured,
+    qzone_video_upload_credentials_from_env,
 )
 from .video import materialize_video_cover_list, materialize_video_source_list
 from .models import FeedEntry, SessionState
@@ -159,6 +177,24 @@ async def _bridge_response(service: "QzoneDaemonService", action) -> web.Respons
         service._set_error(exc)
         return fail(exc.code, exc.message, detail=_error_detail(exc))
     return ok(payload)
+
+
+def _trusted_daemon_video_path(video: PostMedia) -> Path | None:
+    if not video.trusted_local:
+        return None
+    source = normalize_source(video.source)
+    return resolve_trusted_local_media_path(
+        source,
+        name=video.name or source_name(source),
+        suffixes=QZONE_VIDEO_SUFFIXES,
+    )
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 class QzoneDaemonService:
@@ -707,6 +743,79 @@ class QzoneDaemonService:
         self._set_success(defer_save=True)
         return {"items": visitors, "count": len(visitors), "raw": payload}
 
+    async def _publish_native_video_if_configured(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool,
+        media: list[PostMedia],
+    ) -> dict[str, Any] | None:
+        if not qzone_video_upload_credentials_configured():
+            return None
+        video = native_video_candidate(PostPayload(content=content, media=list(media)))
+        if video is None:
+            return None
+        path = _trusted_daemon_video_path(video)
+        if path is None:
+            return None
+        self._ensure_session_ready()
+        try:
+            credentials = qzone_video_upload_credentials_from_env()
+        except QzoneNativeVideoCredentialError as exc:
+            raise QzoneParseError(str(exc)) from exc
+        duration_ms = _probe_video_duration_ms(path)
+        file_size = _file_size(path)
+        client_key = f"{self.state.session.uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+        try:
+            uploader = QzoneTencentVideoUploader(
+                uin=self.state.session.uin,
+                login_data=credentials.login_data,
+                login_key=credentials.login_key,
+                token_type=credentials.token_type,
+                token_appid=credentials.token_appid,
+                token_wt_appid=credentials.token_wt_appid,
+                timeout=float(getattr(self.client, "timeout", 30.0) or 30.0),
+            )
+            result = await asyncio.to_thread(
+                uploader.upload_video,
+                path,
+                title=video.name or path.name,
+                desc=content,
+                play_time=duration_ms,
+                publish_content=content,
+                sync_weibo=sync_weibo,
+                client_key=client_key,
+                business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+            )
+        except QzoneNativeVideoCredentialError as exc:
+            raise QzoneParseError(str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise QzoneParseError("视频文件不存在，无法进行原生视频后台上传", detail={"path": str(path)}) from exc
+        except (OSError, TencentUploadPduError, TencentUploadProtocolError, QzoneTencentVideoUploadError) as exc:
+            raise QzoneRequestError("QQ 空间原生视频后台上传失败", detail={"type": type(exc).__name__, "message": str(exc)}) from exc
+        finish_report = encode_video_shuoshuo_upload_finish_uni_attribute(
+            uin=self.state.session.uin,
+            size=file_size,
+            time_length=duration_ms,
+        )
+        return {
+            "fid": "",
+            "vid": result.vid,
+            "message": "已提交 QQ 空间原生视频后台上传发布",
+            "native_video": True,
+            "status": "submitted_native_upload",
+            "operation_status": "accepted_pending_verification",
+            "media_count": len(media),
+            "photo_count": 0,
+            "raw": {
+                "upload_result": result.to_dict(),
+                "credentials": credentials.to_dict(),
+                "finish_report_payload_length": len(finish_report),
+                "video": video.to_dict(),
+                "client_key": client_key,
+            },
+        }
+
     async def publish_post(
         self,
         *,
@@ -721,6 +830,14 @@ class QzoneDaemonService:
             normalized_media,
             self.store.root / "video_sources",
         )
+        native_payload = await self._publish_native_video_if_configured(
+            content=content,
+            sync_weibo=sync_weibo,
+            media=normalized_media,
+        )
+        if native_payload is not None:
+            self._set_success(defer_save=True)
+            return native_payload
         normalized_media, _video_covers_changed = materialize_video_cover_list(
             normalized_media,
             self.store.root / "video_covers",

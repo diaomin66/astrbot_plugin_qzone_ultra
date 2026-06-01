@@ -77,18 +77,18 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - `encode_file_batch_control_req()` / `decode_file_batch_control_rsp()`
 - `encode_file_upload_req()` / `decode_file_upload_rsp()`
 - `QzoneTencentVideoUploader`：可按控制包、分片包顺序走 socket/PDU/JCE 上传流程，成功响应里解析 `sVid/iBusiNessType/vBusiNessData`。
-- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项已经从编码层收敛为 QQ upload 二进制登录材料和最终发布 RPC。
+- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项已经从编码层收敛为 QQ upload 二进制登录材料；录制视频说说的发布体已确认嵌入 `UploadVideoInfoReq.vBusiNessData`。
 
-这一步还不是直发完成，但它把“已确认的 wire protocol”从文档变成可回归测试的代码边界。后续只要补上 `vLoginData/vLoginKey` 来源和最终发布 RPC，就可以把上传成功返回的 `sVid/vBusiNessData` 接到 daemon 原生发布里，而不是继续只停留在文档推测。
+这一步把“已确认的 wire protocol”从文档变成可回归测试的代码边界。v0.6.8 继续确认了录制视频说说的发布体其实嵌在 `vBusiNessData` 中；后续真正依赖外部补齐的是 `vLoginData/vLoginKey` 这类 QQ upload 二进制登录材料。
 
 ## 需要继续逆向的点
 
 要让 daemon 真正原生发视频，必须补齐以下协议，而不是复用图片说说接口：
 
 1. `vLoginData/vLoginKey` 的生成来源，尤其是 QQ 登录态、设备态、uin、skey/pt4_token 之外的二进制字段，以及 `ITokenEncryptor` 是否在 QQ/Qzone 运行时被替换。
-2. `vBusiNessData` 的结构，以及它和 `UploadVideoInfoRsp.sVid`、最终说说发布请求之间的关系。
+2. `vBusiNessData` 的结构已确认包含 `UniAttribute(hostuin, publishmood)`；后续需要继续实测不同来源、同步选项、权限设置下的扩展字段差异。
 3. 视频封面、时长、宽高、转码/原画、`needProcess` 等字段在上传 SDK 与最终发布模型中的映射。
-4. 成功上传后最终发布说说的 RPC/CGI 请求体，确认它是否能在 PC Cookie 登录态下复现。
+4. 成功上传后的 `rptVSUploadFinish` 上报是否必需，以及它是否需要 WNS/移动端 SSO 会话才能补发。
 
 ## 当前实现策略
 
@@ -96,4 +96,24 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - 裸 `file` / `file_id` 只当作文件标识或文件名，不当作本地路径。
 - 如果视频源可读取，daemon 先本地化视频再提取封面，然后按图片说说发布，渲染图保留视频播放标识。
 - 单个本地视频仍可使用 `mqqapi://qzone/publish` 唤起 QQ/QQNT 原生发布窗口；这是客户端确认路径，不是 daemon 后台直发。
-- daemon 原生视频发布应作为后续实验功能单独加开关，必须在抓包和 SDK 协议复现后再接入；失败时继续回退到封面图发布。
+- daemon 原生视频发布现在作为实验链路接入：仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或不适合原生发布时继续回退到客户端确认或封面图发布。
+
+## v0.6.8 进展：发布体嵌入上传业务数据
+
+继续追 `QZoneUploadShuoShuoTask.getUploadMoodBytes4RecordVideo()` 后，确认普通“录制视频说说”不是在上传成功后再单独调用一个最终发布 RPC。客户端会先构造 `QZonePublishMoodRequest`，把 `operation_publishmood_req.mediainfo` 置空，再用 OldUniAttribute 编码：
+
+- `hostuin`：当前登录 QQ 号。
+- `publishmood`：`NS_MOBILE_OPERATION.operation_publishmood_req`，包含正文、同步微博标记、来源 `Source(subtype=0, termtype=4, apptype=1)`、权限 `UgcRightInfo(ugc_right=1)`、`ShootInfo` 和 `extend_info`。
+- `extend_info`：录制视频路径会写入 `iIsOriginalVideo`、`iIsFormatF20`、`videoSize`，以及可能的 `sync` / `sync_qqstory` 等扩展。
+
+这段 UniAttribute 字节会作为 `VideoUploadTask.vBusiNessData`，并将 `VideoUploadTask.iBusiNessType` 置为 `1`。因此 daemon 直发的主链路已经改为：先在 `UploadVideoInfoReq` 中带上 `iBusiNessType=1` 和 `vBusiNessData=UniAttribute(hostuin,publishmood)`，再走 `video_qzone` 控制包与分片上传。
+
+`QZoneVideoShuoshuoUploadFinishRequest` 的命令是 `rptVSUploadFinish`，结构为 `NS_MOBILE_EXTRA.mobile_video_shuoshuo_upload_finish_req(iSize, iTimeLength)`。从调用位置看，它更像上传完成上报/统计，不是发布正文的主入口。
+
+当前代码已把这条链路落地为：
+
+- `encode_record_video_publish_business_data()`：生成 `publishmood` OldUniAttribute。
+- `QzoneTencentVideoUploader.upload_video(..., publish_content=...)`：自动嵌入发布业务体并使用 `iBusiNessType=1`。
+- daemon `publish_post()`：当环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 时，单个本地视频优先交给 Tencent upload 后台路径；未配置时继续走客户端确认或视频封面回退。
+
+仍然必须外部提供 QQ upload 二进制登录材料：`QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`，可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_TYPE`、`QZONE_VIDEO_UPLOAD_TOKEN_APPID`、`QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID`。PC/Web Cookie、`p_skey`、`pt4_token` 不能直接等价为 Tencent upload SDK 的 `vLoginData/vLoginKey`。

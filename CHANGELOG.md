@@ -2,6 +2,14 @@
 
 ## 未发布
 
+## v0.6.8 - 2026-06-01
+
+- 新增：daemon 原生视频直发接入 `UploadVideoInfoReq.vBusiNessData`，按 QQ 空间录制视频说说路径编码 `UniAttribute(hostuin, publishmood)`，并使用 `iBusiNessType=1` 随 Tencent upload 控制包提交。
+- 新增：支持通过 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`、`QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64` 和 `QZONE_VIDEO_UPLOAD_TOKEN_*` 提供 QQ upload 二进制登录材料；未配置时继续回退到客户端确认或视频封面图发布。
+- 修复：有 daemon 上传凭据时，插件入口会把原始视频交给本地 daemon，而不是先唤起 QQ/QQNT 客户端窗口，发布结果渲染仍使用视频封面。
+- 文档：更新 daemon 原生视频逆向记录，明确普通视频说说的发布体嵌在上传业务数据中，`rptVSUploadFinish` 更像上传完成上报，不再把“最终发布 RPC”列为当前主阻塞点。
+- 测试：补充 publishmood OldUniAttribute 编码、环境凭据解析、daemon 直发分支和插件入口选择的回归用例。
+
 ## v0.6.7 - 2026-06-01
 
 - 新增：实现 Tencent upload SDK 所需的最小 JCE/Tars 编解码层，覆盖 `AuthToken`、`FileControlReq`、`FileBatchControlReq/Rsp`、`FileUploadReq/Rsp`、`UploadVideoInfoReq/Rsp` 等已确认 schema。

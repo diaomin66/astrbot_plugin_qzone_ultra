@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060107
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060108
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -711,6 +711,7 @@ from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
+from qzone_bridge.tencent_upload import qzone_video_upload_credentials_configured
 from qzone_bridge.video import materialize_video_covers, materialize_video_sources
 import qzone_bridge.publish_renderer as _publish_renderer
 try:
@@ -3145,6 +3146,14 @@ class QzoneStablePlugin(Star):
         render_post: PostPayload | None = None
         if getattr(self.settings, "native_video_publish", True) and native_video_candidate(post) is not None:
             render_post = await self._prepare_publish_payload(post)
+            if qzone_video_upload_credentials_configured():
+                payload = await self.controller.publish_post(
+                    content=post.content,
+                    sync_weibo=sync_weibo,
+                    media=[item.to_dict() for item in [*post.media, *post.attachments]],
+                    content_sanitized=True,
+                )
+                return render_post, payload
             try:
                 native_result = await asyncio.to_thread(
                     publish_native_video_post,

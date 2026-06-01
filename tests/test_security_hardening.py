@@ -1729,6 +1729,65 @@ def test_daemon_publish_post_materializes_video_without_reference(
     assert payload["media_count"] == 1
 
 
+def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.media import PostMedia
+    from qzone_bridge.models import SessionState
+
+    captured: dict[str, object] = {}
+
+    class _Uploader:
+        def __init__(self, **kwargs):
+            captured["uploader_kwargs"] = kwargs
+
+        def upload_video(self, path, **kwargs):
+            captured["upload_path"] = path
+            captured["upload_kwargs"] = kwargs
+            return types.SimpleNamespace(
+                vid="vid-1",
+                business_type=1,
+                business_data=b"biz",
+                uploaded_bytes=5,
+                session="session-1",
+                to_dict=lambda: {
+                    "vid": "vid-1",
+                    "business_type": 1,
+                    "business_data_length": 3,
+                    "uploaded_bytes": 5,
+                    "session": "session-1",
+                },
+            )
+
+    monkeypatch.setenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", base64.b64encode(b"login-data").decode("ascii"))
+    monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
+    monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+    service.client = types.SimpleNamespace(timeout=1.5)
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert payload["native_video"] is True
+    assert payload["status"] == "submitted_native_upload"
+    assert payload["vid"] == "vid-1"
+    assert captured["upload_path"] == video_path
+    assert captured["upload_kwargs"]["publish_content"] == "hello"
+    assert captured["upload_kwargs"]["play_time"] == 2345
+    assert captured["uploader_kwargs"]["login_data"] == b"login-data"
+
+
 def test_native_qzone_video_publish_uri_encodes_opensdk_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1882,7 +1941,10 @@ def test_tencent_upload_pdu_rejects_malformed_frame() -> None:
         decode_upload_pdu(b"\x03" + b"\x00" * 23 + b"\x05")
 
 
-def test_qzone_video_upload_probe_documents_missing_daemon_requirements(tmp_path: Path) -> None:
+def test_qzone_video_upload_probe_documents_missing_daemon_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     from qzone_bridge.tencent_upload import (
         QZONE_VIDEO_UPLOAD_APPID,
         QZONE_VIDEO_UPLOAD_BACKUP_HOST,
@@ -1892,6 +1954,8 @@ def test_qzone_video_upload_probe_documents_missing_daemon_requirements(tmp_path
         TENCENT_UPLOAD_CMD_FILE,
         qzone_video_upload_probe,
     )
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
 
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"fake video bytes")
@@ -1907,8 +1971,8 @@ def test_qzone_video_upload_probe_documents_missing_daemon_requirements(tmp_path
     assert probe["video_readable"] is True
     implemented = {item["name"] for item in probe["requirements"] if item["status"] == "implemented"}
     missing = {item["name"] for item in probe["requirements"] if item["status"] == "missing"}
-    assert {"jce_codec", "socket_upload_client"} <= implemented
-    assert {"qq_upload_login_material", "native_publish_rpc"} <= missing
+    assert {"jce_codec", "socket_upload_client", "publishmood_business_data"} <= implemented
+    assert {"qq_upload_login_material"} <= missing
 
 
 def test_plugin_collects_quoted_video_from_onebot_get_msg(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2748,6 +2812,64 @@ def test_plugin_publish_prefers_native_video_handoff(
     assert payload["status"] == "pending_user_confirm"
     assert payload["photo_count"] == 1
     assert payload["raw"]["native_video_uri"].startswith("mqqapi://qzone/publish")
+
+
+def test_plugin_publish_sends_original_video_to_daemon_when_upload_credentials_exist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    original = main.PostPayload(
+        content="hello",
+        media=[
+            main.PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+    cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_prepare(post):
+        assert post is original
+        return cover
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {"vid": "vid-1", "native_video": True, "status": "submitted_native_upload"}
+
+    def forbidden_native(*_args, **_kwargs):
+        raise AssertionError("client handoff should not run when daemon upload credentials exist")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    monkeypatch.setattr(main, "qzone_video_upload_credentials_configured", lambda: True)
+    monkeypatch.setattr(main, "publish_native_video_post", forbidden_native)
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
+
+    assert render_post is cover
+    assert payload["vid"] == "vid-1"
+    assert captured["publish_kwargs"] == {
+        "content": "hello",
+        "sync_weibo": False,
+        "media": [original.media[0].to_dict()],
+        "content_sanitized": True,
+    }
 
 
 def test_plugin_publish_falls_back_to_cover_when_native_unavailable(

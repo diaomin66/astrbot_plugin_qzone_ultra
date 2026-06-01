@@ -147,7 +147,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `trigger.comment_cron` | 空 | 自动评论 cron 表达式；空表示关闭 |
 | `trigger.comment_latest_count` | `1` | 每次定时自动评论从好友最新动态中处理的未评论说说条数 |
 
-`native_video_publish` 当前是 QQ 客户端唤起/人工确认路径，不是 daemon 后台真视频直发。daemon 原生视频直发正在按 Tencent upload SDK 逆向推进，已落地 `video_qzone`、`video.upqzfile.com:80`、PDU 帧、cmd=1/2、最小 JCE/Tars schema 和分片上传客户端；真正后台直发还需要拿到 QQ upload 二进制登录材料，并补齐消费 `sVid/vBusiNessData` 的最终发布 RPC。
+`native_video_publish` 开启后，单个本地视频会优先走原生视频路径：如果 daemon 进程环境里配置了 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`（可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_*`），会按 Tencent upload SDK 的 `video_qzone` 协议提交视频，并把 `publishmood` 业务体嵌入 `UploadVideoInfoReq.vBusiNessData` 触发后台发布；未配置 QQ upload 二进制登录材料时，仍回退到 QQ/QQNT 客户端确认窗口或视频封面图发布。PC Cookie 不能直接生成这份二进制上传登录材料。
 | `trigger.read_prob` | `0.0` | 收到消息时概率触发读说说和自动评论 |
 | `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；收到消息概率触发的自动评论会发回当前会话 |
 | `news.scopes` | `["china"]` | 新闻范围，可填 `china`、`world`、`mixed`，也支持 `中国`、`国际`、`混合` |

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import asdict, dataclass, field
 import hashlib
+import os
 from pathlib import Path
 import socket
 import time
@@ -30,6 +33,12 @@ QZONE_VIDEO_UPLOAD_PORT = 80
 QZONE_VIDEO_FILE_TYPE = "Video"
 QZONE_VIDEO_BUSINESS_TYPE = "QZoneVideo"
 QZONE_VIDEO_CONNECT_TYPE = "Epoll"
+QZONE_RECORD_VIDEO_BUSINESS_TYPE = 1
+QZONE_PUBLISH_MOOD_UNI_KEY = "publishmood"
+QZONE_PUBLISH_MOOD_TYPE = "NS_MOBILE_OPERATION.operation_publishmood_req"
+QZONE_VIDEO_UPLOAD_FINISH_UNI_KEY = "rptVSUploadFinish"
+QZONE_VIDEO_UPLOAD_FINISH_TYPE = "NS_MOBILE_EXTRA.mobile_video_shuoshuo_upload_finish_req"
+QZONE_UNI_INT64_TYPE = "int64"
 
 TENCENT_UPLOAD_CMD_CONTROL = 1
 TENCENT_UPLOAD_CMD_FILE = 2
@@ -150,6 +159,24 @@ class AuthToken:
     ext_key: bytes = b""
     appid: int = 0
     wt_appid: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class QzoneVideoUploadCredentials:
+    login_data: bytes
+    login_key: bytes = b""
+    token_type: int = TENCENT_UPLOAD_TOKEN_ENC_TYPE
+    token_appid: int = 0
+    token_wt_appid: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "login_data_length": len(self.login_data),
+            "login_key_length": len(self.login_key),
+            "token_type": self.token_type,
+            "token_appid": self.token_appid,
+            "token_wt_appid": self.token_wt_appid,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +375,144 @@ def decode_upload_video_info_rsp(payload: bytes) -> UploadVideoInfoRsp:
     )
 
 
+def encode_old_uni_attribute(entries: dict[str, tuple[str, Any]]) -> bytes:
+    """Encode the old WUP UniAttribute map used by Qzone mobile requests."""
+
+    wrapped: dict[str, dict[str, bytes]] = {}
+    for key, (type_name, value) in entries.items():
+        key_text = str(key or "")
+        type_text = str(type_name or "")
+        if not key_text or not type_text:
+            raise TencentUploadProtocolError("UniAttribute entries require non-empty key and type name")
+        wrapped[key_text] = {type_text: encode_struct([JceField(0, value)])}
+    return encode_struct([JceField(0, wrapped)])
+
+
+def operation_publish_mood_req_struct(
+    *,
+    uin: int | str,
+    content: str,
+    sync_weibo: bool = False,
+    weibourl: str = "",
+    media_type: int = 0,
+    media_bit_type: int = 0,
+    busi_param: dict[Any, Any] | None = None,
+    client_key: str = "",
+    publish_time: int = 0,
+    media_sub_type: int = 0,
+    srcid: str = "",
+    modify_flag: int = 0,
+    extend_info: dict[Any, Any] | None = None,
+    stored_extend_info: dict[Any, Any] | None = None,
+    proto_extend_info: dict[Any, Any] | None = None,
+    source_subtype: int = 0,
+    source_termtype: int = 4,
+    source_apptype: int = 1,
+    ugc_right: int = 1,
+    shoot_time: int = 0,
+) -> Any:
+    fields = [
+        JceField(0, int(uin or 0)),
+        JceField(1, str(content or "")),
+        JceField(2, True),
+        JceField(3, bool(sync_weibo)),
+        JceField(4, str(weibourl or "")),
+        JceField(5, int(media_type or 0)),
+        JceField(8, _source_struct(source_subtype, source_termtype, source_apptype)),
+        JceField(9, int(media_bit_type or 0)),
+    ]
+    if busi_param is not None:
+        fields.append(JceField(10, dict(busi_param)))
+    fields.extend(
+        [
+            JceField(11, str(client_key or "")),
+            JceField(12, ""),
+            JceField(13, _ugc_right_info_struct(ugc_right)),
+            JceField(14, _shoot_info_struct(shoot_time)),
+            JceField(15, int(publish_time or 0)),
+            JceField(16, int(media_sub_type or 0)),
+            JceField(17, str(srcid or "")),
+            JceField(18, int(modify_flag or 0)),
+        ]
+    )
+    if extend_info is not None:
+        fields.append(JceField(19, dict(extend_info)))
+    fields.extend(
+        [
+            JceField(20, ""),
+            JceField(21, ""),
+            JceField(22, 0),
+            JceField(23, ""),
+            JceField(25, 0),
+            JceField(26, 0),
+            JceField(27, 0),
+        ]
+    )
+    if stored_extend_info is not None:
+        fields.append(JceField(28, dict(stored_extend_info)))
+    if proto_extend_info is not None:
+        fields.append(JceField(29, dict(proto_extend_info)))
+    return jce_struct(fields)
+
+
+def encode_record_video_publish_business_data(
+    *,
+    uin: int | str,
+    content: str,
+    video_size: int = 0,
+    sync_weibo: bool = False,
+    client_key: str = "",
+    publish_time: int = 0,
+    media_type: int = 0,
+    media_bit_type: int = 0,
+    media_sub_type: int = 0,
+    is_original_video: int = 0,
+    is_format_f20: int = 0,
+    shoot_params: dict[Any, Any] | None = None,
+    stored_extend_info: dict[Any, Any] | None = None,
+    proto_extend_info: dict[Any, Any] | None = None,
+) -> bytes:
+    extend_info = {str(key): value for key, value in dict(shoot_params or {}).items()}
+    extend_info.setdefault("iIsOriginalVideo", str(int(is_original_video or 0)))
+    extend_info.setdefault("iIsFormatF20", str(int(is_format_f20 or 0)))
+    if int(video_size or 0) > 0:
+        extend_info.setdefault("videoSize", str(int(video_size)))
+    publish_req = operation_publish_mood_req_struct(
+        uin=uin,
+        content=content,
+        sync_weibo=sync_weibo,
+        client_key=client_key,
+        publish_time=publish_time,
+        media_type=media_type,
+        media_bit_type=media_bit_type,
+        media_sub_type=media_sub_type,
+        extend_info=extend_info,
+        stored_extend_info=stored_extend_info,
+        proto_extend_info=proto_extend_info,
+    )
+    return encode_old_uni_attribute(
+        {
+            "hostuin": (QZONE_UNI_INT64_TYPE, int(uin or 0)),
+            QZONE_PUBLISH_MOOD_UNI_KEY: (QZONE_PUBLISH_MOOD_TYPE, publish_req),
+        }
+    )
+
+
+def encode_video_shuoshuo_upload_finish_uni_attribute(
+    *,
+    uin: int | str,
+    size: int,
+    time_length: int,
+) -> bytes:
+    finish_req = jce_struct([JceField(0, int(size or 0)), JceField(1, int(time_length or 0))])
+    return encode_old_uni_attribute(
+        {
+            "hostuin": (QZONE_UNI_INT64_TYPE, int(uin or 0)),
+            QZONE_VIDEO_UPLOAD_FINISH_UNI_KEY: (QZONE_VIDEO_UPLOAD_FINISH_TYPE, finish_req),
+        }
+    )
+
+
 def encode_auth_token(token: AuthToken) -> bytes:
     return encode_struct(
         [
@@ -481,12 +646,32 @@ def sha1_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def qzone_video_upload_credentials_configured(env: dict[str, str] | None = None) -> bool:
+    env_map = env if env is not None else os.environ
+    return bool(_env_text(env_map, "QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", "QZONE_UPLOAD_LOGIN_DATA_B64"))
+
+
+def qzone_video_upload_credentials_from_env(env: dict[str, str] | None = None) -> QzoneVideoUploadCredentials:
+    env_map = env if env is not None else os.environ
+    login_data = _env_base64(env_map, "QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", "QZONE_UPLOAD_LOGIN_DATA_B64")
+    if not login_data:
+        raise QzoneNativeVideoCredentialError(
+            "daemon 原生视频上传缺少 QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64，无法生成 Tencent upload AuthToken"
+        )
+    return QzoneVideoUploadCredentials(
+        login_data=login_data,
+        login_key=_env_base64(env_map, "QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64", "QZONE_UPLOAD_LOGIN_KEY_B64"),
+        token_type=_env_int(env_map, TENCENT_UPLOAD_TOKEN_ENC_TYPE, "QZONE_VIDEO_UPLOAD_TOKEN_TYPE"),
+        token_appid=_env_int(env_map, 0, "QZONE_VIDEO_UPLOAD_TOKEN_APPID"),
+        token_wt_appid=_env_int(env_map, 0, "QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID"),
+    )
+
+
 class QzoneTencentVideoUploader:
     """Synchronous Tencent upload SDK client for daemon-side video experiments.
 
-    This implements the socket/PDU/JCE upload layer. A complete background
-    Qzone publish still also needs valid QQ upload login material and the final
-    Qzone publish RPC that consumes UploadVideoInfoRsp.
+    This implements the socket/PDU/JCE upload layer. For record-video shuoshuo
+    it can embed the mobile publishmood UniAttribute in UploadVideoInfoReq.
     """
 
     def __init__(
@@ -534,11 +719,41 @@ class QzoneTencentVideoUploader:
         extend_info: dict[str, str] | None = None,
         width: int = 0,
         height: int = 0,
+        publish_content: str | None = None,
+        sync_weibo: bool = False,
+        client_key: str = "",
+        publish_time: int = 0,
+        is_original_video: int = 0,
+        is_format_f20: int = 0,
+        media_type: int = 0,
+        media_bit_type: int = 0,
+        media_sub_type: int = 0,
+        shoot_params: dict[Any, Any] | None = None,
+        stored_extend_info: dict[Any, Any] | None = None,
+        proto_extend_info: dict[Any, Any] | None = None,
     ) -> QzoneTencentVideoUploadResult:
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(str(path))
         file_size = path.stat().st_size
+        if not business_data and publish_content is not None:
+            business_data = encode_record_video_publish_business_data(
+                uin=self.uin,
+                content=publish_content,
+                video_size=file_size,
+                sync_weibo=sync_weibo,
+                client_key=client_key,
+                publish_time=publish_time,
+                media_type=media_type,
+                media_bit_type=media_bit_type,
+                media_sub_type=media_sub_type,
+                is_original_video=is_original_video,
+                is_format_f20=is_format_f20,
+                shoot_params=shoot_params,
+                stored_extend_info=stored_extend_info,
+                proto_extend_info=proto_extend_info,
+            )
+            business_type = int(business_type or QZONE_RECORD_VIDEO_BUSINESS_TYPE)
         info_req = UploadVideoInfoReq(
             title=title or path.name,
             desc=desc,
@@ -547,6 +762,8 @@ class QzoneTencentVideoUploader:
             business_data=business_data,
             play_time=play_time,
             cover_url=cover_url,
+            is_original_video=is_original_video,
+            is_format_f20=is_format_f20,
             extend_info=dict(extend_info or {}),
             width=width,
             height=height,
@@ -654,6 +871,7 @@ class QzoneTencentVideoUploader:
 
 
 def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> QzoneVideoUploadProtocolSpec:
+    credentials_ready = qzone_video_upload_credentials_configured()
     requirements = (
         NativeVideoDaemonRequirement(
             name="jce_codec",
@@ -666,14 +884,14 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
             detail="Implemented PDU/JCE control and slice upload client for video_qzone; it requires valid QQ upload login material at runtime.",
         ),
         NativeVideoDaemonRequirement(
-            name="qq_upload_login_material",
-            status="missing",
-            detail="Need vLoginData and vLoginKey compatible with TokenProvider.getAuthToken; current PC Qzone cookies do not prove this binary login material.",
+            name="publishmood_business_data",
+            status="implemented",
+            detail="Record-video shuoshuo uses UniAttribute(hostuin, publishmood) as UploadVideoInfoReq.vBusiNessData/iBusiNessType=1 instead of a separate final publish RPC.",
         ),
         NativeVideoDaemonRequirement(
-            name="native_publish_rpc",
-            status="missing",
-            detail="Need the final publish RPC body that consumes UploadVideoInfoRsp.sVid and vBusiNessData after Tencent upload succeeds.",
+            name="qq_upload_login_material",
+            status="configured" if credentials_ready else "missing",
+            detail="Need vLoginData and optional vLoginKey compatible with TokenProvider.getAuthToken; configure QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64 for daemon background upload.",
         ),
     )
     sequence = (
@@ -690,16 +908,16 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
             "response": "FileUpload/UploadVideoInfoRsp when the upload finishes",
         },
         {
-            "step": "publish",
-            "cmd": "unknown",
-            "jce": "Qzone publish queue/RPC still under reverse engineering",
-            "input": "UploadVideoInfoRsp.sVid and vBusiNessData",
+            "step": "publish_business_data",
+            "cmd": "embedded",
+            "jce": "UniAttribute(hostuin, publishmood)",
+            "input": "UploadVideoInfoReq.iBusiNessType=1 and vBusiNessData before slice upload",
         },
     )
     return QzoneVideoUploadProtocolSpec(
         request_sequence=sequence,
         requirements=requirements,
-        daemon_ready=False,
+        daemon_ready=credentials_ready,
     )
 
 
@@ -710,8 +928,8 @@ def qzone_video_upload_probe(video_path: str | Path | None = None) -> dict[str, 
     payload["video_path"] = str(path) if path else ""
     payload["video_readable"] = bool(path and path.is_file())
     payload["reason"] = (
-        "daemon native video upload wire protocol is implemented, but true background video publishing still needs "
-        "QQ upload login material and the final Qzone publish RPC"
+        "daemon native video upload and record-video publish business data are implemented; true background publishing "
+        "requires QQ upload login material via QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64"
     )
     return payload
 
@@ -736,6 +954,48 @@ def _file_control_req_fields(request: FileControlReq) -> list[JceField]:
     if request.dump_req is not None:
         fields.insert(12, JceField(12, request.dump_req))
     return fields
+
+
+def _source_struct(subtype: int, termtype: int, apptype: int) -> Any:
+    return jce_struct([JceField(0, int(subtype or 0)), JceField(1, int(termtype or 0)), JceField(2, int(apptype or 0))])
+
+
+def _ugc_right_info_struct(ugc_right: int) -> Any:
+    return jce_struct([JceField(0, int(ugc_right or 0))])
+
+
+def _shoot_info_struct(shoot_time: int) -> Any:
+    return jce_struct([JceField(1, int(shoot_time or 0))])
+
+
+def _env_text(env: dict[str, str] | os._Environ[str], *keys: str) -> str:
+    for key in keys:
+        value = str(env.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _env_base64(env: dict[str, str] | os._Environ[str], *keys: str) -> bytes:
+    for key in keys:
+        value = str(env.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            return base64.b64decode("".join(value.split()), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise QzoneNativeVideoCredentialError(f"{key} 不是合法的 base64 QQ upload 登录材料") from exc
+    return b""
+
+
+def _env_int(env: dict[str, str] | os._Environ[str], default: int, *keys: str) -> int:
+    value = _env_text(env, *keys)
+    if not value:
+        return int(default)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise QzoneNativeVideoCredentialError(f"{keys[0]} 必须是整数") from exc
 
 
 def _recv_exact(sock: Any, length: int) -> bytes:
