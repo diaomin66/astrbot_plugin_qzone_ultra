@@ -1661,6 +1661,7 @@ def test_daemon_publish_post_materializes_video_without_reference(
         mime_type="video/mp4",
         trusted_local=True,
     )
+    Path(video.source).write_bytes(b"fake video bytes")
 
     payload = asyncio.run(
         service.publish_post(
@@ -1827,6 +1828,198 @@ def test_plugin_collects_quoted_video_from_onebot_get_msg(monkeypatch: pytest.Mo
     assert len(post.media) == 1
     assert post.media[0].kind == "video"
     assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert post.media[0].trusted_local is True
+
+
+def test_collect_message_media_parses_raw_cq_video_url() -> None:
+    from qzone_bridge.media import collect_message_media, iter_reference_message_ids
+
+    payload = {
+        "raw_message": "[CQ:reply,id=123456][CQ:video,file=clip.mp4,url=https://example.test/video/clip.mp4]"
+    }
+
+    media = collect_message_media(payload)
+
+    assert iter_reference_message_ids(types.SimpleNamespace(message_obj=types.SimpleNamespace(raw_message=payload))) == [
+        123456
+    ]
+    assert len(media) == 1
+    assert media[0].kind == "video"
+    assert media[0].source == "https://example.test/video/clip.mp4"
+    assert media[0].trusted_local is True
+
+
+def test_collect_message_media_does_not_treat_bare_onebot_video_file_as_path() -> None:
+    from qzone_bridge.media import collect_message_media
+
+    payload = {
+        "message": [
+            {
+                "type": "video",
+                "data": {
+                    "file": "95d20307dfb960194a9210eff4824876.mp4",
+                    "url": "empty",
+                    "path": "empty",
+                    "file_id": "file-id-1",
+                },
+            }
+        ]
+    }
+
+    assert collect_message_media(payload) == []
+
+
+def test_collect_post_payload_promotes_mp4_file_segment_with_url_to_video() -> None:
+    from qzone_bridge.media import collect_post_payload
+
+    event = types.SimpleNamespace(
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "text", "data": {"text": "post hello"}},
+                {
+                    "type": "file",
+                    "data": {
+                        "file": "clip.mp4",
+                        "url": "https://example.test/video/clip.mp4",
+                        "mime": "video/mp4",
+                    },
+                },
+            ]
+        )
+    )
+
+    post = collect_post_payload(event, command_prefixes=("post",))
+
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert not post.attachments
+
+
+def test_plugin_resolves_quoted_video_file_id_with_onebot_get_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.get_file_params: list[dict[str, str]] = []
+
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {
+                "data": {
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": "95d20307dfb960194a9210eff4824876.mp4",
+                                "url": "empty",
+                                "path": "empty",
+                                "file_id": "video-file-id",
+                            },
+                        }
+                    ]
+                }
+            }
+
+        async def get_file(self, **params):
+            self.get_file_params.append(params)
+            assert params in ({"file_id": "video-file-id"}, {"file": "video-file-id"})
+            return {"data": {"file": str(source), "file_name": "clip.mp4", "file_size": source.stat().st_size}}
+
+    bot = _Bot()
+    event = types.SimpleNamespace(
+        bot=bot,
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "post hello"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert bot.get_file_params
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].trusted_local is True
+
+
+def test_plugin_collects_quoted_video_from_raw_cq_get_msg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {
+                "data": {
+                    "raw_message": "[CQ:video,file=clip.mp4,url=https://example.test/video/clip.mp4]"
+                }
+            }
+
+    event = types.SimpleNamespace(
+        bot=_Bot(),
+        message_obj=types.SimpleNamespace(raw_message="[CQ:reply,id=123456]post hello"),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert post.media[0].trusted_local is True
+
+
+def test_plugin_collects_astrbot_reply_video_component_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+
+    class _Video:
+        type = "Video"
+        file = "95d20307dfb960194a9210eff4824876.mp4"
+
+        async def convert_to_file_path(self):
+            return str(source)
+
+    class _Reply:
+        type = "Reply"
+        id = 123456
+        chain = [_Video()]
+
+    event = types.SimpleNamespace(
+        message_obj=types.SimpleNamespace(
+            message=[
+                _Reply(),
+                {"type": "text", "data": {"text": "post hello"}},
+            ]
+        )
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].name == "95d20307dfb960194a9210eff4824876.mp4"
     assert post.media[0].trusted_local is True
 
 

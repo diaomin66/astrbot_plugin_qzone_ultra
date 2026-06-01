@@ -25,7 +25,7 @@ from .media import (
     sanitize_publish_content,
     split_publishable_images,
 )
-from .video import materialize_video_cover_list
+from .video import materialize_video_cover_list, materialize_video_source_list
 from .models import FeedEntry, SessionState
 from .parser import (
     compute_unikey,
@@ -717,6 +717,10 @@ class QzoneDaemonService:
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         normalized_media = normalize_media_list(media)
+        normalized_media, _video_sources_changed = materialize_video_source_list(
+            normalized_media,
+            self.store.root / "video_sources",
+        )
         normalized_media, _video_covers_changed = materialize_video_cover_list(
             normalized_media,
             self.store.root / "video_covers",

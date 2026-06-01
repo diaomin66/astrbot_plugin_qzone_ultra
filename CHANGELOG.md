@@ -2,6 +2,12 @@
 
 ## 未发布
 
+## v0.6.2 - 2026-06-01
+
+- 修复：引用视频现在按 aiocqhttp/OneBot 通用消息结构解析，不再只依赖某一个协议端；支持从结构化消息、CQ/raw_message、AstrBot `Reply.chain` 视频组件和 `get_msg` 返回体中提取真实视频源。
+- 修复：当 llbot、NapCat、Shamrock 等协议端只返回 `file=xxx.mp4`、`file_id` 或 `empty` 占位字段时，不再把裸文件名误当成本地路径；会优先使用真实 `url/path`，再尝试 OneBot `get_file`、群/私聊文件 URL 扩展补全。
+- 修复：`type=file` 的 mp4/video MIME 附件会按视频处理，不再拼成 `[文件:xxx]` 文本写进说说；daemon 直发视频也会先本地化视频源再提取封面。
+
 ## v0.6.1 - 2026-06-01
 
 - 修复：引用 NTQQ/OneBot 视频时会优先补查引用消息并读取真实视频段；若平台只返回视频 URL，会先下载到插件缓存再提取封面，避免把 `file=xxx.mp4` 文件名误当成本地路径导致“视频文件不存在，无法提取封面”。
