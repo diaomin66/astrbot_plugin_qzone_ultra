@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
@@ -668,7 +668,15 @@ from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
 from qzone_bridge.llm import QzoneLLM
-from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
+from qzone_bridge.media import (
+    PostMedia,
+    PostPayload,
+    collect_message_media,
+    collect_post_payload,
+    iter_reference_message_ids,
+    normalize_media_list,
+    source_name,
+)
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.native_video import NativeVideoPublishUnavailable, native_video_candidate, publish_native_video_post
 from qzone_bridge.news import (
@@ -685,7 +693,7 @@ from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
-from qzone_bridge.video import materialize_video_covers
+from qzone_bridge.video import materialize_video_covers, materialize_video_sources
 import qzone_bridge.publish_renderer as _publish_renderer
 try:
     import qzone_bridge.compat as _bridge_compat
@@ -1771,6 +1779,19 @@ class QzoneStablePlugin(Star):
             return
         raise AttributeError(f"OneBot client does not support {action}")
 
+    async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
+        method = getattr(bot, action, None)
+        if callable(method):
+            return await self._maybe_await(method(**kwargs))
+        call_action = getattr(bot, "call_action", None)
+        if callable(call_action):
+            return await self._maybe_await(call_action(action, **kwargs))
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+        if callable(call_action):
+            return await self._maybe_await(call_action(action, **kwargs))
+        raise AttributeError(f"OneBot client does not support {action}")
+
     async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> int:
         sent = 0
         manage_group = int(getattr(self.settings, "manage_group", 0) or 0)
@@ -2582,12 +2603,55 @@ class QzoneStablePlugin(Star):
         except ValueError:
             return 0, raw
 
-    def _collect_target_post_payload(self, event: AstrMessageEvent, content: str, prefixes: tuple[str, ...]) -> PostPayload:
+    @staticmethod
+    def _onebot_data_payload(payload: Any) -> Any:
+        if isinstance(payload, dict) and payload.get("data") not in (None, ""):
+            return payload["data"]
+        return payload
+
+    async def _referenced_message_media(self, event: AstrMessageEvent) -> list[PostMedia]:
+        message_ids = iter_reference_message_ids(event)
+        if not message_ids:
+            return []
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            return []
+        media: list[PostMedia] = []
+        for message_id in message_ids:
+            try:
+                payload = await self._query_onebot_action(bot, "get_msg", message_id=message_id)
+            except Exception as exc:
+                logger.debug("qzone referenced message lookup failed message_id=%s: %s", message_id, exc)
+                continue
+            media.extend(collect_message_media(self._onebot_data_payload(payload)))
+        return media
+
+    async def _collect_target_post_payload(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        prefixes: tuple[str, ...],
+        *,
+        include_event_text: bool = True,
+        extra_media: Iterable[Any] | None = None,
+    ) -> PostPayload:
+        referenced_media = await self._referenced_message_media(event)
+        combined_extra_media: list[Any] = [*referenced_media]
+        if extra_media is not None:
+            combined_extra_media.extend(extra_media)
         return collect_post_payload(
             event,
             fallback_content=content,
-            include_event_text=True,
+            include_event_text=include_event_text,
             command_prefixes=prefixes,
+            extra_media=combined_extra_media,
+        )
+
+    async def _prepare_video_sources(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_sources,
+            post,
+            self.data_dir / "video_sources",
         )
 
     async def _prepare_publish_payload(self, post: PostPayload) -> PostPayload:
@@ -2603,6 +2667,7 @@ class QzoneStablePlugin(Star):
         *,
         sync_weibo: bool = False,
     ) -> tuple[PostPayload, dict[str, Any]]:
+        post = await self._prepare_video_sources(post)
         render_post: PostPayload | None = None
         if getattr(self.settings, "native_video_publish", True) and native_video_candidate(post) is not None:
             render_post = await self._prepare_publish_payload(post)
@@ -3851,7 +3916,7 @@ class QzoneStablePlugin(Star):
     async def publish_feed(self, event: AstrMessageEvent, content: str = ""):
         """发布一条 QQ 空间说说，支持文字和图片。"""
         self._stop_event(event)
-        post = self._collect_target_post_payload(event, content, ("发说说",))
+        post = await self._collect_target_post_payload(event, content, ("发说说",))
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
@@ -3879,7 +3944,7 @@ class QzoneStablePlugin(Star):
     async def write_feed(self, event: AstrMessageEvent):
         """根据主题生成说说草稿，提交管理员审核。"""
         topic = self._message_after_command(self._event_text(event), ("写说说", "写稿"))
-        post = self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
+        post = await self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
         try:
             text = await self._generate_post_text(event, post.content)
         except Exception as exc:
@@ -4153,7 +4218,7 @@ class QzoneStablePlugin(Star):
     @filter.command("投稿")
     async def contribute_post(self, event: AstrMessageEvent, content: str = ""):
         """提交一条待审核的说说投稿。"""
-        post = self._collect_target_post_payload(event, content, ("投稿",))
+        post = await self._collect_target_post_payload(event, content, ("投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
@@ -4164,7 +4229,7 @@ class QzoneStablePlugin(Star):
     @filter.command("匿名投稿")
     async def anon_contribute_post(self, event: AstrMessageEvent, content: str = ""):
         """匿名提交一条待审核的说说投稿。"""
-        post = self._collect_target_post_payload(event, content, ("匿名投稿",))
+        post = await self._collect_target_post_payload(event, content, ("匿名投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
@@ -4517,11 +4582,11 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以发说说。")
             return
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=content,
+            content,
+            ("qzone post",),
             include_event_text=True,
-            command_prefixes=("qzone post",),
         )
         profile_task: asyncio.Task | None = None
         try:
@@ -4683,11 +4748,11 @@ class QzoneStablePlugin(Star):
                 {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
                 self._llm_error_fallback_text("没有权限"),
             )
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=text,
+            text,
+            ("发说说", "qzone post"),
             include_event_text=bool(get_image),
-            command_prefixes=("发说说", "qzone post"),
         )
         if not get_image:
             post.media = []
@@ -4935,11 +5000,11 @@ class QzoneStablePlugin(Star):
             )
             yield event.plain_result(text)
             return
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=content,
+            content,
+            ("qzone post",),
             include_event_text=False,
-            command_prefixes=("qzone post",),
             extra_media=media,
         )
         try:

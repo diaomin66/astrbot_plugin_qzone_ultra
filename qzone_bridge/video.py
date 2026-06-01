@@ -13,26 +13,72 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
+import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .errors import QzoneParseError
+from .errors import QzoneParseError, QzoneRequestError
 from .local_media import is_recoverable_local_media_reference, resolve_trusted_local_media_path
 from .media import (
     QZONE_MIN_IMAGE_SIDE,
     QZONE_VIDEO_SUFFIXES,
     PostMedia,
     PostPayload,
+    guess_mime_type,
     is_supported_image,
     is_video_media,
     normalize_source,
     source_name,
 )
-from .source_policy import is_windows_drive_path
+from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
 
 
 VIDEO_COVER_MAX_EDGE = 1600
 VIDEO_COVER_MIME_TYPE = "image/jpeg"
 FFMPEG_TIMEOUT_SECONDS = 30
+VIDEO_SOURCE_MAX_BYTES = 512 * 1024 * 1024
+VIDEO_SOURCE_DOWNLOAD_TIMEOUT_SECONDS = 60
+
+
+def materialize_video_sources(post: PostPayload, source_dir: Path) -> PostPayload:
+    """Replace trusted remote or damaged local video sources with readable local files."""
+
+    media, media_changed = materialize_video_source_list(post.media, source_dir)
+    attachments, attachments_changed = materialize_video_source_list(post.attachments, source_dir)
+    if not media_changed and not attachments_changed:
+        return post
+    return PostPayload(content=post.content, media=media, attachments=attachments)
+
+
+def materialize_video_source_list(
+    media: Iterable[PostMedia],
+    source_dir: Path,
+) -> tuple[list[PostMedia], bool]:
+    prepared: list[PostMedia] = []
+    changed = False
+    for item in media:
+        if _needs_video_cover(item):
+            next_item = video_source_media(item, source_dir)
+            prepared.append(next_item)
+            changed = changed or next_item.source != item.source or next_item.trusted_local != item.trusted_local
+            continue
+        prepared.append(item)
+    return prepared, changed
+
+
+def video_source_media(video: PostMedia, source_dir: Path) -> PostMedia:
+    source = normalize_source(video.source)
+    path = _materialized_video_path(video, source, source_dir)
+    if str(path) == source and video.trusted_local:
+        return video
+    return PostMedia(
+        kind="video",
+        source=str(path),
+        name=video.name or path.name or source_name(source),
+        mime_type=video.mime_type or guess_video_mime(path, video),
+        size=video.size or _file_size(path),
+        raw_type=video.raw_type or "video",
+        trusted_local=True,
+    )
 
 
 def materialize_video_covers(post: PostPayload, cover_dir: Path) -> PostPayload:
@@ -69,7 +115,7 @@ def materialize_video_cover_list(
 
 def video_cover_media(video: PostMedia, cover_dir: Path) -> PostMedia:
     source = normalize_source(video.source)
-    path = _trusted_local_video_path(video, source)
+    path = _materialized_video_path(video, source, cover_dir / "video_sources")
     if not path.is_file():
         raise QzoneParseError("视频文件不存在，无法提取封面", detail={"name": video.name or source_name(source)})
 
@@ -103,6 +149,15 @@ def _needs_video_cover(item: PostMedia) -> bool:
     return not is_supported_image(item) and (item.kind == "video" or is_video_media(item))
 
 
+def _materialized_video_path(video: PostMedia, source: str, source_dir: Path) -> Path:
+    parsed = urlparse(source)
+    if parsed.scheme.lower() in {"http", "https"}:
+        if not video.trusted_local:
+            raise QzoneParseError("暂不支持远程视频直传，请引用消息视频后再发说说")
+        return _download_trusted_remote_video(video, source, source_dir)
+    return _trusted_local_video_path(video, source)
+
+
 def _trusted_local_video_path(video: PostMedia, source: str) -> Path:
     parsed = urlparse(source)
     if parsed.scheme.lower() in {"http", "https", "data"} or source.startswith("base64://"):
@@ -127,6 +182,132 @@ def _trusted_local_video_path(video: PostMedia, source: str) -> Path:
             detail={"name": video.name or source_name(source), "source": source},
         )
     return path
+
+
+def _download_trusted_remote_video(video: PostMedia, source: str, source_dir: Path) -> Path:
+    if not is_remote_media_url_allowed(source):
+        raise QzoneParseError("视频 URL 不安全，仅允许 http/https 公网地址", detail={"url": source})
+
+    source_dir.mkdir(parents=True, exist_ok=True)
+    target = _remote_video_cache_path(video, source, source_dir)
+    if _valid_local_video_file(target, video):
+        return target
+
+    temp_path = _temp_video_path(source_dir, target.stem, target.suffix)
+    try:
+        _stream_remote_video(source, temp_path)
+        if not _valid_local_video_file(temp_path, video):
+            raise QzoneParseError("视频下载结果无效，无法提取封面", detail={"url": source})
+        temp_path.replace(target)
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+    return target
+
+
+def _remote_video_cache_path(video: PostMedia, source: str, source_dir: Path) -> Path:
+    digest = hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest()[:20]
+    name = video.name or source_name(source) or "video.mp4"
+    suffix = Path(name).suffix.lower()
+    if suffix not in QZONE_VIDEO_SUFFIXES:
+        suffix = ".mp4"
+    stem = _safe_stem(name or "video")
+    return source_dir / f"video_source_{digest}_{stem}{suffix}"
+
+
+def _temp_video_path(source_dir: Path, stem: str, suffix: str) -> Path:
+    handle, name = tempfile.mkstemp(prefix=f"{stem}_", suffix=suffix or ".mp4", dir=str(source_dir))
+    os.close(handle)
+    path = Path(name)
+    with contextlib.suppress(OSError):
+        path.unlink()
+    return path
+
+
+def _valid_local_video_file(path: Path, video: PostMedia) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    if path.suffix.lower() in QZONE_VIDEO_SUFFIXES:
+        return True
+    return is_video_media(
+        PostMedia(
+            kind="video",
+            source=str(path),
+            name=video.name or path.name,
+            mime_type=video.mime_type,
+            raw_type=video.raw_type or "video",
+            trusted_local=True,
+        )
+    )
+
+
+def _stream_remote_video(source: str, target: Path) -> None:
+    timeout = httpx.Timeout(VIDEO_SOURCE_DOWNLOAD_TIMEOUT_SECONDS)
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            current_url = source
+            for redirect_count in range(4):
+                with client.stream(
+                    "GET",
+                    current_url,
+                    headers=_remote_video_headers(current_url),
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count >= 3:
+                            raise QzoneRequestError("视频跳转次数过多", detail={"url": source})
+                        redirected = resolve_remote_media_redirect(current_url, response.headers.get("location", ""))
+                        if not redirected:
+                            raise QzoneParseError("视频跳转地址不安全", detail={"url": current_url})
+                        current_url = redirected
+                        continue
+                    if response.status_code >= 400:
+                        raise QzoneRequestError(
+                            f"视频下载失败 HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            detail={"url": current_url},
+                        )
+                    length = response.headers.get("content-length")
+                    if length and int(length) > VIDEO_SOURCE_MAX_BYTES:
+                        raise QzoneParseError("视频文件过大，无法提取封面", detail={"url": current_url})
+                    total = 0
+                    with target.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > VIDEO_SOURCE_MAX_BYTES:
+                                raise QzoneParseError("视频文件过大，无法提取封面", detail={"url": current_url})
+                            handle.write(chunk)
+                    return
+    except httpx.HTTPError as exc:
+        raise QzoneRequestError("视频下载失败，无法提取封面", detail={"url": source}) from exc
+    raise QzoneRequestError("视频下载失败，无法提取封面", detail={"url": source})
+
+
+def _remote_video_headers(source: str) -> dict[str, str]:
+    parsed = urlparse(source)
+    headers = {
+        "User-Agent": "Mozilla/5.0 QzoneUltra/1.0",
+        "Accept": "video/*,*/*;q=0.8",
+    }
+    if parsed.scheme and parsed.netloc:
+        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+    return headers
+
+
+def guess_video_mime(path: Path, video: PostMedia) -> str:
+    return video.mime_type or guess_mime_type(video.name or str(path)) or "video/mp4"
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _cover_path_for_video(path: Path, video: PostMedia, cover_dir: Path) -> Path:

@@ -1471,6 +1471,49 @@ def test_normalize_media_item_detects_common_video_formats(tmp_path: Path) -> No
         assert item.mime_type.startswith("video/") or Path(filename).suffix.lower() in {".mkv", ".flv"}
 
 
+def test_collect_post_payload_marks_message_video_url_trusted() -> None:
+    from qzone_bridge.media import collect_post_payload
+
+    event = types.SimpleNamespace(
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "text", "data": {"text": "发说说 hello"}},
+                {
+                    "type": "video",
+                    "data": {
+                        "file": "clip.mp4",
+                        "url": "https://example.test/video/clip.mp4",
+                        "mime": "video/mp4",
+                    },
+                },
+            ]
+        )
+    )
+
+    post = collect_post_payload(event, command_prefixes=("发说说",))
+
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert post.media[0].trusted_local is True
+
+
+def test_reference_message_ids_from_reply_segment() -> None:
+    from qzone_bridge.media import iter_reference_message_ids
+
+    event = types.SimpleNamespace(
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "发说说 hello"}},
+            ]
+        )
+    )
+
+    assert iter_reference_message_ids(event) == [123456]
+
+
 def test_materialize_video_covers_replaces_video_with_trusted_cover(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1515,40 +1558,36 @@ def test_materialize_video_covers_replaces_video_with_trusted_cover(
         assert image.size == (320, 180)
 
 
-def test_materialize_video_covers_recovers_ntqq_cache_path_by_name(
+def test_materialize_video_covers_downloads_trusted_message_video_url(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from PIL import Image
 
-    from qzone_bridge import local_media, video as video_mod
+    from qzone_bridge import video as video_mod
     from qzone_bridge.media import PostMedia, PostPayload
 
-    root = tmp_path / "Tencent Files"
-    source = root / "3112333596" / "nt_qq" / "nt_data" / "Video" / "2026-06" / "OriV9" / "95d20307dfb960194a9210eff4824876.mp4"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"fake video bytes")
-    monkeypatch.setattr(local_media, "_tencent_file_roots", lambda: [root])
     seen: dict[str, Path] = {}
+
+    monkeypatch.setattr(video_mod, "is_remote_media_url_allowed", lambda _source: True)
+
+    def fake_download(_source: str, target: Path) -> None:
+        target.write_bytes(b"fake video bytes")
 
     def fake_extract(path: Path, output_path: Path, *, name: str = "") -> None:
         seen["path"] = path
         Image.new("RGB", (320, 180), (42, 84, 126)).save(output_path)
 
+    monkeypatch.setattr(video_mod, "_stream_remote_video", fake_download)
     monkeypatch.setattr(video_mod, "_extract_frame_with_ffmpeg", fake_extract)
-    damaged_source = (
-        "D:Documents\nATencent Files\\3112333596\\nt_qq\\nt_data\\Video\\2026-06\\OriV9\\"
-        f"{source.name}"
-    )
     post = PostPayload(
         content="hello",
         media=[
             PostMedia(
                 kind="video",
-                source=damaged_source,
-                name=source.name,
+                source="https://example.test/cache/95d20307dfb960194a9210eff4824876.mp4",
+                name="95d20307dfb960194a9210eff4824876.mp4",
                 mime_type="video/mp4",
-                size=source.stat().st_size,
                 trusted_local=True,
             )
         ],
@@ -1556,7 +1595,8 @@ def test_materialize_video_covers_recovers_ntqq_cache_path_by_name(
 
     prepared = video_mod.materialize_video_covers(post, tmp_path / "covers")
 
-    assert seen["path"] == source
+    assert seen["path"].is_file()
+    assert seen["path"].parent.name == "video_sources"
     assert prepared.media[0].raw_type == "video"
     assert Path(prepared.media[0].source).is_file()
 
@@ -1680,32 +1720,29 @@ def test_native_qzone_video_publish_uri_encodes_opensdk_fields(
     assert decoded("app_name") == "QQ空间Ultra"
 
 
-def test_native_qzone_video_publish_uri_recovers_ntqq_cache_path(
+def test_native_qzone_video_publish_uri_recovers_drive_relative_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import base64
     from urllib.parse import parse_qs, urlparse
 
-    from qzone_bridge import local_media, native_video
+    from qzone_bridge import native_video
     from qzone_bridge.media import PostMedia
 
-    root = tmp_path / "Tencent Files"
-    source = root / "3112333596" / "nt_qq" / "nt_data" / "Video" / "2026-06" / "OriV9" / "95d20307dfb960194a9210eff4824876.mp4"
-    source.parent.mkdir(parents=True)
+    source = tmp_path / "clip.mp4"
     source.write_bytes(b"fake video bytes")
-    monkeypatch.setattr(local_media, "_tencent_file_roots", lambda: [root])
     monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 2345)
-    damaged_source = (
-        "D:Documents\nATencent Files\\3112333596\\nt_qq\\nt_data\\Video\\2026-06\\OriV9\\"
-        f"{source.name}"
-    )
+    text = str(source)
+    if len(text) < 3 or text[1] != ":" or text[2] not in "\\/":
+        pytest.skip("Windows drive path required")
+    damaged_source = text[:2] + text[3:]
 
     uri = native_video.build_native_qzone_video_publish_uri(
         PostMedia(
             kind="video",
             source=damaged_source,
-            name=source.name,
+            name="clip.mp4",
             mime_type="video/mp4",
             trusted_local=True,
         ),
@@ -1750,6 +1787,47 @@ def test_publish_native_video_post_launches_registered_handler(
     assert launched["uri"] == result.uri
     assert result.handler == '"QQ" "%1"'
     assert result.video.source == str(source)
+
+
+def test_plugin_collects_quoted_video_from_onebot_get_msg(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {
+                "data": {
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": "clip.mp4",
+                                "url": "https://example.test/video/clip.mp4",
+                                "mime": "video/mp4",
+                            },
+                        }
+                    ]
+                }
+            }
+
+    event = types.SimpleNamespace(
+        bot=_Bot(),
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "发说说 hello"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("发说说",)))
+
+    assert post.content == "hello"
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == "https://example.test/video/clip.mp4"
+    assert post.media[0].trusted_local is True
 
 
 def test_plugin_publish_prefers_native_video_handoff(

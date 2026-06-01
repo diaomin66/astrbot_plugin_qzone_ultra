@@ -62,6 +62,7 @@ MESSAGE_CHAIN_KEYS = (
     "message_segments",
 )
 REFERENCE_MEDIA_KEYS = ("image", "images", "media", "medias", "attachment", "attachments", "files")
+REFERENCE_MESSAGE_ID_KEYS = ("id", "message_id", "messageId", "message_seq", "messageSeq", "seq")
 REFERENCE_MAX_DEPTH = 6
 COMPONENT_STRING_RE = re.compile(r"\b(?:Image|Video|File|Record|Plain)\s*\(|\[CQ:(?:image|video|file|record)\b", re.I)
 COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
@@ -179,7 +180,7 @@ def _is_local_source(value: str) -> bool:
     parsed = urlparse(value)
     if parsed.scheme.lower() in {"http", "https"} or _is_base64_source(value):
         return False
-    if parsed.scheme and not is_windows_drive_path(value):
+    if parsed.scheme and not is_windows_drive_path(value) and not re.match(r"^[A-Za-z]:", value):
         return False
     return True
 
@@ -199,7 +200,7 @@ def _looks_like_path(value: str) -> bool:
         return True
     if Path(value).exists():
         return True
-    return bool(re.match(r"^[a-zA-Z]:[\\/]", value) or value.startswith(("/", "\\")))
+    return bool(re.match(r"^[a-zA-Z]:", value) or value.startswith(("/", "\\")))
 
 
 def normalize_source(value: Any) -> str:
@@ -335,7 +336,7 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
             mime_type=mime_type,
             size=size,
             raw_type=raw_type,
-            trusted_local=item_trusted_local and _is_local_source(source),
+            trusted_local=item_trusted_local or _is_local_source(source),
         )
         if is_supported_image(media):
             media.kind = "image"
@@ -450,6 +451,12 @@ def _component_mapping(component: Any) -> dict[str, Any]:
         "mime",
         "mime_type",
         "size",
+        "id",
+        "message_id",
+        "messageId",
+        "message_seq",
+        "messageSeq",
+        "seq",
     ):
         if hasattr(component, attr):
             data[attr] = getattr(component, attr)
@@ -514,7 +521,7 @@ def _choose_media_source(data: dict[str, Any]) -> str:
     return normalized[0] if normalized else ""
 
 
-def _component_media(component: Any, kind: str) -> PostMedia | None:
+def _component_media(component: Any, kind: str, *, trusted_message: bool = False) -> PostMedia | None:
     data = _component_mapping(component)
     source = _choose_media_source(data)
     if not source:
@@ -532,7 +539,7 @@ def _component_media(component: Any, kind: str) -> PostMedia | None:
         mime_type=mime_type,
         size=size,
         raw_type=kind,
-        trusted_local=_is_local_source(source),
+        trusted_local=trusted_message or _is_local_source(source),
     )
     if is_supported_image(media):
         media.kind = "image"
@@ -598,7 +605,13 @@ def _media_from_reference_field(value: Any, *, key: str) -> list[PostMedia]:
     return normalize_media_list(values, default_kind=default_kind, trusted_local=True)
 
 
-def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
+def _collect_referenced_media(
+    value: Any,
+    *,
+    seen: set[int],
+    depth: int = 0,
+    trusted_message: bool = True,
+) -> list[PostMedia]:
     if depth > REFERENCE_MAX_DEPTH or not _is_traversable_reference_value(value):
         return []
 
@@ -610,12 +623,12 @@ def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> 
     media: list[PostMedia] = []
     if isinstance(value, (list, tuple, set)):
         for item in value:
-            media.extend(_collect_referenced_media(item, seen=seen, depth=depth + 1))
+            media.extend(_collect_referenced_media(item, seen=seen, depth=depth + 1, trusted_message=trusted_message))
         return media
 
     kind = _component_kind(value)
     if kind in MEDIA_KINDS:
-        item = _component_media(value, kind)
+        item = _component_media(value, kind, trusted_message=trusted_message)
         if item:
             media.append(item)
 
@@ -625,11 +638,11 @@ def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> 
 
     for nested in _iter_mapping_values(value, MESSAGE_CHAIN_KEYS):
         if _is_traversable_reference_value(nested):
-            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1, trusted_message=trusted_message))
 
     for nested in _iter_mapping_values(value, REFERENCE_OWNER_KEYS):
         if _is_traversable_reference_value(nested):
-            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1, trusted_message=trusted_message))
 
     return media
 
@@ -657,6 +670,105 @@ def iter_referenced_media(event: Any) -> list[PostMedia]:
             media.extend(_collect_referenced_media(value, seen=seen))
 
     return media
+
+
+def collect_message_media(payload: Any) -> list[PostMedia]:
+    """Return media segments from a message payload fetched from the platform."""
+
+    media = _collect_referenced_media(payload, seen=set(), trusted_message=True)
+    result: list[PostMedia] = []
+    seen: set[tuple[str, str]] = set()
+    for item in media:
+        key = _media_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _coerce_reference_message_id(value: Any) -> int | str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        return text
+    return number if number > 0 else None
+
+
+def _reference_message_id(value: Any) -> int | str | None:
+    data = _component_mapping(value)
+    for key in REFERENCE_MESSAGE_ID_KEYS:
+        identifier = _coerce_reference_message_id(data.get(key))
+        if identifier is not None:
+            return identifier
+    return None
+
+
+def _collect_reference_message_ids(value: Any, *, seen: set[int], depth: int = 0) -> list[int | str]:
+    if depth > REFERENCE_MAX_DEPTH or not _is_traversable_reference_value(value):
+        return []
+    marker = id(value)
+    if marker in seen:
+        return []
+    seen.add(marker)
+
+    result: list[int | str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            result.extend(_collect_reference_message_ids(item, seen=seen, depth=depth + 1))
+        return result
+
+    kind = _component_kind(value)
+    if kind in REFERENCE_KINDS:
+        identifier = _reference_message_id(value)
+        if identifier is not None:
+            result.append(identifier)
+
+    for nested in _iter_mapping_values(value, MESSAGE_CHAIN_KEYS):
+        if _is_traversable_reference_value(nested):
+            result.extend(_collect_reference_message_ids(nested, seen=seen, depth=depth + 1))
+    for nested in _iter_mapping_values(value, REFERENCE_OWNER_KEYS):
+        if _is_traversable_reference_value(nested):
+            result.extend(_collect_reference_message_ids(nested, seen=seen, depth=depth + 1))
+    return result
+
+
+def iter_reference_message_ids(event: Any) -> list[int | str]:
+    """Return referenced platform message ids from reply/quote segments."""
+
+    seen_values: set[str] = set()
+    result: list[int | str] = []
+    seen_objects: set[int] = set()
+
+    def append(values: Iterable[int | str]) -> None:
+        for value in values:
+            key = str(value)
+            if not key or key in seen_values:
+                continue
+            seen_values.add(key)
+            result.append(value)
+
+    message_obj = getattr(event, "message_obj", None)
+    for owner in (message_obj, event):
+        for value in _iter_mapping_values(owner, REFERENCE_OWNER_KEYS):
+            append(_collect_reference_message_ids(value, seen=seen_objects))
+
+    raw = getattr(message_obj, "raw_message", None) or getattr(event, "raw_message", None)
+    append(_collect_reference_message_ids(raw, seen=seen_objects))
+
+    for component in iter_event_components(event):
+        kind = _component_kind(component)
+        if kind in REFERENCE_KINDS:
+            identifier = _reference_message_id(component)
+            if identifier is not None:
+                append([identifier])
+        for value in _iter_mapping_values(component, REFERENCE_OWNER_KEYS):
+            append(_collect_reference_message_ids(value, seen=seen_objects))
+
+    return result
 
 
 def _media_dedupe_key(item: PostMedia) -> tuple[str, str]:
@@ -798,7 +910,7 @@ def collect_post_payload(
                 content_parts.append(text)
             continue
         if kind in MEDIA_KINDS:
-            item = _component_media(component, kind)
+            item = _component_media(component, kind, trusted_message=True)
             if not item:
                 continue
             _append_collected_media(
