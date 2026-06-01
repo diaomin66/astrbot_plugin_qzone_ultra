@@ -1426,6 +1426,185 @@ def test_publish_renderer_short_single_image_card_uses_compact_adaptive_width(tm
         assert image.width == 560 * 3
 
 
+def test_collect_post_payload_keeps_video_media_out_of_content(tmp_path: Path) -> None:
+    from qzone_bridge.media import collect_post_payload
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake video bytes")
+    event = types.SimpleNamespace(
+        message=[
+            {"type": "Plain", "data": {"text": "qzone post hello"}},
+            {
+                "type": "Video",
+                "data": {
+                    "file": str(video_path),
+                    "name": "clip.mp4",
+                    "mime": "video/mp4",
+                    "size": 123,
+                },
+            },
+        ]
+    )
+
+    post = collect_post_payload(
+        event,
+        include_event_text=True,
+        command_prefixes=("qzone post",),
+    )
+
+    assert post.content == "hello"
+    assert post.attachments == []
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].trusted_local is True
+    assert "clip.mp4" not in post.content
+    assert "[视频" not in post.content
+
+
+def test_normalize_media_item_detects_common_video_formats(tmp_path: Path) -> None:
+    from qzone_bridge.media import normalize_media_item
+
+    for filename in ("clip.mp4", "clip.MOV", "clip.mkv", "clip.webm", "clip.avi", "clip.flv", "clip.3gp"):
+        item = normalize_media_item(str(tmp_path / filename), trusted_local=True)
+        assert item is not None
+        assert item.kind == "video"
+        assert item.mime_type.startswith("video/") or Path(filename).suffix.lower() in {".mkv", ".flv"}
+
+
+def test_materialize_video_covers_replaces_video_with_trusted_cover(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    from qzone_bridge import video as video_mod
+    from qzone_bridge.media import PostMedia, PostPayload
+
+    def fake_extract(_path: Path, output_path: Path, *, name: str = "") -> None:
+        Image.new("RGB", (320, 180), (42, 84, 126)).save(output_path)
+
+    monkeypatch.setattr(video_mod, "_extract_frame_with_ffmpeg", fake_extract)
+    source = tmp_path / "clip.webm"
+    source.write_bytes(b"fake video bytes")
+    post = PostPayload(
+        content="hello",
+        media=[
+            PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.webm",
+                mime_type="video/webm",
+                size=source.stat().st_size,
+                trusted_local=True,
+            )
+        ],
+    )
+
+    prepared = video_mod.materialize_video_covers(post, tmp_path / "covers")
+
+    assert prepared.content == "hello"
+    assert prepared.attachments == []
+    assert len(prepared.media) == 1
+    cover = prepared.media[0]
+    assert cover.kind == "image"
+    assert cover.raw_type == "video"
+    assert cover.mime_type == "image/jpeg"
+    assert cover.trusted_local is True
+    assert Path(cover.source).is_file()
+    with Image.open(cover.source) as image:
+        assert image.size == (320, 180)
+
+
+def test_daemon_publish_post_materializes_video_without_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    from qzone_bridge import video as video_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.media import PostMedia
+
+    captured: dict[str, object] = {}
+
+    def fake_video_cover_media(item: PostMedia, cover_dir: Path) -> PostMedia:
+        cover_dir.mkdir(parents=True, exist_ok=True)
+        cover = cover_dir / "clip.jpg"
+        Image.new("RGB", (320, 180), (20, 30, 40)).save(cover)
+        return PostMedia(
+            kind="image",
+            source=str(cover),
+            name="clip.jpg",
+            mime_type="image/jpeg",
+            raw_type="video",
+            trusted_local=True,
+        )
+
+    class _Client:
+        async def publish_mood(self, content: str, *, sync_weibo: bool = False, photos=None):
+            captured["content"] = content
+            captured["photos"] = photos
+            return {"fid": "fid-1", "msg": "ok"}
+
+    monkeypatch.setattr(video_mod, "video_cover_media", fake_video_cover_media)
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+    video = PostMedia(
+        kind="video",
+        source=str(tmp_path / "clip.mp4"),
+        name="clip.mp4",
+        mime_type="video/mp4",
+        trusted_local=True,
+    )
+
+    payload = asyncio.run(
+        service.publish_post(
+            content="hello",
+            media=[video.to_dict()],
+            content_sanitized=True,
+        )
+    )
+
+    assert captured["content"] == "hello"
+    assert "[视频" not in captured["content"]
+    assert captured["photos"][0]["raw_type"] == "video"
+    assert payload["photo_count"] == 1
+    assert payload["media_count"] == 1
+
+
+def test_publish_renderer_draws_video_play_overlay() -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    from qzone_bridge.media import PostMedia
+    from qzone_bridge.publish_renderer import _ImagePreview, _draw_preview_tile
+
+    canvas = Image.new("RGB", (300, 180), (255, 255, 255))
+    source = Image.new("RGB", (300, 180), (180, 20, 20))
+    preview = _ImagePreview(
+        media=PostMedia(kind="image", source="cover.jpg", raw_type="video"),
+        image=source,
+        failed=False,
+    )
+
+    _draw_preview_tile(
+        ImageDraw.Draw(canvas),
+        canvas,
+        preview,
+        0,
+        0,
+        300,
+        180,
+        ImageFont.load_default(),
+        crop=False,
+        scale=1,
+    )
+
+    assert canvas.getpixel((150, 90)) != (180, 20, 20)
+
+
 def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path: Path) -> None:
     from PIL import Image
 

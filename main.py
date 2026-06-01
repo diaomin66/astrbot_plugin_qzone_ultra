@@ -683,6 +683,7 @@ from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
+from qzone_bridge.video import materialize_video_covers
 import qzone_bridge.publish_renderer as _publish_renderer
 try:
     import qzone_bridge.compat as _bridge_compat
@@ -2587,6 +2588,13 @@ class QzoneStablePlugin(Star):
             command_prefixes=prefixes,
         )
 
+    async def _prepare_publish_payload(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_covers,
+            post,
+            self.data_dir / "video_covers",
+        )
+
     async def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
         return await self.drafts.add_async(
             author_uin=self._sender_id(event),
@@ -3802,6 +3810,7 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
+            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
@@ -4215,6 +4224,7 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
+            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
@@ -4481,6 +4491,7 @@ class QzoneStablePlugin(Star):
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
+            post = await self._prepare_publish_payload(post)
             profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
@@ -4653,6 +4664,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
+            post = await self._prepare_publish_payload(post)
             payload = await self.controller.publish_post(
                 content=post.content,
                 media=[item.to_dict() for item in post.media],
@@ -4907,6 +4919,7 @@ class QzoneStablePlugin(Star):
         )
         try:
             await self._ensure_cookie_ready(event)
+            post = await self._prepare_publish_payload(post)
             payload = await self.controller.publish_post(
                 content=post.content,
                 sync_weibo=sync_weibo,

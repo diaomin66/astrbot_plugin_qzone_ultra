@@ -16,6 +16,23 @@ from .source_policy import is_windows_drive_path
 QZONE_MAX_IMAGES = 9
 QZONE_MIN_IMAGE_SIDE = 16
 QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+QZONE_VIDEO_SUFFIXES = {
+    ".mp4",
+    ".m4v",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".flv",
+    ".wmv",
+    ".mpeg",
+    ".mpg",
+    ".3gp",
+    ".3g2",
+    ".ts",
+    ".mts",
+    ".m2ts",
+}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
 REFERENCE_KINDS = {"reply", "quote", "quoted", "reference"}
@@ -239,6 +256,28 @@ def is_supported_image(media: PostMedia | dict[str, Any]) -> bool:
     return suffix in QZONE_IMAGE_SUFFIXES
 
 
+def is_video_media(media: PostMedia | dict[str, Any]) -> bool:
+    if isinstance(media, dict):
+        kind = str(media.get("kind") or media.get("type") or "").lower()
+        source = str(media.get("source") or media.get("file") or media.get("url") or media.get("path") or "")
+        name = str(media.get("name") or media.get("filename") or source_name(source) or "")
+        mime_type = str(media.get("mime_type") or media.get("mime") or guess_mime_type(name or source) or "")
+        raw_type = str(media.get("raw_type") or "").lower()
+    else:
+        kind = media.kind
+        source = media.source
+        name = media.name
+        mime_type = media.mime_type or guess_mime_type(name or source)
+        raw_type = media.raw_type
+
+    if str(kind).lower() == "video" or str(raw_type).lower() == "video":
+        return True
+    if str(mime_type).lower().startswith("video/"):
+        return True
+    suffix = Path(name or source).suffix.lower()
+    return suffix in QZONE_VIDEO_SUFFIXES
+
+
 def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local: bool = False) -> PostMedia | None:
     if item is None:
         return None
@@ -268,6 +307,8 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
         )
         if is_supported_image(media):
             media.kind = "image"
+        elif is_video_media(media):
+            media.kind = "video"
         return media
     if isinstance(item, dict):
         source = normalize_source(item.get("source") or item.get("file") or item.get("url") or item.get("path") or "")
@@ -286,17 +327,20 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
         item_trusted_local = trusted_local or _bool_value(
             item.get("trusted_local") or item.get("trusted_local_source") or item.get("from_message")
         )
+        raw_type = str(item.get("raw_type") or kind)
         media = PostMedia(
             kind=kind,
             source=source,
             name=name,
             mime_type=mime_type,
             size=size,
-            raw_type=kind,
+            raw_type=raw_type,
             trusted_local=item_trusted_local and _is_local_source(source),
         )
         if is_supported_image(media):
             media.kind = "image"
+        elif is_video_media(media):
+            media.kind = "video"
         return media
     return None
 
@@ -632,7 +676,7 @@ def _append_collected_media(
     if key in seen:
         return
     seen.add(key)
-    if item.kind == "image":
+    if item.kind in {"image", "video"}:
         media.append(item)
         return
     attachments.append(item)
