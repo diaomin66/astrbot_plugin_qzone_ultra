@@ -670,7 +670,7 @@ from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneC
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.native_video import NativeVideoPublishUnavailable, publish_native_video_post
+from qzone_bridge.native_video import NativeVideoPublishUnavailable, native_video_candidate, publish_native_video_post
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
     NewsItem,
@@ -2603,7 +2603,9 @@ class QzoneStablePlugin(Star):
         *,
         sync_weibo: bool = False,
     ) -> tuple[PostPayload, dict[str, Any]]:
-        if getattr(self.settings, "native_video_publish", True):
+        render_post: PostPayload | None = None
+        if getattr(self.settings, "native_video_publish", True) and native_video_candidate(post) is not None:
+            render_post = await self._prepare_publish_payload(post)
             try:
                 native_result = await asyncio.to_thread(
                     publish_native_video_post,
@@ -2613,7 +2615,6 @@ class QzoneStablePlugin(Star):
             except NativeVideoPublishUnavailable as exc:
                 logger.debug("native qzone video publish skipped: %s", exc)
             else:
-                render_post = await self._prepare_publish_payload(post)
                 payload = {
                     "fid": "",
                     "message": native_result.message,
@@ -2629,7 +2630,8 @@ class QzoneStablePlugin(Star):
                 }
                 return render_post, payload
 
-        render_post = await self._prepare_publish_payload(post)
+        if render_post is None:
+            render_post = await self._prepare_publish_payload(post)
         payload = await self.controller.publish_post(
             content=render_post.content,
             sync_weibo=sync_weibo,

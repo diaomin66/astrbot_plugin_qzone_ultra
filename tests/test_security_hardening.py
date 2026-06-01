@@ -1712,6 +1712,65 @@ def test_plugin_publish_prefers_native_video_handoff(
     assert payload["raw"]["native_video_uri"].startswith("mqqapi://qzone/publish")
 
 
+def test_plugin_publish_falls_back_to_cover_when_native_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    original = main.PostPayload(
+        content="hello",
+        media=[
+            main.PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+    cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_native(_post, *, app_name=""):
+        raise main.NativeVideoPublishUnavailable("no handler")
+
+    async def fake_prepare(post):
+        assert post is original
+        captured["prepared"] = captured.get("prepared", 0) + 1
+        return cover
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {"fid": "fid-cover", "message": "ok", "photo_count": 1}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    monkeypatch.setattr(main, "publish_native_video_post", fake_native)
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
+
+    assert render_post is cover
+    assert payload["fid"] == "fid-cover"
+    assert captured["prepared"] == 1
+    assert captured["publish_kwargs"] == {
+        "content": "hello",
+        "sync_weibo": False,
+        "media": [cover.media[0].to_dict()],
+        "content_sanitized": True,
+    }
+
+
 def test_publish_renderer_draws_video_play_overlay() -> None:
     from PIL import Image, ImageDraw, ImageFont
 
