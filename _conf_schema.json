@@ -11,6 +11,12 @@
     "default": "",
     "hint": "例如 C:\\styles\\my-style；留空则使用普通文本/内置发布结果渲染。"
   },
+  "native_video_publish": {
+    "description": "优先使用 QQ 原生视频发布",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，单个本地视频说说会优先唤起 QQ/QQNT 原生发布窗口；不支持或失败时回退为视频封面图发布。"
+  },
   "llm": {
     "description": "大模型配置",
     "type": "object",

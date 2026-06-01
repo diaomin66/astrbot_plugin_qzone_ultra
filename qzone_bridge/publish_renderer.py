@@ -21,7 +21,7 @@ from urllib.parse import unquote_to_bytes, urlparse
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
-from .media import PostMedia, PostPayload, source_name
+from .media import PostMedia, PostPayload, is_video_media, source_name
 from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
 from .utils import truncate
 
@@ -1249,6 +1249,8 @@ def _draw_preview_tile(
             rendered = ImageOps.contain(preview.image, (width, height), method=QUALITY_RESAMPLE)
             width, height = rendered.size
         image.paste(rendered, (x, y))
+        if _is_video_preview(preview.media):
+            _draw_video_play_overlay(image, x, y, width, height, scale=scale)
         return
 
     draw.rectangle((x, y, x + width, y + height), fill=(244, 245, 247), outline=LINE, width=_scale_px(1, scale))
@@ -1279,6 +1281,49 @@ def _draw_preview_tile(
         width=_scale_px(2, scale),
     )
     _safe_text(draw, (x + _scale_px(12, scale), y + height - _scale_px(30, scale)), label, small_font, MUTED)
+    if _is_video_preview(preview.media):
+        _draw_video_play_overlay(image, x, y, width, height, scale=scale)
+
+
+def _is_video_preview(media: PostMedia) -> bool:
+    return media.raw_type.lower() == "video" or media.kind == "video" or is_video_media(media)
+
+
+def _draw_video_play_overlay(
+    image: Image.Image,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    *,
+    scale: int = 1,
+) -> None:
+    max_diameter = max(1, min(width, height))
+    diameter = min(max_diameter, _scale_px(92, scale))
+    diameter = min(max_diameter, max(_scale_px(42, scale), diameter))
+    center_x = x + width // 2
+    center_y = y + height // 2
+    left = center_x - diameter // 2
+    top = center_y - diameter // 2
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.ellipse(
+        (left - x, top - y, left - x + diameter, top - y + diameter),
+        fill=(0, 0, 0, 132),
+    )
+    triangle_w = int(diameter * 0.32)
+    triangle_h = int(diameter * 0.42)
+    triangle_x = center_x - x - triangle_w // 3
+    triangle_y = center_y - y
+    overlay_draw.polygon(
+        (
+            (triangle_x, triangle_y - triangle_h // 2),
+            (triangle_x, triangle_y + triangle_h // 2),
+            (triangle_x + triangle_w, triangle_y),
+        ),
+        fill=(255, 255, 255, 232),
+    )
+    image.paste(overlay.convert("RGB"), (x, y), overlay.getchannel("A"))
 
 
 def _draw_attachment_block(

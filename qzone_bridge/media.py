@@ -10,12 +10,30 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
+from .local_media import resolve_trusted_local_media_path
 from .source_policy import is_windows_drive_path
 
 
 QZONE_MAX_IMAGES = 9
 QZONE_MIN_IMAGE_SIDE = 16
 QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+QZONE_VIDEO_SUFFIXES = {
+    ".mp4",
+    ".m4v",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".flv",
+    ".wmv",
+    ".mpeg",
+    ".mpg",
+    ".3gp",
+    ".3g2",
+    ".ts",
+    ".mts",
+    ".m2ts",
+}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
 REFERENCE_KINDS = {"reply", "quote", "quoted", "reference"}
@@ -45,8 +63,68 @@ MESSAGE_CHAIN_KEYS = (
     "message_segments",
 )
 REFERENCE_MEDIA_KEYS = ("image", "images", "media", "medias", "attachment", "attachments", "files")
+REFERENCE_MESSAGE_ID_KEYS = (
+    "id",
+    "message_id",
+    "messageId",
+    "message_seq",
+    "messageSeq",
+    "seq",
+    "reply_id",
+    "replyId",
+    "msg_id",
+    "msgId",
+    "source_msg_id",
+    "sourceMsgId",
+    "origin_message_id",
+    "originMessageId",
+)
 REFERENCE_MAX_DEPTH = 6
-COMPONENT_STRING_RE = re.compile(r"\b(?:Image|Video|File|Record|Plain)\s*\(|\[CQ:(?:image|video|file|record)\b", re.I)
+COMPONENT_STRING_RE = re.compile(
+    r"\b(?:Image|Video|File|Record|Plain|Reply)\s*\(|\[CQ:(?:image|video|file|record|reply|quote)\b",
+    re.I,
+)
+CQ_SEGMENT_RE = re.compile(r"\[CQ:([A-Za-z0-9_]+)((?:,[^\]]*)?)\]")
+PLACEHOLDER_SOURCE_VALUES = {"", "empty", "null", "none", "nil", "undefined", "false"}
+MEDIA_URL_SOURCE_KEYS = (
+    "url",
+    "download_url",
+    "downloadUrl",
+    "file_url",
+    "fileUrl",
+    "media_url",
+    "mediaUrl",
+    "origin_url",
+    "originUrl",
+    "original_url",
+    "originalUrl",
+    "cdn_url",
+    "cdnUrl",
+    "preview_url",
+    "previewUrl",
+)
+MEDIA_LOCAL_SOURCE_KEYS = (
+    "path",
+    "file_path",
+    "filePath",
+    "absolute_path",
+    "absolutePath",
+    "abs_path",
+    "absPath",
+    "local_path",
+    "localPath",
+    "source",
+    "src",
+    "file",
+    "file_",
+    "attachment_id",
+)
+MEDIA_BASE64_SOURCE_KEYS = (
+    "base64",
+    "file_base64",
+    "fileBase64",
+)
+MEDIA_SOURCE_KEYS = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS + MEDIA_BASE64_SOURCE_KEYS
 COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
 COMMAND_PREFIX_CHARS = "/\uFF0F!\uFF01#\uFF03.\uFF0E\u3002~\uFF5E?\uFF1F"
 LEADING_SPACE_CHARS = " \t\r\n\f\v\u3000\ufeff\u200b\u200c\u200d"
@@ -86,6 +164,72 @@ def _is_url(value: str) -> bool:
 
 def _is_base64_source(value: str) -> bool:
     return value.startswith("base64://") or value.startswith("data:")
+
+
+def _is_placeholder_source(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in PLACEHOLDER_SOURCE_VALUES
+
+
+def base64_media_source(data: dict[str, Any]) -> str:
+    """Return a normalized base64:// media source from OneBot-style payloads."""
+
+    for key in MEDIA_BASE64_SOURCE_KEYS:
+        value = data.get(key)
+        if value is None or _is_placeholder_source(value):
+            continue
+        source = str(value).strip()
+        if not source:
+            continue
+        if _is_base64_source(source):
+            return normalize_source(source) or source
+        return f"base64://{''.join(source.split())}"
+    return ""
+
+
+def _cq_unescape(value: str) -> str:
+    return (
+        value.replace("&#44;", ",")
+        .replace("&#91;", "[")
+        .replace("&#93;", "]")
+        .replace("&amp;", "&")
+    )
+
+
+def _cq_attrs(value: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for chunk in value.split(","):
+        if not chunk or "=" not in chunk:
+            continue
+        key, raw = chunk.split("=", 1)
+        key = key.strip()
+        if key:
+            attrs[key] = _cq_unescape(raw)
+    return attrs
+
+
+def parse_cq_message(text: str) -> list[dict[str, Any]]:
+    """Parse OneBot/CQ code text into segment dicts while preserving plain text."""
+
+    value = str(text or "")
+    if "[CQ:" not in value:
+        return []
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for match in CQ_SEGMENT_RE.finditer(value):
+        if match.start() > cursor:
+            plain = _cq_unescape(value[cursor : match.start()])
+            if plain:
+                segments.append({"type": "text", "data": {"text": plain}})
+        kind = match.group(1).strip().lower()
+        attrs = _cq_attrs(match.group(2)[1:] if match.group(2).startswith(",") else match.group(2))
+        segments.append({"type": kind, "data": attrs})
+        cursor = match.end()
+    if cursor < len(value):
+        plain = _cq_unescape(value[cursor:])
+        if plain:
+            segments.append({"type": "text", "data": {"text": plain}})
+    return segments
 
 
 def looks_like_supported_image_bytes(data: bytes) -> bool:
@@ -162,7 +306,7 @@ def _is_local_source(value: str) -> bool:
     parsed = urlparse(value)
     if parsed.scheme.lower() in {"http", "https"} or _is_base64_source(value):
         return False
-    if parsed.scheme and not is_windows_drive_path(value):
+    if parsed.scheme and not is_windows_drive_path(value) and not re.match(r"^[A-Za-z]:", value):
         return False
     return True
 
@@ -182,13 +326,15 @@ def _looks_like_path(value: str) -> bool:
         return True
     if Path(value).exists():
         return True
-    return bool(re.match(r"^[a-zA-Z]:[\\/]", value) or value.startswith(("/", "\\")))
+    return bool(re.match(r"^[a-zA-Z]:", value) or value.startswith(("/", "\\")))
 
 
 def normalize_source(value: Any) -> str:
     if value is None:
         return ""
     source = str(value).strip()
+    if _is_placeholder_source(source):
+        return ""
     if source.startswith("file://"):
         parsed = urlparse(source)
         if parsed.netloc and parsed.path:
@@ -198,6 +344,29 @@ def normalize_source(value: Any) -> str:
             return path[1:]
         return path
     return source
+
+
+def _first_source_candidate(*values: Any) -> str:
+    normalized = [normalize_source(value) for value in values]
+    normalized = [value for value in normalized if value]
+    for value in normalized:
+        if _is_base64_source(value):
+            return value
+    for value in normalized:
+        if _is_url(value):
+            continue
+        with contextlib.suppress(OSError):
+            if Path(value).is_file():
+                return value
+    for value in normalized:
+        if _is_url(value):
+            return value
+    for value in normalized:
+        if not _is_url(value) and _looks_like_path(value):
+            return value
+    for value in normalized:
+        return value
+    return ""
 
 
 def source_name(source: str) -> str:
@@ -222,7 +391,27 @@ def guess_mime_type(name_or_source: str) -> str:
 def is_supported_image(media: PostMedia | dict[str, Any]) -> bool:
     if isinstance(media, dict):
         kind = str(media.get("kind") or media.get("type") or "").lower()
-        source = str(media.get("source") or media.get("file") or media.get("url") or media.get("path") or "")
+        source = _first_source_candidate(
+            media.get("source"),
+            media.get("url"),
+            media.get("download_url"),
+            media.get("downloadUrl"),
+            media.get("file_url"),
+            media.get("fileUrl"),
+            media.get("media_url"),
+            media.get("mediaUrl"),
+            media.get("path"),
+            media.get("file_path"),
+            media.get("filePath"),
+            media.get("absolute_path"),
+            media.get("absolutePath"),
+            media.get("abs_path"),
+            media.get("absPath"),
+            media.get("local_path"),
+            media.get("localPath"),
+            media.get("file"),
+            media.get("file_"),
+        )
         name = str(media.get("name") or source_name(source) or "")
         mime_type = str(media.get("mime_type") or media.get("mime") or guess_mime_type(name or source) or "")
     else:
@@ -237,6 +426,48 @@ def is_supported_image(media: PostMedia | dict[str, Any]) -> bool:
         return True
     suffix = Path(name or source).suffix.lower()
     return suffix in QZONE_IMAGE_SUFFIXES
+
+
+def is_video_media(media: PostMedia | dict[str, Any]) -> bool:
+    if isinstance(media, dict):
+        kind = str(media.get("kind") or media.get("type") or "").lower()
+        source = _first_source_candidate(
+            media.get("source"),
+            media.get("url"),
+            media.get("download_url"),
+            media.get("downloadUrl"),
+            media.get("file_url"),
+            media.get("fileUrl"),
+            media.get("media_url"),
+            media.get("mediaUrl"),
+            media.get("path"),
+            media.get("file_path"),
+            media.get("filePath"),
+            media.get("absolute_path"),
+            media.get("absolutePath"),
+            media.get("abs_path"),
+            media.get("absPath"),
+            media.get("local_path"),
+            media.get("localPath"),
+            media.get("file"),
+            media.get("file_"),
+        )
+        name = str(media.get("name") or media.get("filename") or media.get("file_name") or source_name(source) or "")
+        mime_type = str(media.get("mime_type") or media.get("mime") or guess_mime_type(name or source) or "")
+        raw_type = str(media.get("raw_type") or "").lower()
+    else:
+        kind = media.kind
+        source = media.source
+        name = media.name
+        mime_type = media.mime_type or guess_mime_type(name or source)
+        raw_type = media.raw_type
+
+    if str(kind).lower() == "video" or str(raw_type).lower() == "video":
+        return True
+    if str(mime_type).lower().startswith("video/"):
+        return True
+    suffix = Path(name or source).suffix.lower()
+    return suffix in QZONE_VIDEO_SUFFIXES
 
 
 def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local: bool = False) -> PostMedia | None:
@@ -268,17 +499,39 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
         )
         if is_supported_image(media):
             media.kind = "image"
+        elif is_video_media(media):
+            media.kind = "video"
         return media
     if isinstance(item, dict):
-        source = normalize_source(item.get("source") or item.get("file") or item.get("url") or item.get("path") or "")
+        source = _first_source_candidate(
+            item.get("source"),
+            item.get("url"),
+            item.get("download_url"),
+            item.get("downloadUrl"),
+            item.get("file_url"),
+            item.get("fileUrl"),
+            item.get("media_url"),
+            item.get("mediaUrl"),
+            item.get("path"),
+            item.get("file_path"),
+            item.get("filePath"),
+            item.get("absolute_path"),
+            item.get("absolutePath"),
+            item.get("abs_path"),
+            item.get("absPath"),
+            item.get("local_path"),
+            item.get("localPath"),
+            item.get("file"),
+            item.get("file_"),
+        )
         if not source:
             return None
         kind = str(item.get("kind") or item.get("type") or default_kind).lower()
         if kind == "voice":
             kind = "audio"
-        name = str(item.get("name") or item.get("filename") or source_name(source) or "")
+        name = str(item.get("name") or item.get("filename") or item.get("file_name") or source_name(source) or "")
         mime_type = str(item.get("mime_type") or item.get("mime") or guess_mime_type(name or source) or "")
-        size_value = item.get("size") or 0
+        size_value = item.get("size") or item.get("file_size") or item.get("fileSize") or 0
         try:
             size = int(size_value or 0)
         except (TypeError, ValueError):
@@ -286,17 +539,20 @@ def normalize_media_item(item: Any, *, default_kind: str = "file", trusted_local
         item_trusted_local = trusted_local or _bool_value(
             item.get("trusted_local") or item.get("trusted_local_source") or item.get("from_message")
         )
+        raw_type = str(item.get("raw_type") or kind)
         media = PostMedia(
             kind=kind,
             source=source,
             name=name,
             mime_type=mime_type,
             size=size,
-            raw_type=kind,
-            trusted_local=item_trusted_local and _is_local_source(source),
+            raw_type=raw_type,
+            trusted_local=item_trusted_local or _is_local_source(source),
         )
         if is_supported_image(media):
             media.kind = "image"
+        elif is_video_media(media):
+            media.kind = "video"
         return media
     return None
 
@@ -399,13 +655,55 @@ def _component_mapping(component: Any) -> dict[str, Any]:
         "content",
         "message",
         "file",
+        "file_",
+        "file_id",
+        "fileId",
+        "file_unique",
+        "fileUnique",
+        "file_name",
+        "fileName",
+        "source",
+        "src",
         "url",
+        "download_url",
+        "downloadUrl",
+        "file_url",
+        "fileUrl",
+        "media_url",
+        "mediaUrl",
+        "origin_url",
+        "originUrl",
+        "original_url",
+        "originalUrl",
+        "cdn_url",
+        "cdnUrl",
+        "preview_url",
+        "previewUrl",
         "path",
+        "file_path",
+        "filePath",
+        "absolute_path",
+        "absolutePath",
+        "abs_path",
+        "absPath",
+        "local_path",
+        "localPath",
         "name",
         "filename",
+        "thumb",
+        "thumbnail",
+        "cover",
         "mime",
         "mime_type",
         "size",
+        "file_size",
+        "fileSize",
+        "id",
+        "message_id",
+        "messageId",
+        "message_seq",
+        "messageSeq",
+        "seq",
     ):
         if hasattr(component, attr):
             data[attr] = getattr(component, attr)
@@ -452,33 +750,65 @@ def _component_text(component: Any) -> str:
     return ""
 
 
-def _choose_media_source(data: dict[str, Any]) -> str:
-    candidates = [
-        data.get("url"),
-        data.get("path"),
-        data.get("file"),
-        data.get("source"),
-        data.get("attachment_id"),
-    ]
+def _source_needs_local_file(source: str) -> bool:
+    if not source or _is_url(source) or _is_base64_source(source):
+        return False
+    return _is_local_source(source) and _looks_like_path(source)
+
+
+def _local_media_source_exists(
+    source: str,
+    *,
+    kind: str = "",
+    name: str = "",
+    mime_type: str = "",
+) -> bool:
+    if not _source_needs_local_file(source):
+        return True
+    descriptor = {"kind": kind, "source": source, "name": name, "mime_type": mime_type}
+    if is_video_media(descriptor):
+        suffixes = QZONE_VIDEO_SUFFIXES
+    elif is_supported_image(descriptor):
+        suffixes = QZONE_IMAGE_SUFFIXES
+    else:
+        suffixes = QZONE_IMAGE_SUFFIXES | QZONE_VIDEO_SUFFIXES
+    return resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None
+
+
+def _choose_media_source(data: dict[str, Any], *, kind: str = "") -> str:
+    candidates = [data.get(key) for key in MEDIA_SOURCE_KEYS]
     normalized = [normalize_source(value) for value in candidates if value not in (None, "")]
+    normalized = [value for value in normalized if value and not _is_placeholder_source(value)]
+    name = str(data.get("name") or data.get("filename") or data.get("file_name") or data.get("fileName") or "")
+    mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name) or "")
+    source_kind = kind or str(data.get("kind") or data.get("type") or "")
     for value in normalized:
-        if _is_base64_source(value) or (not _is_url(value) and _looks_like_path(value)):
+        if _is_base64_source(value):
             return value
     for value in normalized:
-        if _is_url(value) or _is_base64_source(value) or _looks_like_path(value):
+        if not _is_url(value) and _looks_like_path(value):
+            candidate_name = name or source_name(value)
+            candidate_mime = mime_type or guess_mime_type(candidate_name or value)
+            if _local_media_source_exists(value, kind=source_kind, name=candidate_name, mime_type=candidate_mime):
+                return value
+    for value in normalized:
+        if _is_url(value):
             return value
-    return normalized[0] if normalized else ""
+    source = base64_media_source(data)
+    if source:
+        return source
+    return ""
 
 
-def _component_media(component: Any, kind: str) -> PostMedia | None:
+def _component_media(component: Any, kind: str, *, trusted_message: bool = False) -> PostMedia | None:
     data = _component_mapping(component)
-    source = _choose_media_source(data)
+    source = _choose_media_source(data, kind=kind)
     if not source:
         return None
-    name = str(data.get("name") or data.get("filename") or source_name(source) or "")
+    name = str(data.get("name") or data.get("filename") or data.get("file_name") or data.get("fileName") or source_name(source) or "")
     mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name or source) or "")
     try:
-        size = int(data.get("size") or 0)
+        size = int(data.get("size") or data.get("file_size") or data.get("fileSize") or 0)
     except (TypeError, ValueError):
         size = 0
     media = PostMedia(
@@ -488,11 +818,30 @@ def _component_media(component: Any, kind: str) -> PostMedia | None:
         mime_type=mime_type,
         size=size,
         raw_type=kind,
-        trusted_local=_is_local_source(source),
+        trusted_local=trusted_message or _is_local_source(source),
     )
     if is_supported_image(media):
         media.kind = "image"
+    elif is_video_media(media):
+        media.kind = "video"
     return media
+
+
+def _reference_media_is_usable(item: PostMedia) -> bool:
+    if not item.source:
+        return False
+    if _is_url(item.source) or _is_base64_source(item.source):
+        return True
+    if item.kind == "video" or is_video_media(item):
+        return (
+            resolve_trusted_local_media_path(
+                item.source,
+                name=item.name or source_name(item.source),
+                suffixes=QZONE_VIDEO_SUFFIXES,
+            )
+            is not None
+        )
+    return True
 
 
 def _event_message_text(event: Any) -> str:
@@ -535,8 +884,19 @@ def iter_event_components(event: Any) -> list[Any]:
         return list(raw)
     if isinstance(raw, dict) and isinstance(raw.get("message"), list) and raw.get("message"):
         return list(raw["message"])
+    if isinstance(raw, dict) and isinstance(raw.get("raw_message"), str):
+        segments = parse_cq_message(raw["raw_message"])
+        if segments:
+            return segments
+    if isinstance(raw, str):
+        segments = parse_cq_message(raw)
+        if segments:
+            return segments
     event_text = _event_message_text(event)
     if event_text:
+        segments = parse_cq_message(event_text)
+        if segments:
+            return segments
         return [event_text]
     return []
 
@@ -551,10 +911,32 @@ def _media_from_reference_field(value: Any, *, key: str) -> list[PostMedia]:
         values = value
     else:
         values = [value]
-    return normalize_media_list(values, default_kind=default_kind, trusted_local=True)
+    return [
+        item
+        for item in normalize_media_list(values, default_kind=default_kind, trusted_local=True)
+        if _reference_media_is_usable(item)
+    ]
 
 
-def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
+def _collect_referenced_media(
+    value: Any,
+    *,
+    seen: set[int],
+    depth: int = 0,
+    trusted_message: bool = True,
+) -> list[PostMedia]:
+    if isinstance(value, str):
+        media: list[PostMedia] = []
+        for segment in parse_cq_message(value):
+            media.extend(
+                _collect_referenced_media(
+                    segment,
+                    seen=seen,
+                    depth=depth + 1,
+                    trusted_message=trusted_message,
+                )
+            )
+        return media
     if depth > REFERENCE_MAX_DEPTH or not _is_traversable_reference_value(value):
         return []
 
@@ -566,12 +948,12 @@ def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> 
     media: list[PostMedia] = []
     if isinstance(value, (list, tuple, set)):
         for item in value:
-            media.extend(_collect_referenced_media(item, seen=seen, depth=depth + 1))
+            media.extend(_collect_referenced_media(item, seen=seen, depth=depth + 1, trusted_message=trusted_message))
         return media
 
     kind = _component_kind(value)
     if kind in MEDIA_KINDS:
-        item = _component_media(value, kind)
+        item = _component_media(value, kind, trusted_message=trusted_message)
         if item:
             media.append(item)
 
@@ -580,12 +962,12 @@ def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> 
             media.extend(_media_from_reference_field(nested, key=key))
 
     for nested in _iter_mapping_values(value, MESSAGE_CHAIN_KEYS):
-        if _is_traversable_reference_value(nested):
-            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+        if isinstance(nested, str) or _is_traversable_reference_value(nested):
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1, trusted_message=trusted_message))
 
     for nested in _iter_mapping_values(value, REFERENCE_OWNER_KEYS):
-        if _is_traversable_reference_value(nested):
-            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+        if isinstance(nested, str) or _is_traversable_reference_value(nested):
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1, trusted_message=trusted_message))
 
     return media
 
@@ -601,7 +983,7 @@ def iter_referenced_media(event: Any) -> list[PostMedia]:
             media.extend(_collect_referenced_media(value, seen=seen))
 
     raw = getattr(message_obj, "raw_message", None) or getattr(event, "raw_message", None)
-    if _is_traversable_reference_value(raw):
+    if isinstance(raw, str) or _is_traversable_reference_value(raw):
         media.extend(_collect_referenced_media(raw, seen=seen))
 
     for component in iter_event_components(event):
@@ -613,6 +995,110 @@ def iter_referenced_media(event: Any) -> list[PostMedia]:
             media.extend(_collect_referenced_media(value, seen=seen))
 
     return media
+
+
+def collect_message_media(payload: Any) -> list[PostMedia]:
+    """Return media segments from a message payload fetched from the platform."""
+
+    media = _collect_referenced_media(payload, seen=set(), trusted_message=True)
+    result: list[PostMedia] = []
+    seen: set[tuple[str, str]] = set()
+    for item in media:
+        key = _media_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _coerce_reference_message_id(value: Any) -> int | str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        return text
+    return number if number > 0 else None
+
+
+def _reference_message_id(value: Any) -> int | str | None:
+    data = _component_mapping(value)
+    for key in REFERENCE_MESSAGE_ID_KEYS:
+        identifier = _coerce_reference_message_id(data.get(key))
+        if identifier is not None:
+            return identifier
+    return None
+
+
+def _collect_reference_message_ids(value: Any, *, seen: set[int], depth: int = 0) -> list[int | str]:
+    if isinstance(value, str):
+        result: list[int | str] = []
+        for segment in parse_cq_message(value):
+            result.extend(_collect_reference_message_ids(segment, seen=seen, depth=depth + 1))
+        return result
+    if depth > REFERENCE_MAX_DEPTH or not _is_traversable_reference_value(value):
+        return []
+    marker = id(value)
+    if marker in seen:
+        return []
+    seen.add(marker)
+
+    result: list[int | str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            result.extend(_collect_reference_message_ids(item, seen=seen, depth=depth + 1))
+        return result
+
+    kind = _component_kind(value)
+    if kind in REFERENCE_KINDS:
+        identifier = _reference_message_id(value)
+        if identifier is not None:
+            result.append(identifier)
+
+    for nested in _iter_mapping_values(value, MESSAGE_CHAIN_KEYS):
+        if isinstance(nested, str) or _is_traversable_reference_value(nested):
+            result.extend(_collect_reference_message_ids(nested, seen=seen, depth=depth + 1))
+    for nested in _iter_mapping_values(value, REFERENCE_OWNER_KEYS):
+        if isinstance(nested, str) or _is_traversable_reference_value(nested):
+            result.extend(_collect_reference_message_ids(nested, seen=seen, depth=depth + 1))
+    return result
+
+
+def iter_reference_message_ids(event: Any) -> list[int | str]:
+    """Return referenced platform message ids from reply/quote segments."""
+
+    seen_values: set[str] = set()
+    result: list[int | str] = []
+    seen_objects: set[int] = set()
+
+    def append(values: Iterable[int | str]) -> None:
+        for value in values:
+            key = str(value)
+            if not key or key in seen_values:
+                continue
+            seen_values.add(key)
+            result.append(value)
+
+    message_obj = getattr(event, "message_obj", None)
+    for owner in (message_obj, event):
+        for value in _iter_mapping_values(owner, REFERENCE_OWNER_KEYS):
+            append(_collect_reference_message_ids(value, seen=seen_objects))
+
+    raw = getattr(message_obj, "raw_message", None) or getattr(event, "raw_message", None)
+    append(_collect_reference_message_ids(raw, seen=seen_objects))
+
+    for component in iter_event_components(event):
+        kind = _component_kind(component)
+        if kind in REFERENCE_KINDS:
+            identifier = _reference_message_id(component)
+            if identifier is not None:
+                append([identifier])
+        for value in _iter_mapping_values(component, REFERENCE_OWNER_KEYS):
+            append(_collect_reference_message_ids(value, seen=seen_objects))
+
+    return result
 
 
 def _media_dedupe_key(item: PostMedia) -> tuple[str, str]:
@@ -632,7 +1118,7 @@ def _append_collected_media(
     if key in seen:
         return
     seen.add(key)
-    if item.kind == "image":
+    if item.kind in {"image", "video"}:
         media.append(item)
         return
     attachments.append(item)
@@ -754,7 +1240,7 @@ def collect_post_payload(
                 content_parts.append(text)
             continue
         if kind in MEDIA_KINDS:
-            item = _component_media(component, kind)
+            item = _component_media(component, kind, trusted_message=True)
             if not item:
                 continue
             _append_collected_media(
