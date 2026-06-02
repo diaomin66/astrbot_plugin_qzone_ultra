@@ -30,8 +30,14 @@ QZONE_VIDEO_UPLOAD_APPID = "video_qzone"
 QZONE_VIDEO_UPLOAD_HOST = "video.upqzfile.com"
 QZONE_VIDEO_UPLOAD_BACKUP_HOST = "video.upqzfilebk.com"
 QZONE_VIDEO_UPLOAD_PORT = 80
+QZONE_PIC_UPLOAD_APPID = "pic_qzone"
+QZONE_PIC_UPLOAD_HOST = "pic.upqzfile.com"
+QZONE_PIC_UPLOAD_BACKUP_HOST = "pic.upqzfilebk.com"
+QZONE_PIC_UPLOAD_PORT = 80
 QZONE_VIDEO_FILE_TYPE = "Video"
+QZONE_PIC_FILE_TYPE = "Photo"
 QZONE_VIDEO_BUSINESS_TYPE = "QZoneVideo"
+QZONE_PIC_BUSINESS_TYPE = "QZonePhoto"
 QZONE_VIDEO_CONNECT_TYPE = "Epoll"
 QZONE_RECORD_VIDEO_BUSINESS_TYPE = 1
 QZONE_PUBLISH_MOOD_UNI_KEY = "publishmood"
@@ -42,6 +48,7 @@ QZONE_UNI_INT64_TYPE = "int64"
 
 TENCENT_UPLOAD_CMD_CONTROL = 1
 TENCENT_UPLOAD_CMD_FILE = 2
+TENCENT_UPLOAD_CHECK_TYPE_MD5 = 0
 TENCENT_UPLOAD_CHECK_TYPE_SHA1 = 1
 TENCENT_UPLOAD_DEFAULT_SLICE_SIZE = 256 * 1024
 TENCENT_UPLOAD_TOKEN_ENC_TYPE = 2
@@ -153,6 +160,84 @@ class UploadVideoInfoRsp:
 
 
 @dataclass(frozen=True, slots=True)
+class MultiPicInfo:
+    batch_upload_num: int = 0
+    current_upload: int = 0
+    success_num: int = 0
+    fail_num: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PicExtendInfo:
+    effect: int = 0
+    quan_info: tuple[Any, ...] = field(default_factory=tuple)
+    exif: dict[str, str] | None = None
+    user_define_source: str = ""
+    params: dict[str, str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UploadPicInfoReq:
+    title: str = ""
+    desc: str = ""
+    album_name: str = ""
+    album_id: str = ""
+    album_type_id: int = 7
+    bitmap: int = 0
+    upload_type: int = 0
+    up_pic_type: int = 0
+    batch_id: int = 0
+    multi_pic_info: MultiPicInfo | None = None
+    extend_info: PicExtendInfo | None = None
+    pic_path: str = ""
+    width: int = 0
+    height: int = 0
+    water_type: int = 0
+    exif_camera_maker: str = ""
+    exif_camera_model: str = ""
+    exif_time: str = ""
+    exif_latitude_ref: str = ""
+    exif_latitude: str = ""
+    exif_longitude_ref: str = ""
+    exif_longitude: str = ""
+    need_feeds: int = 0
+    upload_time: int = 0
+    map_ext: dict[str, str] | None = None
+    distinct_use: int = 0x37DD
+    other_params: str = ""
+    business_type: int = 0
+    business_data: bytes | None = None
+    external_map_ext: dict[str, str] | None = None
+    external_data: dict[str, bytes] | None = None
+    resource_type: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class UploadPicInfoRsp:
+    small_url: str = ""
+    big_url: str = ""
+    album_id: str = ""
+    photo_id: str = ""
+    sloc: str = ""
+    width: int = 0
+    height: int = 0
+    original_url: str = ""
+    original_width: int = 0
+    original_height: int = 0
+    original_photo_id: str = ""
+    pic_type: int = 0
+    adapt_url_160: str = ""
+    adapt_url_200: str = ""
+    adapt_url_400: str = ""
+    adapt_url_640: str = ""
+    adapt_url_1000: str = ""
+    business_type: int = 0
+    business_data_rsp: bytes = b""
+    real_lloc: str = ""
+    photo_md5: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class AuthToken:
     type: int = TENCENT_UPLOAD_TOKEN_ENC_TYPE
     data: bytes = b""
@@ -257,6 +342,8 @@ class FileUploadReq:
     checksum: str = ""
     check_type: int = TENCENT_UPLOAD_CHECK_TYPE_SHA1
     send_time: int = 0
+    data_type: int = 0
+    extend_info: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +370,25 @@ class QzoneTencentVideoUploadResult:
             "vid": self.vid,
             "business_type": self.business_type,
             "business_data_length": len(self.business_data),
+            "uploaded_bytes": self.uploaded_bytes,
+            "session": self.session,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QzoneTencentPicUploadResult:
+    response: UploadPicInfoRsp
+    uploaded_bytes: int
+    session: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "photo_id": self.response.photo_id,
+            "album_id": self.response.album_id,
+            "sloc": self.response.sloc,
+            "real_lloc": self.response.real_lloc,
+            "business_type": self.response.business_type,
+            "business_data_rsp_length": len(self.response.business_data_rsp),
             "uploaded_bytes": self.uploaded_bytes,
             "session": self.session,
         }
@@ -366,12 +472,112 @@ def encode_upload_video_info_req(request: UploadVideoInfoReq) -> bytes:
     )
 
 
+def encode_multi_pic_info(info: MultiPicInfo) -> Any:
+    return jce_struct(
+        [
+            JceField(0, info.batch_upload_num),
+            JceField(1, info.current_upload),
+            JceField(2, info.success_num),
+            JceField(3, info.fail_num),
+        ]
+    )
+
+
+def encode_pic_extend_info(info: PicExtendInfo) -> Any:
+    fields = [JceField(0, info.effect)]
+    if info.quan_info:
+        fields.append(JceField(1, list(info.quan_info)))
+    if info.exif is not None:
+        fields.append(JceField(2, dict(info.exif)))
+    if info.user_define_source is not None:
+        fields.append(JceField(3, info.user_define_source))
+    if info.params is not None:
+        fields.append(JceField(4, dict(info.params)))
+    return jce_struct(fields)
+
+
+def encode_upload_pic_info_req(request: UploadPicInfoReq) -> bytes:
+    fields = [
+        JceField(0, request.title),
+        JceField(1, request.desc),
+        JceField(2, request.album_name),
+        JceField(3, request.album_id),
+        JceField(4, request.album_type_id),
+        JceField(5, request.bitmap),
+        JceField(6, request.upload_type),
+        JceField(7, request.up_pic_type),
+        JceField(8, request.batch_id),
+    ]
+    if request.multi_pic_info is not None:
+        fields.append(JceField(9, encode_multi_pic_info(request.multi_pic_info)))
+    if request.extend_info is not None:
+        fields.append(JceField(10, encode_pic_extend_info(request.extend_info)))
+    fields.extend(
+        [
+            JceField(11, request.pic_path),
+            JceField(12, request.width),
+            JceField(13, request.height),
+            JceField(14, request.water_type),
+            JceField(15, request.exif_camera_maker),
+            JceField(16, request.exif_camera_model),
+            JceField(17, request.exif_time),
+            JceField(18, request.exif_latitude_ref),
+            JceField(19, request.exif_latitude),
+            JceField(20, request.exif_longitude_ref),
+            JceField(21, request.exif_longitude),
+            JceField(22, request.need_feeds),
+            JceField(23, request.upload_time),
+        ]
+    )
+    if request.map_ext is not None:
+        fields.append(JceField(24, dict(request.map_ext)))
+    fields.append(JceField(25, request.distinct_use))
+    if request.other_params is not None:
+        fields.append(JceField(28, request.other_params))
+    fields.append(JceField(29, request.business_type))
+    if request.business_data is not None:
+        fields.append(JceField(30, bytes(request.business_data)))
+    if request.external_map_ext is not None:
+        fields.append(JceField(31, dict(request.external_map_ext)))
+    if request.external_data is not None:
+        fields.append(JceField(32, dict(request.external_data)))
+    fields.append(JceField(33, request.resource_type))
+    return encode_struct(fields)
+
+
 def decode_upload_video_info_rsp(payload: bytes) -> UploadVideoInfoRsp:
     nodes = decode_struct(payload)
     return UploadVideoInfoRsp(
         vid=as_str(field_value(nodes, 0), ""),
         business_type=as_int(field_value(nodes, 1), 0),
         business_data=as_bytes(field_value(nodes, 2), b""),
+    )
+
+
+def decode_upload_pic_info_rsp(payload: bytes) -> UploadPicInfoRsp:
+    nodes = decode_struct(payload)
+    return UploadPicInfoRsp(
+        small_url=as_str(field_value(nodes, 0), ""),
+        big_url=as_str(field_value(nodes, 1), ""),
+        album_id=as_str(field_value(nodes, 2), ""),
+        photo_id=as_str(field_value(nodes, 3), ""),
+        sloc=as_str(field_value(nodes, 4), ""),
+        width=as_int(field_value(nodes, 5), 0),
+        height=as_int(field_value(nodes, 6), 0),
+        original_url=as_str(field_value(nodes, 7), ""),
+        original_width=as_int(field_value(nodes, 8), 0),
+        original_height=as_int(field_value(nodes, 9), 0),
+        original_photo_id=as_str(field_value(nodes, 10), ""),
+        pic_type=as_int(field_value(nodes, 11), 0),
+        adapt_url_160=as_str(field_value(nodes, 12), ""),
+        adapt_url_200=as_str(field_value(nodes, 13), ""),
+        adapt_url_400=as_str(field_value(nodes, 14), ""),
+        adapt_url_640=as_str(field_value(nodes, 15), ""),
+        adapt_url_1000=as_str(field_value(nodes, 16), ""),
+        business_type=as_int(field_value(nodes, 18), 0),
+        business_data_rsp=as_bytes(field_value(nodes, 19), b""),
+        real_lloc=as_str(field_value(nodes, 20), ""),
+        photo_md5=as_str(field_value(nodes, 21), ""),
     )
 
 
@@ -599,18 +805,20 @@ def decode_file_control_rsp_nodes(nodes: list[Any]) -> FileControlRsp:
 
 
 def encode_file_upload_req(request: FileUploadReq) -> bytes:
-    return encode_struct(
-        [
-            JceField(0, request.uin),
-            JceField(1, request.appid),
-            JceField(2, request.session),
-            JceField(3, request.offset),
-            JceField(4, request.data),
-            JceField(5, request.checksum),
-            JceField(6, request.check_type),
-            JceField(7, request.send_time),
-        ]
-    )
+    fields = [
+        JceField(0, request.uin),
+        JceField(1, request.appid),
+        JceField(2, request.session),
+        JceField(3, request.offset),
+        JceField(4, request.data),
+        JceField(5, request.checksum),
+        JceField(6, request.check_type),
+        JceField(7, request.send_time),
+        JceField(8, request.data_type),
+    ]
+    if request.extend_info:
+        fields.append(JceField(9, dict(request.extend_info)))
+    return encode_struct(fields)
 
 
 def decode_file_upload_rsp(payload: bytes) -> FileUploadRsp:
@@ -640,6 +848,14 @@ def decode_st_offset_nodes(nodes: list[Any]) -> StOffset:
 
 def sha1_file(path: str | Path) -> str:
     digest = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def md5_file(path: str | Path) -> str:
+    digest = hashlib.md5()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -774,6 +990,11 @@ class QzoneTencentVideoUploader:
                 proto_extend_info=proto_extend_info,
             )
             business_type = int(business_type or QZONE_RECORD_VIDEO_BUSINESS_TYPE)
+        upload_extend_info = {str(key): str(value) for key, value in dict(extend_info or {}).items()}
+        upload_extend_info.setdefault("video_type", "3")
+        upload_extend_info.setdefault("qz_video_format", _qzone_video_format(path))
+        if client_key:
+            upload_extend_info.setdefault("clientkey", str(client_key))
         info_req = UploadVideoInfoReq(
             title=title or path.name,
             desc=desc,
@@ -784,7 +1005,7 @@ class QzoneTencentVideoUploader:
             cover_url=cover_url,
             is_original_video=is_original_video,
             is_format_f20=is_format_f20,
-            extend_info=dict(extend_info or {}),
+            extend_info=upload_extend_info,
             width=width,
             height=height,
         )
@@ -808,10 +1029,94 @@ class QzoneTencentVideoUploader:
                         uploaded_bytes=control_rsp.offset or file_size,
                         session=control_rsp.session,
                     )
-            return self._upload_slices(sock, path, file_size, control_rsp)
+            return self._upload_video_slices(sock, path, file_size, control_rsp)
 
-    def _connect(self) -> Any:
-        return self.socket_factory((self.host, self.port), timeout=self.timeout)
+    def upload_video_cover(
+        self,
+        cover_path: str | Path,
+        *,
+        vid: str,
+        video_path: str | Path | None = None,
+        client_key: str = "",
+        video_size: int = 0,
+        duration_ms: int = 0,
+        is_original_video: int = 0,
+        desc: str = "",
+        width: int = 0,
+        height: int = 0,
+        batch_id: int = 0,
+        upload_time: int = 0,
+        business_type: int = 0,
+        business_data: bytes | None = None,
+        extra_map_ext: dict[str, str] | None = None,
+        extra_params: dict[str, str] | None = None,
+    ) -> QzoneTencentPicUploadResult:
+        """Upload the Android video-cover ImageUploadTask for a completed sVid."""
+
+        path = Path(cover_path)
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        if not str(vid or "").strip():
+            raise TencentUploadProtocolError("video cover upload requires sVid")
+        file_size = path.stat().st_size
+        upload_time = int(upload_time or time.time() * 1000)
+        batch_id = int(batch_id or _batch_id_from_client_key(client_key) or upload_time)
+        width, height = _resolve_image_size(path, width, height)
+        params = {str(key): str(value) for key, value in dict(extra_params or {}).items()}
+        params["vid"] = str(vid)
+        if client_key:
+            params.setdefault("clientkey", str(client_key))
+        params.setdefault("raw_width", str(width))
+        params.setdefault("raw_height", str(height))
+        params.setdefault("raw_size", str(file_size))
+        params.setdefault("show_geo", "0")
+        map_ext = {"mobile_fakefeeds_clientkey": str(client_key or "")}
+        external_map_ext = {str(key): str(value) for key, value in dict(extra_map_ext or {}).items()}
+        external_map_ext.setdefault("is_client_upload_cover", "1")
+        external_map_ext.setdefault("is_pic_video_mix_feeds", "1")
+        if int(video_size or 0) > 0:
+            external_map_ext.setdefault("mix_videoSize", str(int(video_size)))
+        external_map_ext.setdefault("mix_isOriginalVideo", str(int(is_original_video or 0)))
+        if int(duration_ms or 0) > 0:
+            external_map_ext.setdefault("mix_time", str(int(duration_ms)))
+        info_req = UploadPicInfoReq(
+            desc=desc,
+            batch_id=batch_id,
+            multi_pic_info=MultiPicInfo(batch_upload_num=1, current_upload=0),
+            extend_info=PicExtendInfo(params=params),
+            pic_path=str(video_path or path),
+            width=width,
+            height=height,
+            upload_time=upload_time,
+            map_ext=map_ext,
+            distinct_use=0x37DD,
+            business_type=int(business_type or 0),
+            business_data=business_data,
+            external_map_ext=external_map_ext,
+        )
+        control_req = FileControlReq(
+            uin=self.uin,
+            token=self.token,
+            appid=QZONE_PIC_UPLOAD_APPID,
+            checksum=md5_file(path),
+            check_type=TENCENT_UPLOAD_CHECK_TYPE_MD5,
+            file_len=file_size,
+            biz_req=encode_upload_pic_info_req(info_req),
+        )
+        with self._connect(host=QZONE_PIC_UPLOAD_HOST, port=QZONE_PIC_UPLOAD_PORT) as sock:
+            control_rsp = self._send_control(sock, control_req)
+            self._raise_on_result(control_rsp.result, "视频封面控制包被拒绝")
+            if control_rsp.biz_rsp:
+                pic_rsp = decode_upload_pic_info_rsp(control_rsp.biz_rsp)
+                return QzoneTencentPicUploadResult(
+                    response=pic_rsp,
+                    uploaded_bytes=control_rsp.offset or file_size,
+                    session=control_rsp.session,
+                )
+            return self._upload_pic_slices(sock, path, file_size, control_rsp)
+
+    def _connect(self, *, host: str | None = None, port: int | None = None) -> Any:
+        return self.socket_factory((host or self.host, int(port or self.port)), timeout=self.timeout)
 
     def _send_control(self, sock: Any, request: FileControlReq) -> FileControlRsp:
         payload = encode_file_batch_control_req(FileBatchControlReq(control_req={"1": request}))
@@ -823,13 +1128,76 @@ class QzoneTencentVideoUploader:
             raise TencentUploadProtocolError("Tencent upload control response lacks key '1'")
         return response
 
-    def _upload_slices(
+    def _upload_video_slices(
         self,
         sock: Any,
         path: Path,
         file_size: int,
         control_rsp: FileControlRsp,
     ) -> QzoneTencentVideoUploadResult:
+        def decode_result(payload: bytes, uploaded_bytes: int, session: str) -> QzoneTencentVideoUploadResult:
+            video_rsp = decode_upload_video_info_rsp(payload)
+            if not video_rsp.vid:
+                raise TencentUploadProtocolError("UploadVideoInfoRsp 缺少 sVid")
+            return QzoneTencentVideoUploadResult(
+                vid=video_rsp.vid,
+                business_type=video_rsp.business_type,
+                business_data=video_rsp.business_data,
+                uploaded_bytes=uploaded_bytes,
+                session=session,
+            )
+
+        return self._upload_slices(
+            sock,
+            path,
+            file_size,
+            control_rsp,
+            appid=QZONE_VIDEO_UPLOAD_APPID,
+            check_type=TENCENT_UPLOAD_CHECK_TYPE_SHA1,
+            reject_message="视频分片上传被拒绝",
+            missing_message="Tencent upload finished without UploadVideoInfoRsp",
+            decode_result=decode_result,
+        )
+
+    def _upload_pic_slices(
+        self,
+        sock: Any,
+        path: Path,
+        file_size: int,
+        control_rsp: FileControlRsp,
+    ) -> QzoneTencentPicUploadResult:
+        def decode_result(payload: bytes, uploaded_bytes: int, session: str) -> QzoneTencentPicUploadResult:
+            return QzoneTencentPicUploadResult(
+                response=decode_upload_pic_info_rsp(payload),
+                uploaded_bytes=uploaded_bytes,
+                session=session,
+            )
+
+        return self._upload_slices(
+            sock,
+            path,
+            file_size,
+            control_rsp,
+            appid=QZONE_PIC_UPLOAD_APPID,
+            check_type=TENCENT_UPLOAD_CHECK_TYPE_MD5,
+            reject_message="视频封面分片上传被拒绝",
+            missing_message="Tencent upload finished without UploadPicInfoRsp",
+            decode_result=decode_result,
+        )
+
+    def _upload_slices(
+        self,
+        sock: Any,
+        path: Path,
+        file_size: int,
+        control_rsp: FileControlRsp,
+        *,
+        appid: str,
+        check_type: int,
+        reject_message: str,
+        missing_message: str,
+        decode_result: Callable[[bytes, int, str], Any],
+    ) -> Any:
         session = control_rsp.session
         if not session:
             raise TencentUploadProtocolError("Tencent upload control response lacks session")
@@ -843,29 +1211,25 @@ class QzoneTencentVideoUploader:
                     break
                 upload_req = FileUploadReq(
                     uin=self.uin,
-                    appid=QZONE_VIDEO_UPLOAD_APPID,
+                    appid=appid,
                     session=session,
                     offset=offset,
                     data=chunk,
+                    check_type=check_type,
                     send_time=int(time.time()),
                 )
                 self._send_frame(sock, TENCENT_UPLOAD_CMD_FILE, encode_file_upload_req(upload_req))
                 upload_rsp = decode_file_upload_rsp(self._read_frame(sock).payload)
-                self._raise_on_result(upload_rsp.result, "视频分片上传被拒绝")
+                self._raise_on_result(upload_rsp.result, reject_message)
                 if upload_rsp.biz_rsp:
-                    video_rsp = decode_upload_video_info_rsp(upload_rsp.biz_rsp)
-                    if not video_rsp.vid:
-                        raise TencentUploadProtocolError("UploadVideoInfoRsp 缺少 sVid")
-                    return QzoneTencentVideoUploadResult(
-                        vid=video_rsp.vid,
-                        business_type=video_rsp.business_type,
-                        business_data=video_rsp.business_data,
-                        uploaded_bytes=max(offset + len(chunk), upload_rsp.offset),
-                        session=upload_rsp.session or session,
+                    return decode_result(
+                        upload_rsp.biz_rsp,
+                        max(offset + len(chunk), upload_rsp.offset),
+                        upload_rsp.session or session,
                     )
                 next_offset = int(upload_rsp.offset or 0)
                 offset = next_offset if next_offset > offset else offset + len(chunk)
-        raise TencentUploadProtocolError("Tencent upload finished without UploadVideoInfoRsp")
+        raise TencentUploadProtocolError(missing_message)
 
     def _send_frame(self, sock: Any, cmd: int, payload: bytes) -> None:
         frame = encode_upload_pdu(cmd, self._next_seq(), payload)
@@ -909,6 +1273,16 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
             detail="Record-video shuoshuo uses UniAttribute(hostuin, publishmood) as UploadVideoInfoReq.vBusiNessData/iBusiNessType=1 instead of a separate final publish RPC.",
         ),
         NativeVideoDaemonRequirement(
+            name="video_cover_pic_qzone_upload",
+            status="implemented",
+            detail="Implemented the Android ImageUploadTask cover leg: pic_qzone, pic.upqzfile.com:80, UploadPicInfoReq/PicExtendInfo, vid/clientkey/mix_* fields, and MD5 file control.",
+        ),
+        NativeVideoDaemonRequirement(
+            name="feed_vid_verification",
+            status="implemented",
+            detail="Daemon native video publish must poll recent feeds and verify the returned sVid before reporting success.",
+        ),
+        NativeVideoDaemonRequirement(
             name="qq_upload_login_material",
             status="configured" if credentials_ready else "missing",
             detail="Need vLoginData and optional vLoginKey compatible with TokenProvider.getAuthToken; configure QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64 for daemon background upload.",
@@ -926,6 +1300,26 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
             "cmd": str(TENCENT_UPLOAD_CMD_FILE),
             "jce": "SLICE_UPLOAD/FileUploadReq",
             "response": "FileUpload/UploadVideoInfoRsp when the upload finishes",
+        },
+        {
+            "step": "cover_control",
+            "cmd": str(TENCENT_UPLOAD_CMD_CONTROL),
+            "jce": "SLICE_UPLOAD/FileBatchControlReq -> FileControlReq",
+            "appid": QZONE_PIC_UPLOAD_APPID,
+            "host": QZONE_PIC_UPLOAD_HOST,
+            "biz_req": "FileUpload/UploadPicInfoReq with stExtendInfo.mapParams[vid/clientkey] and stExternalMapExt[mix_*]",
+        },
+        {
+            "step": "cover_slice",
+            "cmd": str(TENCENT_UPLOAD_CMD_FILE),
+            "jce": "SLICE_UPLOAD/FileUploadReq",
+            "response": "FileUpload/UploadPicInfoRsp when the cover upload finishes",
+        },
+        {
+            "step": "feed_verification",
+            "cmd": "poll",
+            "jce": "recent feed raw/detail",
+            "input": "the same sVid must appear before daemon reports success",
         },
         {
             "step": "publish_business_data",
@@ -948,8 +1342,8 @@ def qzone_video_upload_probe(video_path: str | Path | None = None) -> dict[str, 
     payload["video_path"] = str(path) if path else ""
     payload["video_readable"] = bool(path and path.is_file())
     payload["reason"] = (
-        "daemon native video upload and record-video publish business data are implemented; true background publishing "
-        "requires QQ upload login material via QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64"
+        "daemon native video upload, Android video-cover pic_qzone upload, and feed sVid verification are implemented; "
+        "true background publishing requires QQ upload login material via QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64"
     )
     return payload
 
@@ -978,6 +1372,38 @@ def _file_control_req_fields(request: FileControlReq) -> list[JceField]:
 
 def _source_struct(subtype: int, termtype: int, apptype: int) -> Any:
     return jce_struct([JceField(0, int(subtype or 0)), JceField(1, int(termtype or 0)), JceField(2, int(apptype or 0))])
+
+
+def _qzone_video_format(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix in {"mp4", "m4v", "mov"}:
+        return "h264"
+    if suffix:
+        return suffix
+    return "h264"
+
+
+def _batch_id_from_client_key(client_key: str) -> int:
+    text = str(client_key or "")
+    if "_" not in text:
+        return 0
+    tail = text.rsplit("_", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
+
+
+def _resolve_image_size(path: Path, width: int, height: int) -> tuple[int, int]:
+    if int(width or 0) > 0 and int(height or 0) > 0:
+        return int(width), int(height)
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return int(width or image.width or 0), int(height or image.height or 0)
+    except Exception:
+        return int(width or 0), int(height or 0)
 
 
 def _ugc_right_info_struct(ugc_right: int) -> Any:

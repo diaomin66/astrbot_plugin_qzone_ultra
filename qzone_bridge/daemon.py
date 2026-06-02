@@ -21,9 +21,12 @@ from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzonePar
 from .local_media import resolve_trusted_local_media_path
 from .media import (
     QZONE_MAX_IMAGES,
+    QZONE_IMAGE_SUFFIXES,
     QZONE_VIDEO_SUFFIXES,
     PostMedia,
     PostPayload,
+    is_supported_image,
+    is_video_media,
     media_reference_text,
     normalize_media_list,
     normalize_source,
@@ -45,7 +48,7 @@ from .tencent_upload import (
     qzone_video_upload_credentials_configured,
     qzone_video_upload_credentials_from_env,
 )
-from .video import materialize_video_cover_list, materialize_video_source_list
+from .video import materialize_video_cover_list, materialize_video_source_list, video_cover_media
 from .models import FeedEntry, SessionState, VideoUploadCredentialState
 from .parser import (
     compute_unikey,
@@ -64,6 +67,7 @@ from .utils import now_iso, from_iso
 
 log = get_logger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
+NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0)
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
 PUBLIC_HEALTH_METHODS = {"GET", "HEAD"}
@@ -192,11 +196,43 @@ def _trusted_daemon_video_path(video: PostMedia) -> Path | None:
     )
 
 
+def _trusted_daemon_image_path(image: PostMedia) -> Path | None:
+    if not image.trusted_local:
+        return None
+    source = normalize_source(image.source)
+    return resolve_trusted_local_media_path(
+        source,
+        name=image.name or source_name(source),
+        suffixes=QZONE_IMAGE_SUFFIXES,
+    )
+
+
 def _file_size(path: Path) -> int:
     try:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _contains_video_media(media: list[PostMedia]) -> bool:
+    return any(not is_supported_image(item) and is_video_media(item) for item in media)
+
+
+def _raw_contains_text(value: Any, needle: str, *, depth: int = 0) -> bool:
+    if not needle or depth > 8:
+        return False
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return str(value) == needle
+    if isinstance(value, dict):
+        return any(
+            _raw_contains_text(key, needle, depth=depth + 1) or _raw_contains_text(item, needle, depth=depth + 1)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_raw_contains_text(item, needle, depth=depth + 1) for item in value)
+    return False
 
 
 class QzoneDaemonService:
@@ -797,6 +833,35 @@ class QzoneDaemonService:
         self._set_success(defer_save=True)
         return {"items": visitors, "count": len(visitors), "raw": payload}
 
+    async def _wait_for_native_video_feed(self, *, vid: str) -> dict[str, Any] | None:
+        vid = str(vid or "").strip()
+        if not vid:
+            return None
+        last_error: Exception | None = None
+        for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                page = await self.list_feeds(
+                    hostuin=int(self.state.session.uin or 0),
+                    limit=10,
+                    scope="self",
+                    record_recent=False,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                last_error = exc
+                log.debug("qzone native video feed verification fetch failed: %s", exc)
+                continue
+            for item in page.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.get("raw")
+                if _raw_contains_text(item, vid) or _raw_contains_text(raw, vid):
+                    return item
+        if last_error is not None:
+            log.warning("qzone native video feed verification ended with fetch errors: %s", last_error)
+        return None
+
     async def _publish_native_video_if_configured(
         self,
         *,
@@ -804,14 +869,21 @@ class QzoneDaemonService:
         sync_weibo: bool,
         media: list[PostMedia],
     ) -> dict[str, Any] | None:
-        if not self._video_upload_credentials_configured():
-            return None
         video = native_video_candidate(PostPayload(content=content, media=list(media)))
         if video is None:
             return None
         path = _trusted_daemon_video_path(video)
         if path is None:
-            return None
+            raise QzoneParseError(
+                "daemon 原生视频后台直发需要可读取的本地视频文件，已阻止视频封面替代发布",
+                detail={"name": video.name or source_name(video.source), "source": video.source},
+            )
+        if not self._video_upload_credentials_configured():
+            raise QzoneParseError(
+                "daemon 原生视频后台直发缺少 QQ upload 登录材料，已阻止视频封面替代发布；"
+                "请先使用 /qzone videoauth 或 /qzone autovideoauth 绑定上传材料",
+                detail={"name": video.name or path.name, "video_upload_configured": False},
+            )
         self._ensure_session_ready()
         try:
             credentials = self._video_upload_credentials()
@@ -821,6 +893,13 @@ class QzoneDaemonService:
         file_size = _file_size(path)
         client_key = f"{self.state.session.uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
         try:
+            cover = video_cover_media(video, self.store.root / "video_covers")
+            cover_path = _trusted_daemon_image_path(cover)
+            if cover_path is None:
+                raise QzoneParseError(
+                    "daemon 原生视频后台直发无法生成可读取的视频封面，已停止发布",
+                    detail={"name": video.name or path.name},
+                )
             uploader = QzoneTencentVideoUploader(
                 uin=self.state.session.uin,
                 login_data=credentials.login_data,
@@ -841,6 +920,16 @@ class QzoneDaemonService:
                 client_key=client_key,
                 business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
             )
+            cover_result = await asyncio.to_thread(
+                uploader.upload_video_cover,
+                cover_path,
+                vid=result.vid,
+                video_path=path,
+                client_key=client_key,
+                video_size=file_size,
+                duration_ms=duration_ms,
+                desc=content,
+            )
         except QzoneNativeVideoCredentialError as exc:
             raise QzoneParseError(str(exc)) from exc
         except FileNotFoundError as exc:
@@ -852,21 +941,30 @@ class QzoneDaemonService:
             size=file_size,
             time_length=duration_ms,
         )
+        verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
+        if verified_feed is None:
+            raise QzoneRequestError(
+                "QQ 空间原生视频后台上传已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",
+                detail={"vid": result.vid, "client_key": client_key, "cover_upload": cover_result.to_dict()},
+            )
         return {
-            "fid": "",
+            "fid": str(verified_feed.get("fid") or ""),
             "vid": result.vid,
-            "message": "已提交 QQ 空间原生视频后台上传发布",
+            "message": "已验证 QQ 空间原生视频后台直发成功",
             "native_video": True,
-            "status": "submitted_native_upload",
-            "operation_status": "accepted_pending_verification",
+            "status": "published_native_video",
+            "operation_status": "verified_feed_video",
             "media_count": len(media),
-            "photo_count": 0,
+            "photo_count": 1,
             "raw": {
                 "upload_result": result.to_dict(),
+                "cover_upload_result": cover_result.to_dict(),
                 "credentials": credentials.to_dict(),
                 "finish_report_payload_length": len(finish_report),
                 "video": video.to_dict(),
+                "cover": cover.to_dict(),
                 "client_key": client_key,
+                "verified_feed": verified_feed,
             },
         }
 
@@ -892,6 +990,12 @@ class QzoneDaemonService:
         if native_payload is not None:
             self._set_success(defer_save=True)
             return native_payload
+        if _contains_video_media(normalized_media):
+            raise QzoneParseError(
+                "daemon 原生视频后台直发仅支持单个本地视频，已阻止视频封面替代发布；"
+                "请只附带一个视频，或关闭 native_video_publish 后明确按封面图发布",
+                detail={"media_count": len(normalized_media)},
+            )
         normalized_media, _video_covers_changed = materialize_video_cover_list(
             normalized_media,
             self.store.root / "video_covers",

@@ -34,6 +34,10 @@ QZONE_VIDEO_SUFFIXES = {
     ".mts",
     ".m2ts",
 }
+QZONE_VIDEO_MIME_OVERRIDES = {
+    ".3gp": "video/3gpp",
+    ".3g2": "video/3gpp2",
+}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
 REFERENCE_KINDS = {"reply", "quote", "quoted", "reference"}
@@ -384,6 +388,9 @@ def source_name(source: str) -> str:
 def guess_mime_type(name_or_source: str) -> str:
     if not name_or_source or _is_base64_source(name_or_source):
         return ""
+    suffix = Path(str(name_or_source)).suffix.lower()
+    if suffix in QZONE_VIDEO_MIME_OVERRIDES:
+        return QZONE_VIDEO_MIME_OVERRIDES[suffix]
     guessed, _ = mimetypes.guess_type(name_or_source)
     return guessed or ""
 

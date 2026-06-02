@@ -1,10 +1,10 @@
 # QQ 空间 daemon 原生视频发布逆向记录
 
-日期：2026-06-01
+日期：2026-06-02
 
 ## 结论
 
-当前仓库里的 daemon 已能稳定做到“引用视频 -> 获取真实视频源 -> 提取封面 -> 按图片说说发布”。但“daemon 后台直接发布 QQ 空间原生视频”还不能只靠现有 Web 说说接口完成。
+当前仓库里的 daemon 已完全废除 QQ/QQNT 客户端 handoff，也不再把视频帧伪装成图片说说发布。`native_video_publish` 开启时，单个本地视频只走 Tencent upload 后台直发链路；缺少 QQ upload 登录材料、媒体组合不适合原生发布，或上传后未能在最近动态中验证到同一 `sVid` 时，都会直接报错。
 
 已知的 PC/Web 路径是：
 
@@ -77,9 +77,9 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - `encode_file_batch_control_req()` / `decode_file_batch_control_rsp()`
 - `encode_file_upload_req()` / `decode_file_upload_rsp()`
 - `QzoneTencentVideoUploader`：可按控制包、分片包顺序走 socket/PDU/JCE 上传流程，成功响应里解析 `sVid/iBusiNessType/vBusiNessData`。
-- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项已经从编码层收敛为 QQ upload 二进制登录材料；录制视频说说的发布体已确认嵌入 `UploadVideoInfoReq.vBusiNessData`。
+- `qzone_video_upload_probe()`：面向 daemon 后续接入的协议探针，明确当前阻塞项已经从编码层收敛为 QQ upload 二进制登录材料；录制视频说说的发布体已确认嵌入 `UploadVideoInfoReq.vBusiNessData`，且 Android 的视频封面 `pic_qzone` 上传腿也已落地。
 
-这一步把“已确认的 wire protocol”从文档变成可回归测试的代码边界。v0.6.8 继续确认了录制视频说说的发布体其实嵌在 `vBusiNessData` 中；后续真正依赖外部补齐的是 `vLoginData/vLoginKey` 这类 QQ upload 二进制登录材料。
+这一步把“已确认的 wire protocol”从文档变成可回归测试的代码边界。v0.6.8 继续确认了录制视频说说的发布体其实嵌在 `vBusiNessData` 中；v0.6.9 继续确认只上传视频拿到 `sVid` 还不够，Android 客户端还会上传视频封面来触发混排视频动态。后续真正依赖外部补齐的是 `vLoginData/vLoginKey` 这类 QQ upload 二进制登录材料。
 
 ## 需要继续逆向的点
 
@@ -87,7 +87,7 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 
 1. `vLoginData/vLoginKey` 的生成来源，尤其是 QQ 登录态、设备态、uin、skey/pt4_token 之外的二进制字段，以及 `ITokenEncryptor` 是否在 QQ/Qzone 运行时被替换。
 2. `vBusiNessData` 的结构已确认包含 `UniAttribute(hostuin, publishmood)`；后续需要继续实测不同来源、同步选项、权限设置下的扩展字段差异。
-3. 视频封面、时长、宽高、转码/原画、`needProcess` 等字段在上传 SDK 与最终发布模型中的映射。
+3. 视频封面上传已确认需要 `pic_qzone` / `UploadPicInfoReq` / `PicExtendInfo.mapParams[vid,clientkey]` / `stExternalMapExt[mix_*]`；后续需要继续实测转码/原画、`needProcess`、不同封面宽高与服务端审核状态的差异。
 4. 成功上传后的 `rptVSUploadFinish` 上报是否必需，以及它是否需要 WNS/移动端 SSO 会话才能补发。
 
 ## 当前实现策略
@@ -96,7 +96,7 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - 裸 `file` / `file_id` 只当作文件标识或文件名，不当作本地路径。
 - 如果视频源可读取，daemon 先本地化视频；单个本地视频优先进入 Tencent upload 后台直发链路，渲染结果仍可使用视频封面图保留播放标识。
 - 运行时已废除 `mqqapi://qzone/publish` / QQ/QQNT 客户端确认发布路径；客户端跳转只保留在逆向背景说明中，不再由插件调用。
-- daemon 原生视频发布仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或不适合原生发布时只回退为视频封面图发布。
+- daemon 原生视频发布仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或视频组合不适合原生发布时会阻止发布并提示绑定/调整媒体，不再把视频封面帧当作图片说说发出。只有关闭 `native_video_publish` 后才明确走视频封面图发布。
 
 ## v0.6.8 进展：发布体嵌入上传业务数据
 
@@ -114,6 +114,24 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 
 - `encode_record_video_publish_business_data()`：生成 `publishmood` OldUniAttribute。
 - `QzoneTencentVideoUploader.upload_video(..., publish_content=...)`：自动嵌入发布业务体并使用 `iBusiNessType=1`。
-- daemon `publish_post()`：当状态或环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 等 QQ upload 登录材料时，单个本地视频优先交给 Tencent upload 后台路径；未配置时只走视频封面回退，不再唤起客户端。
+- daemon `publish_post()`：当状态或环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 等 QQ upload 登录材料时，单个本地视频优先交给 Tencent upload 后台路径；未配置时直接报错并阻止封面帧替代发布，不再唤起客户端。
 
 仍然必须外部提供 QQ upload 二进制登录材料：`QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`，可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_TYPE`、`QZONE_VIDEO_UPLOAD_TOKEN_APPID`、`QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID`。PC/Web Cookie、`p_skey`、`pt4_token` 不能直接等价为 Tencent upload SDK 的 `vLoginData/vLoginKey`。
+
+## v0.6.9 进展：Android 视频封面上传腿与 feed 校验
+
+实测和 smali 对照后，单独走 `video_qzone` 上传并返回 `UploadVideoInfoRsp.sVid` 不足以生成 QQ 空间视频动态。Android 路径在视频上传后还会继续创建 `ImageUploadTask` 上传视频封面；这一步使用图片上传 appid/域名，但业务参数里把封面和前一步的 `sVid` 绑定：
+
+| 阶段 | appid | host | 校验 | 关键业务字段 |
+| --- | --- | --- | --- | --- |
+| 视频上传 | `video_qzone` | `video.upqzfile.com:80` | SHA1 | `UploadVideoInfoReq.iBusiNessType=1`、`vBusiNessData=publishmood`、`stExtendInfo.clientkey` |
+| 封面上传 | `pic_qzone` | `pic.upqzfile.com:80` | MD5 | `UploadPicInfoReq.stExtendInfo.mapParams["vid"]`、`mapParams["clientkey"]`、`mapExt["mobile_fakefeeds_clientkey"]`、`stExternalMapExt["is_client_upload_cover"]`、`stExternalMapExt["is_pic_video_mix_feeds"]`、`stExternalMapExt["mix_videoSize"]`、`stExternalMapExt["mix_time"]` |
+
+当前代码对应落地为：
+
+- `UploadPicInfoReq`、`PicExtendInfo`、`UploadPicInfoRsp` 的 JCE 编解码。
+- `QzoneTencentVideoUploader.upload_video_cover(...)`：使用 `pic_qzone`、MD5、封面文件分片上传，并携带 `vid/clientkey/mobile_fakefeeds_clientkey/mix_*`。
+- daemon 原生视频发布顺序变为：本地化视频 -> 生成封面 -> `video_qzone` 上传视频 -> `pic_qzone` 上传封面 -> 轮询最近动态验证同一 `sVid`。
+- 如果未验证到 feed，daemon 抛出 `QzoneRequestError`，不会把“已返回 sVid”包装成发布成功。
+
+因此，当前剩余的真实运行阻塞点不是 Web Cookie，也不是 `clientKey/p_skey`，而是必须取得 QQ/客户端上传 SDK 能接受的 `vLoginData/A2` 类二进制登录材料。OneBot 适配器如果只返回 `clientKey`、`p_skey`、Cookie 或 Web `qzonetoken`，daemon 会保持未配置状态并拒绝原生直发。

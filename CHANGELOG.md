@@ -2,7 +2,11 @@
 
 ## 未发布
 
-- 变更：完全移除运行时 QQ/QQNT 客户端视频发布 handoff；单个本地视频只交给 daemon 后台发布链路处理，缺少 QQ upload 登录材料时仅回退视频封面图发布。
+- 新增：daemon 原生视频直发补齐 Android 双腿上传链路：`video_qzone` 上传视频取得 `sVid` 后，继续用 `pic_qzone` 上传视频封面，并携带 `vid/clientkey/mobile_fakefeeds_clientkey/mix_*` 字段触发真实视频动态。
+- 新增：daemon 原生视频发布成功前会轮询最近动态并验证同一 `sVid`；只拿到上传响应但没有生成 feed 时会报错，不再宣称发布成功。
+- 修复：单个视频在缺少 QQ upload 登录材料时不再静默提取封面并按图片说说发布；daemon 会阻止视频帧替代发布并提示绑定 `/qzone videoauth` 或 `/qzone autovideoauth`。
+- 修复：Linux CI 上 `.3gp` 被 `mimetypes` 识别为 `audio/3gpp` 时仍归一化为 QQ 空间视频媒体。
+- 变更：完全移除运行时 QQ/QQNT 客户端视频发布 handoff；单个本地视频只交给 daemon 后台发布链路处理，缺少 QQ upload 登录材料时阻止发布并提示绑定。
 - 新增：`/qzone videoauth` 与 `/qzone autovideoauth` 可把 QQ upload 二进制登录材料写入 daemon 状态，发布前也会尝试从 OneBot 自动获取并绑定。
 - 测试：新增客户端 handoff 移除、daemon 原始视频接收、OneBot 上传材料自动绑定回归用例。
 

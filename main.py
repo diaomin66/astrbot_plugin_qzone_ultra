@@ -5060,7 +5060,11 @@ class QzoneStablePlugin(Star):
         try:
             payload = await self._auto_bind_video_upload_credentials(event, force=True, source="aiocqhttp")
             if not self._status_has_video_upload_credentials(payload):
-                yield self._command_result(event, "OneBot 没有返回 QQ upload 视频上传登录材料；无法启用 daemon 原生视频直发。")
+                yield self._command_result(
+                    event,
+                    "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
+                    "仅有 clientKey、p_skey 或 Cookie 不能启用 daemon 原生视频直发。",
+                )
                 return
             payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
