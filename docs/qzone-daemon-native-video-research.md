@@ -1,17 +1,17 @@
 # QQ 空间 daemon 原生视频发布逆向记录
 
-日期：2026-06-02
+日期：2026-06-02；H5 路径更新：2026-06-03
 
 ## 结论
 
-当前仓库里的 daemon 已完全废除 QQ/QQNT 客户端 handoff，也不再把视频帧伪装成图片说说发布。`native_video_publish` 开启时，单个本地视频只走 Tencent upload 后台直发链路；缺少 QQ upload 登录材料、媒体组合不适合原生发布，或上传后未能在最近动态中验证到同一 `sVid` 时，都会直接报错。
+当前仓库里的 daemon 已完全废除 QQ/QQNT 客户端 handoff，也不再把视频帧伪装成图片说说发布。`native_video_publish` 开启时，单个本地视频优先走 Qzone H5 `sliceUpload/FileUploadVideo`：使用已绑定 Web Cookie 里的 `p_skey` 取得 `sVid`，再按 Qzone Web 视频模型组装 `richval` 并调用 `emotion_cgi_publish_v6` 发布真实视频说说。QQ upload A2/vLoginData 的 Tencent upload SDK 链路只保留为后备。任一路径上传后都必须在最近动态中验证到同一 `sVid`，否则直接报错。
 
-已知的 PC/Web 路径是：
+已知的普通 PC/Web 图文路径是：
 
 1. `cgi_upload_image` 上传图片，拿到图片 `richval`。
 2. `emotion_cgi_publish_v6` 发布图文说说。
 
-这条链路没有接收本地视频文件、视频分片、`vid` 或腾讯上传 SDK 结果的参数。把本地视频路径拼进正文只会变成普通文本，不能让 QQ 空间上传视频。
+这条图文链路没有接收本地视频文件、视频分片、`vid` 或腾讯上传 SDK 结果的参数。把本地视频路径拼进正文只会变成普通文本，不能让 QQ 空间上传视频。真实 Web 视频路径需要先走 H5 `sliceUpload/FileUploadVideo` 拿到 `sVid`，再用视频 `richval` 发布。
 
 ## 已确认的客户端路径
 
@@ -110,13 +110,13 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 
 `QZoneVideoShuoshuoUploadFinishRequest` 的命令是 `rptVSUploadFinish`，结构为 `NS_MOBILE_EXTRA.mobile_video_shuoshuo_upload_finish_req(iSize, iTimeLength)`。从调用位置看，它更像上传完成上报/统计，不是发布正文的主入口。
 
-当前代码已把这条链路落地为：
+当前代码已把 Android/Tencent upload 后备链路落地为：
 
 - `encode_record_video_publish_business_data()`：生成 `publishmood` OldUniAttribute。
 - `QzoneTencentVideoUploader.upload_video(..., publish_content=...)`：自动嵌入发布业务体并使用 `iBusiNessType=1`。
-- daemon `publish_post()`：当状态或环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 等 QQ upload 登录材料时，单个本地视频优先交给 Tencent upload 后台路径；未配置时直接报错并阻止封面帧替代发布，不再唤起客户端。
+- daemon `publish_post()`：当 H5 Cookie 路径不可用但状态或环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 等 QQ upload 登录材料时，单个本地视频可交给 Tencent upload 后台路径；未配置时直接报错并阻止封面帧替代发布，不再唤起客户端。
 
-仍然必须外部提供 QQ upload 二进制登录材料：`QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`，可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_TYPE`、`QZONE_VIDEO_UPLOAD_TOKEN_APPID`、`QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID`。PC/Web Cookie、`p_skey`、`pt4_token` 不能直接等价为 Tencent upload SDK 的 `vLoginData/vLoginKey`。
+Tencent upload SDK 后备链路仍然必须外部提供 QQ upload 二进制登录材料：`QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`，可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_TYPE`、`QZONE_VIDEO_UPLOAD_TOKEN_APPID`、`QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID`。PC/Web Cookie、`p_skey`、`pt4_token` 不能直接等价为 Tencent upload SDK 的 `vLoginData/vLoginKey`，但已确认可用于 H5 JSON `sliceUpload` 链路。
 
 ## v0.6.9 进展：Android 视频封面上传腿与 feed 校验
 
@@ -134,4 +134,20 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - daemon 原生视频发布顺序变为：本地化视频 -> 生成封面 -> `video_qzone` 上传视频 -> `pic_qzone` 上传封面 -> 轮询最近动态验证同一 `sVid`。
 - 如果未验证到 feed，daemon 抛出 `QzoneRequestError`，不会把“已返回 sVid”包装成发布成功。
 
-因此，当前剩余的真实运行阻塞点不是 Web Cookie，也不是 `clientKey/p_skey`，而是必须取得 QQ/客户端上传 SDK 能接受的 `vLoginData/A2` 类二进制登录材料。OneBot 适配器如果只返回 `clientKey`、`p_skey`、Cookie 或 Web `qzonetoken`，daemon 会保持未配置状态并拒绝原生直发。
+## v0.6.9 H5 补充：`p_skey` 视频上传 + Web richval 发布
+
+本地实测确认，Qzone H5 JSON `sliceUpload` 可以直接用 Web Cookie 里的 `p_skey` 作为 token 上传 `video_qzone` 视频，不需要 OneBot 返回 QQ upload A2/vLoginData：
+
+- 控制接口：`https://h5.qzone.qq.com/webapp/json/sliceUpload/FileBatchControl/<sha1>?g_tk=<gtk>`
+- 分片接口：`https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUploadVideo?seq=...&offset=...&end=...&total=...&type=form&g_tk=<gtk>`
+- control 关键字段：`token={type:4,data:p_skey,appid:5}`、`appid=video_qzone`、`cmd=FileUploadVideo`、`check_type=1`、`biz_req.extend_info.video_type=3`、`qz_video_format=mp4`。
+- multipart 分片关键点：`data` part 必须等价于 `("blob", chunk)`，即 `Content-Disposition` 有 `filename="blob"`；当前本地实测默认需要该 part 带 `Content-Type: application/octet-stream`，同时代码保留接口返回 `-115` 时自动重试无 part `Content-Type` 的兼容后备。
+- 最后一片返回 `data.biz.sVid`。
+
+上传完成后，Web 视频模型 `Video.getValue()` 给出的真实视频 `richval` 形态是：
+
+```text
+playurl=<encoded qqplayer swf>&detailurl=<encoded /qzvideo/sVid>&who=5&rich_flag=4&vid=<sVid>
+```
+
+发布说说时调用 `emotion_cgi_publish_v6`，携带 `richtype=3`、`subrichtype=7`、上述 `richval`、正文、`ugc_right=1` 等字段。daemon 现在优先使用这条 H5 路径，然后轮询最近动态验证同一 `sVid`；只有验证到 feed 才返回成功。A2/vLoginData 相关 `/qzone videoauth` 和 `/qzone autovideoauth` 仅作为旧 Tencent upload SDK 后备。

@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- 新增：daemon 原生视频直发优先使用 Qzone H5 `sliceUpload/FileUploadVideo`，直接复用已绑定 Cookie 的 `p_skey` 上传视频取得 `sVid`，再通过 Web 视频 `richval` 调 `emotion_cgi_publish_v6` 发布真实视频说说。
+- 新增：H5 视频分片上传使用 `filename="blob"` 且默认 `Content-Type: application/octet-stream` 的 multipart `data` 片段；若接口返回 `-115`，自动后备重试无 part `Content-Type` 形态；发布成功前继续轮询最近动态验证同一 `sVid`。
+- 变更：QQ upload A2/vLoginData 材料和 `/qzone autovideoauth` 变为旧 Tencent upload SDK 后备；已有 Qzone Cookie/`p_skey` 时不再因 OneBot 没有返回 A2 材料而阻止 daemon 原生视频直发。
 - 新增：daemon 原生视频直发补齐 Android 双腿上传链路：`video_qzone` 上传视频取得 `sVid` 后，继续用 `pic_qzone` 上传视频封面，并携带 `vid/clientkey/mobile_fakefeeds_clientkey/mix_*` 字段触发真实视频动态。
 - 新增：daemon 原生视频发布成功前会轮询最近动态并验证同一 `sVid`；只拿到上传响应但没有生成 feed 时会报错，不再宣称发布成功。
 - 修复：单个视频在缺少 QQ upload 登录材料时不再静默提取封面并按图片说说发布；daemon 会阻止视频帧替代发布并提示绑定 `/qzone videoauth` 或 `/qzone autovideoauth`。

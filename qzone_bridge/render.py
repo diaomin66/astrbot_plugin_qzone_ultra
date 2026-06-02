@@ -46,9 +46,11 @@ def format_status(status: dict) -> str:
     if isinstance(video_upload, dict):
         source = video_upload.get("source") or "-"
         updated_at = video_upload.get("updated_at") or "-"
+        method = video_upload.get("method") or "-"
         lines.append(f"- video_upload: {'ready' if video_upload.get('configured') else 'missing'}")
         if video_upload.get("configured"):
             lines.append(f"- video_upload_source: {source}")
+            lines.append(f"- video_upload_method: {method}")
             lines.append(f"- video_upload_updated: {updated_at}")
     if status.get("daemon_port"):
         lines.append(f"- endpoint: 127.0.0.1:{status['daemon_port']}")

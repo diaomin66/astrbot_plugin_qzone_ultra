@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060108
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060301
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -5063,7 +5063,8 @@ class QzoneStablePlugin(Star):
                 yield self._command_result(
                     event,
                     "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
-                    "仅有 clientKey、p_skey 或 Cookie 不能启用 daemon 原生视频直发。",
+                    "这只影响旧 Tencent upload 后备。若 /qzone status 显示 video_upload ready，"
+                    "daemon 会优先使用已绑定 Cookie/p_skey 的 H5 原生视频直发。",
                 )
                 return
             payload = await self._status_with_recovery()

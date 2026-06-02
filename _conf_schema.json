@@ -15,7 +15,7 @@
     "description": "优先使用 daemon 原生视频后台直发",
     "type": "bool",
     "default": true,
-    "hint": "开启后，单个本地视频说说会优先交给本地 daemon 通过 Tencent upload 后台直发；daemon 会执行 video_qzone 视频上传、pic_qzone 封面上传并验证最近动态里的 sVid 后才算成功。缺少 QQ upload 登录材料或未验证到 feed 时阻止发布，不再把视频帧当图片发出，也不再打开 QQ/QQNT 客户端。关闭后才按视频封面图发布。"
+    "hint": "开启后，单个本地视频说说会优先交给本地 daemon 通过 Qzone H5 sliceUpload/FileUploadVideo 上传，拿到 sVid 后调用 Web 视频说说发布接口，并验证最近动态里的同一 sVid 后才算成功。已有 Qzone Cookie/p_skey 即可尝试；A2/vLoginData 只作为旧 Tencent upload 后备。未验证到 feed 时阻止发布，不再把视频帧当图片发出，也不再打开 QQ/QQNT 客户端。关闭后才按视频封面图发布。"
   },
   "llm": {
     "description": "大模型配置",

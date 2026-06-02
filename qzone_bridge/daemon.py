@@ -18,6 +18,7 @@ from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import configure_standalone_logging, get_logger
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .h5_video import qzone_h5_video_upload_available
 from .local_media import resolve_trusted_local_media_path
 from .media import (
     QZONE_MAX_IMAGES,
@@ -293,6 +294,28 @@ class QzoneDaemonService:
         state_credentials = getattr(state, "video_upload", None)
         return bool(getattr(state_credentials, "login_data_b64", "") or qzone_video_upload_credentials_configured())
 
+    def _h5_video_upload_configured(self) -> bool:
+        state = getattr(self, "state", None)
+        return qzone_h5_video_upload_available(getattr(state, "session", None))
+
+    def _video_upload_summary(self) -> dict[str, Any]:
+        summary = self.state.video_upload.summary()
+        h5_ready = self._h5_video_upload_configured()
+        summary["web_cookie_configured"] = h5_ready
+        if h5_ready:
+            summary["configured"] = True
+            summary.setdefault("source", "")
+            if not summary["source"]:
+                summary["source"] = "qzone_h5_cookie"
+            if not summary.get("updated_at"):
+                summary["updated_at"] = self.state.session.updated_at
+            summary["method"] = "h5_slice_upload" if not summary.get("login_data_b64_length") else "h5_slice_upload,tencent_upload"
+        elif summary.get("configured"):
+            summary["method"] = "tencent_upload"
+        else:
+            summary["method"] = ""
+        return summary
+
     def _video_upload_credentials(self) -> QzoneVideoUploadCredentials:
         state = getattr(self, "state", None)
         state_credentials = getattr(state, "video_upload", None)
@@ -389,7 +412,7 @@ class QzoneDaemonService:
             "needs_rebind": self._session_needs_rebind(),
             "last_ok_at": session.last_ok_at,
             "last_error": session.last_error,
-            "video_upload": self.state.video_upload.summary(),
+            "video_upload": self._video_upload_summary(),
             "qzonetoken_hosts": sorted(int(k) for k in session.qzonetokens.keys() if str(k).isdigit()),
             "feed_cache_size": len(self.client.feed_cache),
             "session_revision": session.revision,
@@ -878,20 +901,81 @@ class QzoneDaemonService:
                 "daemon 原生视频后台直发需要可读取的本地视频文件，已阻止视频封面替代发布",
                 detail={"name": video.name or source_name(video.source), "source": video.source},
             )
+        self._ensure_session_ready()
+        duration_ms = _probe_video_duration_ms(path)
+        file_size = _file_size(path)
+        client_key = f"{getattr(getattr(self, 'state', None), 'session', SessionState()).uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+
+        if self._h5_video_upload_configured():
+            try:
+                result = await self.client.upload_h5_video(
+                    path,
+                    title=video.name or path.name,
+                    desc=content,
+                    play_time=duration_ms,
+                )
+                publish_result = await self.client.publish_video_mood(
+                    content,
+                    vid=result.vid,
+                    sync_weibo=sync_weibo,
+                )
+            except FileNotFoundError as exc:
+                raise QzoneParseError("视频文件不存在，无法进行 Qzone H5 原生视频后台上传", detail={"path": str(path)}) from exc
+            except (OSError, QzoneRequestError, QzoneParseError) as exc:
+                if isinstance(exc, (QzoneRequestError, QzoneParseError)):
+                    raise
+                raise QzoneRequestError(
+                    "Qzone H5 原生视频后台上传失败",
+                    detail={"type": type(exc).__name__, "message": str(exc)},
+                ) from exc
+            verified_feed: dict[str, Any] | None = None
+            if _raw_contains_text(publish_result, result.vid):
+                verified_feed = {
+                    "fid": str(publish_result.get("tid") or publish_result.get("fid") or ""),
+                    "raw": publish_result,
+                    "verification_source": "publish_result_feedinfo",
+                }
+            else:
+                verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
+            if verified_feed is None:
+                raise QzoneRequestError(
+                    "QQ 空间 H5 原生视频后台发布已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",
+                    detail={"vid": result.vid, "client_key": client_key, "publish_result": publish_result},
+                )
+            return {
+                "fid": str(verified_feed.get("fid") or publish_result.get("tid") or publish_result.get("fid") or ""),
+                "vid": result.vid,
+                "message": "已验证 QQ 空间 H5 原生视频后台直发成功",
+                "native_video": True,
+                "status": "published_native_video",
+                "operation_status": "verified_feed_video",
+                "media_count": len(media),
+                "photo_count": 0,
+                "raw": {
+                    "method": "h5_slice_upload",
+                    "upload_result": result.to_dict(),
+                    "publish_result": publish_result,
+                    "video": video.to_dict(),
+                    "client_key": client_key,
+                    "verified_feed": verified_feed,
+                },
+            }
+
         if not self._video_upload_credentials_configured():
             raise QzoneParseError(
-                "daemon 原生视频后台直发缺少 QQ upload 登录材料，已阻止视频封面替代发布；"
-                "请先使用 /qzone videoauth 或 /qzone autovideoauth 绑定上传材料",
-                detail={"name": video.name or path.name, "video_upload_configured": False},
+                "daemon 原生视频后台直发缺少可用 Qzone Web p_skey Cookie 或 QQ upload 登录材料，"
+                "已阻止视频封面替代发布；请先使用 /qzone bind 绑定可用 Cookie，"
+                "或使用 /qzone videoauth 绑定 QQ upload A2/vLoginData 材料",
+                detail={
+                    "name": video.name or path.name,
+                    "video_upload_configured": False,
+                    "web_cookie_configured": False,
+                },
             )
-        self._ensure_session_ready()
         try:
             credentials = self._video_upload_credentials()
         except QzoneNativeVideoCredentialError as exc:
             raise QzoneParseError(str(exc)) from exc
-        duration_ms = _probe_video_duration_ms(path)
-        file_size = _file_size(path)
-        client_key = f"{self.state.session.uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
         try:
             cover = video_cover_media(video, self.store.root / "video_covers")
             cover_path = _trusted_daemon_image_path(cover)
