@@ -1788,116 +1788,30 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
     assert captured["uploader_kwargs"]["login_data"] == b"login-data"
 
 
-def test_native_qzone_video_publish_uri_encodes_opensdk_fields(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    import base64
-    from urllib.parse import parse_qs, urlparse
-
+def test_native_video_module_removes_client_handoff_helpers() -> None:
     from qzone_bridge import native_video
-    from qzone_bridge.media import PostMedia
 
-    source = tmp_path / "clip.mp4"
-    source.write_bytes(b"fake video bytes")
-    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 2345)
-
-    uri = native_video.build_native_qzone_video_publish_uri(
-        PostMedia(
-            kind="video",
-            source=str(source),
-            name="clip.mp4",
-            mime_type="video/mp4",
-            trusted_local=True,
-        ),
-        "hello",
-        app_name="QQ空间Ultra",
-    )
-    parsed = urlparse(uri)
-    params = parse_qs(parsed.query)
-
-    def decoded(key: str) -> str:
-        return base64.b64decode(params[key][0]).decode("utf-8")
-
-    assert parsed.scheme == "mqqapi"
-    assert parsed.netloc == "qzone"
-    assert parsed.path == "/publish"
-    assert params["src_type"] == ["app"]
-    assert decoded("req_type") == "4"
-    assert decoded("videoPath") == str(source)
-    assert decoded("videoDuration") == "2345"
-    assert decoded("videoSize") == str(source.stat().st_size)
-    assert decoded("description") == "hello"
-    assert decoded("app_name") == "QQ空间Ultra"
+    assert not hasattr(native_video, "publish_native_video_post")
+    assert not hasattr(native_video, "build_native_qzone_video_publish_uri")
+    assert not hasattr(native_video, "native_qzone_protocol_handler")
+    assert not hasattr(native_video, "open_native_qzone_uri")
 
 
-def test_native_qzone_video_publish_uri_recovers_drive_relative_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    import base64
-    from urllib.parse import parse_qs, urlparse
-
-    from qzone_bridge import native_video
-    from qzone_bridge.media import PostMedia
-
-    source = tmp_path / "clip.mp4"
-    source.write_bytes(b"fake video bytes")
-    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 2345)
-    text = str(source)
-    if len(text) < 3 or text[1] != ":" or text[2] not in "\\/":
-        pytest.skip("Windows drive path required")
-    damaged_source = text[:2] + text[3:]
-
-    uri = native_video.build_native_qzone_video_publish_uri(
-        PostMedia(
-            kind="video",
-            source=damaged_source,
-            name="clip.mp4",
-            mime_type="video/mp4",
-            trusted_local=True,
-        ),
-        "hello",
-        app_name="QQ空间Ultra",
-    )
-    params = parse_qs(urlparse(uri).query)
-
-    assert base64.b64decode(params["videoPath"][0]).decode("utf-8") == str(source)
-    assert base64.b64decode(params["videoDuration"][0]).decode("utf-8") == "2345"
-
-
-def test_publish_native_video_post_launches_registered_handler(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from qzone_bridge import native_video
+def test_native_video_candidate_requires_single_video_without_other_media(tmp_path: Path) -> None:
+    from qzone_bridge.native_video import native_video_candidate
     from qzone_bridge.media import PostMedia, PostPayload
 
-    launched: dict[str, str] = {}
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"fake video bytes")
-    monkeypatch.setattr(native_video, "native_qzone_protocol_handler", lambda: '"QQ" "%1"')
-    monkeypatch.setattr(native_video, "_probe_video_duration_ms", lambda _path: 1000)
-    monkeypatch.setattr(native_video, "open_native_qzone_uri", lambda uri: launched.setdefault("uri", uri))
+    video = PostMedia(kind="video", source=str(source), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
 
-    post = PostPayload(
-        content="hello",
-        media=[
-            PostMedia(
-                kind="video",
-                source=str(source),
-                name="clip.mp4",
-                mime_type="video/mp4",
-                trusted_local=True,
-            )
-        ],
-    )
-
-    result = native_video.publish_native_video_post(post)
-
-    assert launched["uri"] == result.uri
-    assert result.handler == '"QQ" "%1"'
-    assert result.video.source == str(source)
+    assert native_video_candidate(PostPayload(content="hello", media=[video])) is video
+    assert native_video_candidate(
+        PostPayload(
+            content="hello",
+            media=[video, PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), trusted_local=True)],
+        )
+    ) is None
 
 
 def test_tencent_upload_pdu_round_trips_control_frame() -> None:
@@ -2754,67 +2668,7 @@ def test_plugin_prefers_astrbot_video_converter_over_stale_path(
     assert post.media[0].trusted_local is True
 
 
-def test_plugin_publish_prefers_native_video_handoff(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    main = _import_main_with_stubs(monkeypatch)
-
-    source = tmp_path / "clip.mp4"
-    source.write_bytes(b"fake video bytes")
-    original = main.PostPayload(
-        content="hello",
-        media=[
-            main.PostMedia(
-                kind="video",
-                source=str(source),
-                name="clip.mp4",
-                mime_type="video/mp4",
-                trusted_local=True,
-            )
-        ],
-    )
-    cover = main.PostPayload(
-        content="hello",
-        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
-    )
-
-    def fake_native(post, *, app_name=""):
-        assert post is original
-        assert app_name == "QQ空间Ultra"
-        return types.SimpleNamespace(
-            uri="mqqapi://qzone/publish?req_type=NA==",
-            video=original.media[0],
-            handler='"QQ" "%1"',
-            message="native opened",
-        )
-
-    async def fake_prepare(post):
-        assert post is original
-        return cover
-
-    class _Controller:
-        async def publish_post(self, **_kwargs):
-            raise AssertionError("cover fallback should not run when native handoff succeeds")
-
-    plugin = object.__new__(main.QzoneStablePlugin)
-    plugin.settings = types.SimpleNamespace(native_video_publish=True)
-    plugin.data_dir = tmp_path
-    plugin.controller = _Controller()
-    plugin._prepare_publish_payload = fake_prepare
-    monkeypatch.setattr(main, "publish_native_video_post", fake_native)
-
-    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
-
-    assert render_post is cover
-    assert payload["message"] == "native opened"
-    assert payload["native_video"] is True
-    assert payload["status"] == "pending_user_confirm"
-    assert payload["photo_count"] == 1
-    assert payload["raw"]["native_video_uri"].startswith("mqqapi://qzone/publish")
-
-
-def test_plugin_publish_sends_original_video_to_daemon_when_upload_credentials_exist(
+def test_plugin_publish_sends_native_video_to_daemon_without_client_handoff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2844,26 +2698,27 @@ def test_plugin_publish_sends_original_video_to_daemon_when_upload_credentials_e
         assert post is original
         return cover
 
+    async def fake_bind(event=None):
+        captured["bind_event"] = event
+
     class _Controller:
         async def publish_post(self, **kwargs):
             captured["publish_kwargs"] = kwargs
             return {"vid": "vid-1", "native_video": True, "status": "submitted_native_upload"}
-
-    def forbidden_native(*_args, **_kwargs):
-        raise AssertionError("client handoff should not run when daemon upload credentials exist")
 
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(native_video_publish=True)
     plugin.data_dir = tmp_path
     plugin.controller = _Controller()
     plugin._prepare_publish_payload = fake_prepare
-    monkeypatch.setattr(main, "qzone_video_upload_credentials_configured", lambda: True)
-    monkeypatch.setattr(main, "publish_native_video_post", forbidden_native)
+    plugin._maybe_bind_video_upload_credentials = fake_bind
 
-    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original, event="evt"))
 
+    assert not hasattr(main, "publish_native_video_post")
     assert render_post is cover
     assert payload["vid"] == "vid-1"
+    assert captured["bind_event"] == "evt"
     assert captured["publish_kwargs"] == {
         "content": "hello",
         "sync_weibo": False,
@@ -2872,7 +2727,64 @@ def test_plugin_publish_sends_original_video_to_daemon_when_upload_credentials_e
     }
 
 
-def test_plugin_publish_falls_back_to_cover_when_native_unavailable(
+def test_plugin_auto_binds_onebot_video_upload_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+    bot = object()
+
+    class _Credentials:
+        source = "aiocqhttp:get_qzone_video_upload_credentials"
+
+        def to_request_body(self):
+            return {
+                "login_data_b64": "bG9naW4=",
+                "login_key_b64": "a2V5",
+                "token_type": 3,
+                "token_appid": 16,
+                "token_wt_appid": 32,
+                "source": self.source,
+            }
+
+    async def fake_fetch(client, *, source="aiocqhttp"):
+        captured["fetch_client"] = client
+        captured["fetch_source"] = source
+        return _Credentials()
+
+    class _Controller:
+        async def get_status(self, **kwargs):
+            captured["status_kwargs"] = kwargs
+            return {"video_upload": {"configured": False}}
+
+        async def bind_video_upload_credentials_local(self, **kwargs):
+            captured["bind_kwargs"] = kwargs
+            return {"video_upload": {"configured": True, "source": kwargs["source"]}}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.controller = _Controller()
+    plugin._onebot_client = bot
+    plugin._context = None
+    plugin._video_upload_lock = None
+    monkeypatch.setattr(main, "fetch_video_upload_credentials", fake_fetch)
+
+    payload = asyncio.run(plugin._auto_bind_video_upload_credentials(force=True, source="aiocqhttp"))
+
+    assert payload == {"video_upload": {"configured": True, "source": "aiocqhttp:get_qzone_video_upload_credentials"}}
+    assert captured["fetch_client"] is bot
+    assert captured["fetch_source"] == "aiocqhttp"
+    assert captured["bind_kwargs"] == {
+        "login_data_b64": "bG9naW4=",
+        "login_key_b64": "a2V5",
+        "token_type": 3,
+        "token_appid": 16,
+        "token_wt_appid": 32,
+        "source": "aiocqhttp:get_qzone_video_upload_credentials",
+    }
+
+
+def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2897,9 +2809,6 @@ def test_plugin_publish_falls_back_to_cover_when_native_unavailable(
         media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
     )
     captured: dict[str, object] = {}
-
-    def fake_native(_post, *, app_name=""):
-        raise main.NativeVideoPublishUnavailable("no handler")
 
     async def fake_prepare(post):
         assert post is original
@@ -2912,11 +2821,10 @@ def test_plugin_publish_falls_back_to_cover_when_native_unavailable(
             return {"fid": "fid-cover", "message": "ok", "photo_count": 1}
 
     plugin = object.__new__(main.QzoneStablePlugin)
-    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.settings = types.SimpleNamespace(native_video_publish=False)
     plugin.data_dir = tmp_path
     plugin.controller = _Controller()
     plugin._prepare_publish_payload = fake_prepare
-    monkeypatch.setattr(main, "publish_native_video_post", fake_native)
 
     render_post, payload = asyncio.run(plugin._publish_post_payload(original))
 

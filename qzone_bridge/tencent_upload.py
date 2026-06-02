@@ -667,6 +667,26 @@ def qzone_video_upload_credentials_from_env(env: dict[str, str] | None = None) -
     )
 
 
+def qzone_video_upload_credentials_from_base64(
+    *,
+    login_data_b64: str,
+    login_key_b64: str = "",
+    token_type: int = TENCENT_UPLOAD_TOKEN_ENC_TYPE,
+    token_appid: int = 0,
+    token_wt_appid: int = 0,
+) -> QzoneVideoUploadCredentials:
+    login_data = _decode_base64_text(login_data_b64, "login_data_b64")
+    if not login_data:
+        raise QzoneNativeVideoCredentialError("daemon 原生视频上传缺少 QQ upload 登录材料")
+    return QzoneVideoUploadCredentials(
+        login_data=login_data,
+        login_key=_decode_base64_text(login_key_b64, "login_key_b64") if login_key_b64 else b"",
+        token_type=int(token_type or TENCENT_UPLOAD_TOKEN_ENC_TYPE),
+        token_appid=int(token_appid or 0),
+        token_wt_appid=int(token_wt_appid or 0),
+    )
+
+
 class QzoneTencentVideoUploader:
     """Synchronous Tencent upload SDK client for daemon-side video experiments.
 
@@ -981,11 +1001,15 @@ def _env_base64(env: dict[str, str] | os._Environ[str], *keys: str) -> bytes:
         value = str(env.get(key) or "").strip()
         if not value:
             continue
-        try:
-            return base64.b64decode("".join(value.split()), validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise QzoneNativeVideoCredentialError(f"{key} 不是合法的 base64 QQ upload 登录材料") from exc
+        return _decode_base64_text(value, key)
     return b""
+
+
+def _decode_base64_text(value: str, field: str) -> bytes:
+    try:
+        return base64.b64decode("".join(str(value or "").split()), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise QzoneNativeVideoCredentialError(f"{field} 不是合法的 base64 QQ upload 登录材料") from exc
 
 
 def _env_int(env: dict[str, str] | os._Environ[str], default: int, *keys: str) -> int:

@@ -2,11 +2,15 @@
 
 ## 未发布
 
+- 变更：完全移除运行时 QQ/QQNT 客户端视频发布 handoff；单个本地视频只交给 daemon 后台发布链路处理，缺少 QQ upload 登录材料时仅回退视频封面图发布。
+- 新增：`/qzone videoauth` 与 `/qzone autovideoauth` 可把 QQ upload 二进制登录材料写入 daemon 状态，发布前也会尝试从 OneBot 自动获取并绑定。
+- 测试：新增客户端 handoff 移除、daemon 原始视频接收、OneBot 上传材料自动绑定回归用例。
+
 ## v0.6.8 - 2026-06-01
 
 - 新增：daemon 原生视频直发接入 `UploadVideoInfoReq.vBusiNessData`，按 QQ 空间录制视频说说路径编码 `UniAttribute(hostuin, publishmood)`，并使用 `iBusiNessType=1` 随 Tencent upload 控制包提交。
-- 新增：支持通过 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`、`QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64` 和 `QZONE_VIDEO_UPLOAD_TOKEN_*` 提供 QQ upload 二进制登录材料；未配置时继续回退到客户端确认或视频封面图发布。
-- 修复：有 daemon 上传凭据时，插件入口会把原始视频交给本地 daemon，而不是先唤起 QQ/QQNT 客户端窗口，发布结果渲染仍使用视频封面。
+- 新增：支持通过 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`、`QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64` 和 `QZONE_VIDEO_UPLOAD_TOKEN_*` 提供 QQ upload 二进制登录材料；未配置时继续回退到视频封面图发布。
+- 修复：有 daemon 上传凭据时，插件入口会把原始视频交给本地 daemon，发布结果渲染仍使用视频封面。
 - 文档：更新 daemon 原生视频逆向记录，明确普通视频说说的发布体嵌在上传业务数据中，`rptVSUploadFinish` 更像上传完成上报，不再把“最终发布 RPC”列为当前主阻塞点。
 - 测试：补充 publishmood OldUniAttribute 编码、环境凭据解析、daemon 直发分支和插件入口选择的回归用例。
 
@@ -55,7 +59,7 @@
 - 修复：引用 NTQQ/OneBot 视频时会优先补查引用消息并读取真实视频段；若平台只返回视频 URL，会先下载到插件缓存再提取封面，避免把 `file=xxx.mp4` 文件名误当成本地路径导致“视频文件不存在，无法提取封面”。
 - 修复：本地视频路径恢复改为通用归一化（盘符斜杠、`file://` 路径、换行/制表符转义），不再扫描固定 Tencent 目录。
 
-- 新增：发说说支持引用本地视频消息，兼容 mp4、mov、mkv、webm、avi、flv、3gp 等常见格式；单个本地视频会优先唤起 QQ/QQNT 原生 `mqqapi://qzone/publish` 视频发布窗口。
+- 新增：发说说支持引用本地视频消息，兼容 mp4、mov、mkv、webm、avi、flv、3gp 等常见格式；早期单个本地视频会优先唤起 QQ/QQNT 原生 `mqqapi://qzone/publish` 视频发布窗口（当前运行路径已废除该客户端 handoff）。
 - 新增：原生视频入口不可用、视频组合不适合原生发布或需要后台自动发布时，会自动使用 ffmpeg 提取视频封面并按图片发布到 QQ 空间。
 - 优化：发布结果渲染会使用视频封面并叠加播放标识，管理员可直接确认本次引用的视频内容。
 - 修复：视频消息不再被拼成 `[视频:xxx] 本地路径` 写进说说正文，避免泄露本地缓存路径并导致发布内容异常。

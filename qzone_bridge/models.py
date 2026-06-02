@@ -81,16 +81,57 @@ class RuntimeState:
 
 
 @dataclass(slots=True)
+class VideoUploadCredentialState:
+    login_data_b64: str = ""
+    login_key_b64: str = ""
+    token_type: int = 2
+    token_appid: int = 0
+    token_wt_appid: int = 0
+    source: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "configured": bool(self.login_data_b64),
+            "login_data_b64_length": len(self.login_data_b64),
+            "login_key_b64_length": len(self.login_key_b64),
+            "token_type": self.token_type,
+            "token_appid": self.token_appid,
+            "token_wt_appid": self.token_wt_appid,
+            "source": self.source,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "VideoUploadCredentialState":
+        data = data or {}
+        return cls(
+            login_data_b64=str(data.get("login_data_b64") or ""),
+            login_key_b64=str(data.get("login_key_b64") or ""),
+            token_type=int(data.get("token_type") or 2),
+            token_appid=int(data.get("token_appid") or 0),
+            token_wt_appid=int(data.get("token_wt_appid") or 0),
+            source=str(data.get("source") or ""),
+            updated_at=str(data.get("updated_at") or ""),
+        )
+
+
+@dataclass(slots=True)
 class BridgeState:
     version: int = 1
     session: SessionState = field(default_factory=SessionState)
     runtime: RuntimeState = field(default_factory=RuntimeState)
+    video_upload: VideoUploadCredentialState = field(default_factory=VideoUploadCredentialState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "session": self.session.to_dict(),
             "runtime": self.runtime.to_dict(),
+            "video_upload": self.video_upload.to_dict(),
         }
 
     @classmethod
@@ -100,6 +141,7 @@ class BridgeState:
             version=int(data.get("version") or 1),
             session=SessionState.from_dict(data.get("session")),
             runtime=RuntimeState.from_dict(data.get("runtime")),
+            video_upload=VideoUploadCredentialState.from_dict(data.get("video_upload")),
         )
 
 

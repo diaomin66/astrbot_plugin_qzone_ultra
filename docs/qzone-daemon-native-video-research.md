@@ -94,9 +94,9 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 
 - aiocqhttp/OneBot 视频引用按协议端通用字段解析，不绑定 NapCat；优先兼容 LLOneBot、NapCat、Shamrock 的 `url`、`download_url`、`file_url`、`file_id`、`get_file`、群/私聊文件 URL 扩展。
 - 裸 `file` / `file_id` 只当作文件标识或文件名，不当作本地路径。
-- 如果视频源可读取，daemon 先本地化视频再提取封面，然后按图片说说发布，渲染图保留视频播放标识。
-- 单个本地视频仍可使用 `mqqapi://qzone/publish` 唤起 QQ/QQNT 原生发布窗口；这是客户端确认路径，不是 daemon 后台直发。
-- daemon 原生视频发布现在作为实验链路接入：仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或不适合原生发布时继续回退到客户端确认或封面图发布。
+- 如果视频源可读取，daemon 先本地化视频；单个本地视频优先进入 Tencent upload 后台直发链路，渲染结果仍可使用视频封面图保留播放标识。
+- 运行时已废除 `mqqapi://qzone/publish` / QQ/QQNT 客户端确认发布路径；客户端跳转只保留在逆向背景说明中，不再由插件调用。
+- daemon 原生视频发布仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或不适合原生发布时只回退为视频封面图发布。
 
 ## v0.6.8 进展：发布体嵌入上传业务数据
 
@@ -114,6 +114,6 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 
 - `encode_record_video_publish_business_data()`：生成 `publishmood` OldUniAttribute。
 - `QzoneTencentVideoUploader.upload_video(..., publish_content=...)`：自动嵌入发布业务体并使用 `iBusiNessType=1`。
-- daemon `publish_post()`：当环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 时，单个本地视频优先交给 Tencent upload 后台路径；未配置时继续走客户端确认或视频封面回退。
+- daemon `publish_post()`：当状态或环境里存在 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 等 QQ upload 登录材料时，单个本地视频优先交给 Tencent upload 后台路径；未配置时只走视频封面回退，不再唤起客户端。
 
 仍然必须外部提供 QQ upload 二进制登录材料：`QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`，可选 `QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64`、`QZONE_VIDEO_UPLOAD_TOKEN_TYPE`、`QZONE_VIDEO_UPLOAD_TOKEN_APPID`、`QZONE_VIDEO_UPLOAD_TOKEN_WT_APPID`。PC/Web Cookie、`p_skey`、`pt4_token` 不能直接等价为 Tencent upload SDK 的 `vLoginData/vLoginKey`。

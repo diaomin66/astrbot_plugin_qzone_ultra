@@ -35,16 +35,18 @@ from .native_video import _probe_video_duration_ms, native_video_candidate
 from .tencent_upload import (
     QZONE_RECORD_VIDEO_BUSINESS_TYPE,
     QzoneNativeVideoCredentialError,
+    QzoneVideoUploadCredentials,
     QzoneTencentVideoUploader,
     QzoneTencentVideoUploadError,
     TencentUploadPduError,
     TencentUploadProtocolError,
     encode_video_shuoshuo_upload_finish_uni_attribute,
+    qzone_video_upload_credentials_from_base64,
     qzone_video_upload_credentials_configured,
     qzone_video_upload_credentials_from_env,
 )
 from .video import materialize_video_cover_list, materialize_video_source_list
-from .models import FeedEntry, SessionState
+from .models import FeedEntry, SessionState, VideoUploadCredentialState
 from .parser import (
     compute_unikey,
     extract_feed_page,
@@ -250,6 +252,24 @@ class QzoneDaemonService:
         if self._session_needs_rebind():
             raise QzoneNeedsRebind()
 
+    def _video_upload_credentials_configured(self) -> bool:
+        state = getattr(self, "state", None)
+        state_credentials = getattr(state, "video_upload", None)
+        return bool(getattr(state_credentials, "login_data_b64", "") or qzone_video_upload_credentials_configured())
+
+    def _video_upload_credentials(self) -> QzoneVideoUploadCredentials:
+        state = getattr(self, "state", None)
+        state_credentials = getattr(state, "video_upload", None)
+        if getattr(state_credentials, "login_data_b64", ""):
+            return qzone_video_upload_credentials_from_base64(
+                login_data_b64=state_credentials.login_data_b64,
+                login_key_b64=state_credentials.login_key_b64,
+                token_type=state_credentials.token_type,
+                token_appid=state_credentials.token_appid,
+                token_wt_appid=state_credentials.token_wt_appid,
+            )
+        return qzone_video_upload_credentials_from_env()
+
     def _schedule_save(self) -> None:
         if self._closing:
             return
@@ -333,6 +353,7 @@ class QzoneDaemonService:
             "needs_rebind": self._session_needs_rebind(),
             "last_ok_at": session.last_ok_at,
             "last_error": session.last_error,
+            "video_upload": self.state.video_upload.summary(),
             "qzonetoken_hosts": sorted(int(k) for k in session.qzonetokens.keys() if str(k).isdigit()),
             "feed_cache_size": len(self.client.feed_cache),
             "session_revision": session.revision,
@@ -424,6 +445,39 @@ class QzoneDaemonService:
             self._set_error(exc)
             raise
         return self.snapshot()
+
+    async def bind_video_upload_credentials(
+        self,
+        *,
+        login_data_b64: str,
+        login_key_b64: str = "",
+        token_type: int = 2,
+        token_appid: int = 0,
+        token_wt_appid: int = 0,
+        source: str = "manual",
+    ) -> dict[str, Any]:
+        try:
+            qzone_video_upload_credentials_from_base64(
+                login_data_b64=login_data_b64,
+                login_key_b64=login_key_b64,
+                token_type=token_type,
+                token_appid=token_appid,
+                token_wt_appid=token_wt_appid,
+            )
+        except QzoneNativeVideoCredentialError as exc:
+            raise QzoneParseError(str(exc)) from exc
+        self.state.video_upload = VideoUploadCredentialState(
+            login_data_b64="".join(str(login_data_b64 or "").split()),
+            login_key_b64="".join(str(login_key_b64 or "").split()),
+            token_type=int(token_type or 2),
+            token_appid=int(token_appid or 0),
+            token_wt_appid=int(token_wt_appid or 0),
+            source=str(source or "manual"),
+            updated_at=now_iso(),
+        )
+        self.touch()
+        self.save()
+        return {"video_upload": self.state.video_upload.summary()}
 
     async def unbind(self) -> dict[str, Any]:
         self.state.session = SessionState(
@@ -750,7 +804,7 @@ class QzoneDaemonService:
         sync_weibo: bool,
         media: list[PostMedia],
     ) -> dict[str, Any] | None:
-        if not qzone_video_upload_credentials_configured():
+        if not self._video_upload_credentials_configured():
             return None
         video = native_video_candidate(PostPayload(content=content, media=list(media)))
         if video is None:
@@ -760,7 +814,7 @@ class QzoneDaemonService:
             return None
         self._ensure_session_ready()
         try:
-            credentials = qzone_video_upload_credentials_from_env()
+            credentials = self._video_upload_credentials()
         except QzoneNativeVideoCredentialError as exc:
             raise QzoneParseError(str(exc)) from exc
         duration_ms = _probe_video_duration_ms(path)
@@ -1338,6 +1392,20 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             lambda: service.bind_cookie(cookie_text, uin=_body_int(body, "uin", 0), source=source),
         )
 
+    async def video_upload_auth(request: web.Request) -> web.Response:
+        body = await _json_body(request)
+        return await _bridge_response(
+            service,
+            lambda: service.bind_video_upload_credentials(
+                login_data_b64=str(body.get("login_data_b64") or ""),
+                login_key_b64=str(body.get("login_key_b64") or ""),
+                token_type=_body_int(body, "token_type", 2),
+                token_appid=_body_int(body, "token_appid", 0),
+                token_wt_appid=_body_int(body, "token_wt_appid", 0),
+                source=str(body.get("source") or "manual"),
+            ),
+        )
+
     async def unbind(request: web.Request) -> web.Response:
         return await _bridge_response(service, service.unbind)
 
@@ -1477,6 +1545,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     app.router.add_get("/health", health)
     app.router.add_get("/status", status)
     app.router.add_post("/bind", bind)
+    app.router.add_post("/video-upload-auth", video_upload_auth)
     app.router.add_post("/unbind", unbind)
     app.router.add_get("/feeds", feeds)
     app.router.add_get("/detail", detail)

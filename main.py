@@ -696,7 +696,7 @@ from qzone_bridge.media import (
     source_name,
 )
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.native_video import NativeVideoPublishUnavailable, native_video_candidate, publish_native_video_post
+from qzone_bridge.native_video import native_video_candidate
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
     NewsItem,
@@ -707,11 +707,11 @@ from qzone_bridge.news import (
     normalize_news_scopes,
 )
 from qzone_bridge.onebot_cookie import fetch_cookie_text
+from qzone_bridge.onebot_upload import fetch_video_upload_credentials
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
-from qzone_bridge.tencent_upload import qzone_video_upload_credentials_configured
 from qzone_bridge.video import materialize_video_covers, materialize_video_sources
 import qzone_bridge.publish_renderer as _publish_renderer
 try:
@@ -936,6 +936,7 @@ class QzoneStablePlugin(Star):
         self.data_dir = _standard_data_dir(self.root)
         self._onebot_client: Any | None = None
         self._cookie_lock: asyncio.Lock | None = None
+        self._video_upload_lock: asyncio.Lock | None = None
         self.controller = QzoneDaemonController(
             plugin_root=self.root,
             data_dir=self.data_dir,
@@ -3141,42 +3142,20 @@ class QzoneStablePlugin(Star):
         post: PostPayload,
         *,
         sync_weibo: bool = False,
+        event: AstrMessageEvent | None = None,
     ) -> tuple[PostPayload, dict[str, Any]]:
         post = await self._prepare_video_sources(post)
         render_post: PostPayload | None = None
         if getattr(self.settings, "native_video_publish", True) and native_video_candidate(post) is not None:
             render_post = await self._prepare_publish_payload(post)
-            if qzone_video_upload_credentials_configured():
-                payload = await self.controller.publish_post(
-                    content=post.content,
-                    sync_weibo=sync_weibo,
-                    media=[item.to_dict() for item in [*post.media, *post.attachments]],
-                    content_sanitized=True,
-                )
-                return render_post, payload
-            try:
-                native_result = await asyncio.to_thread(
-                    publish_native_video_post,
-                    post,
-                    app_name="QQ空间Ultra",
-                )
-            except NativeVideoPublishUnavailable as exc:
-                logger.debug("native qzone video publish skipped: %s", exc)
-            else:
-                payload = {
-                    "fid": "",
-                    "message": native_result.message,
-                    "native_video": True,
-                    "status": "pending_user_confirm",
-                    "media_count": len(post.media) + len(post.attachments),
-                    "photo_count": len(render_post.media),
-                    "raw": {
-                        "native_video_uri": native_result.uri,
-                        "handler": native_result.handler,
-                        "video": native_result.video.to_dict(),
-                    },
-                }
-                return render_post, payload
+            await self._maybe_bind_video_upload_credentials(event)
+            payload = await self.controller.publish_post(
+                content=post.content,
+                sync_weibo=sync_weibo,
+                media=[item.to_dict() for item in [*post.media, *post.attachments]],
+                content_sanitized=True,
+            )
+            return render_post, payload
 
         if render_post is None:
             render_post = await self._prepare_publish_payload(post)
@@ -3930,6 +3909,11 @@ class QzoneStablePlugin(Star):
             self._cookie_lock = asyncio.Lock()
         return self._cookie_lock
 
+    def _get_video_upload_lock(self) -> asyncio.Lock:
+        if getattr(self, "_video_upload_lock", None) is None:
+            self._video_upload_lock = asyncio.Lock()
+        return self._video_upload_lock
+
     def _capture_onebot_client_from_context(self) -> Any | None:
         context = getattr(self, "_context", None) or getattr(self, "context", None)
         platform = None
@@ -4038,6 +4022,48 @@ class QzoneStablePlugin(Star):
         self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
         return payload
 
+    @staticmethod
+    def _status_has_video_upload_credentials(status: dict[str, Any] | None) -> bool:
+        if not isinstance(status, dict):
+            return False
+        video_upload = status.get("video_upload")
+        return isinstance(video_upload, dict) and bool(video_upload.get("configured"))
+
+    async def _auto_bind_video_upload_credentials(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "aiocqhttp",
+    ) -> dict[str, Any] | None:
+        async with self._get_video_upload_lock():
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+            except QzoneBridgeError:
+                status = {}
+            if not force and self._status_has_video_upload_credentials(status):
+                return status
+
+            bot = self._capture_onebot_client(event)
+            if bot is None:
+                return status or None
+
+            credentials = await fetch_video_upload_credentials(bot, source=source)
+            if credentials is None:
+                return status or None
+
+            payload = await self.controller.bind_video_upload_credentials_local(**credentials.to_request_body())
+            logger.info("qzone video upload credentials bound from %s", credentials.source)
+            return payload
+
+    async def _maybe_bind_video_upload_credentials(self, event: AstrMessageEvent | None = None) -> None:
+        try:
+            await self._auto_bind_video_upload_credentials(event)
+        except QzoneBridgeError as exc:
+            logger.debug("qzone video upload credential bind skipped: %s", exc)
+        except Exception:
+            logger.debug("qzone video upload credential bind skipped unexpectedly", exc_info=True)
+
     async def _call_bootstrap_auto_bind(
         self,
         trigger: str,
@@ -4072,6 +4098,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
             return False
+        await self._maybe_bind_video_upload_credentials(event)
         await self._prewarm_daemon_if_cookie_ready(trigger)
         return True
 
@@ -4404,7 +4431,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            post, payload = await self._publish_post_payload(post)
+            post, payload = await self._publish_post_payload(post, event=event)
             if payload.get("fid"):
                 await self._post_store().upsert_async(
                     QzonePost(
@@ -4813,7 +4840,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            post, payload = await self._publish_post_payload(post)
+            post, payload = await self._publish_post_payload(post, event=event)
             published_fid = str(payload.get("fid") or "")
 
             def mark_published(current: DraftPost) -> None:
@@ -4915,6 +4942,8 @@ class QzoneStablePlugin(Star):
                 "/qzone status",
                 "/qzone bind <cookie>",
                 "/qzone autobind",
+                "/qzone videoauth <login_data_b64> [login_key_b64] [token_type] [token_appid] [token_wt_appid]",
+                "/qzone autovideoauth",
                 "/qzone unbind",
                 "",
                 "LLM tools:",
@@ -4973,6 +5002,7 @@ class QzoneStablePlugin(Star):
             return
         try:
             payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
+            await self._maybe_bind_video_upload_credentials(event)
         except QzoneBridgeError as exc:
             logger.warning("qzone autobind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
@@ -4983,6 +5013,60 @@ class QzoneStablePlugin(Star):
             payload = await self._status_with_recovery()
         except QzoneBridgeError:
             pass
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("videoauth")
+    async def qzone_videoauth(
+        self,
+        event: AstrMessageEvent,
+        login_data_b64: str = "",
+        login_key_b64: str = "",
+        token_type: int = 2,
+        token_appid: int = 0,
+        token_wt_appid: int = 0,
+    ):
+        """手动绑定 QQ upload 二进制登录材料，用于 daemon 原生视频直发。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以绑定视频上传材料。")
+            return
+        if not str(login_data_b64 or "").strip():
+            yield self._command_result(
+                event,
+                "用法：/qzone videoauth <login_data_b64> [login_key_b64] [token_type] [token_appid] [token_wt_appid]",
+            )
+            return
+        try:
+            await self.controller.bind_video_upload_credentials_local(
+                login_data_b64=login_data_b64,
+                login_key_b64=login_key_b64,
+                token_type=token_type,
+                token_appid=token_appid,
+                token_wt_appid=token_wt_appid,
+                source="manual",
+            )
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone videoauth failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("autovideoauth")
+    async def qzone_autovideoauth(self, event: AstrMessageEvent):
+        """从 OneBot 自动获取 QQ upload 二进制登录材料，用于 daemon 原生视频直发。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
+            return
+        try:
+            payload = await self._auto_bind_video_upload_credentials(event, force=True, source="aiocqhttp")
+            if not self._status_has_video_upload_credentials(payload):
+                yield self._command_result(event, "OneBot 没有返回 QQ upload 视频上传登录材料；无法启用 daemon 原生视频直发。")
+                return
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autovideoauth failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("unbind")
@@ -5075,7 +5159,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            post, payload = await self._publish_post_payload(post)
+            post, payload = await self._publish_post_payload(post, event=event)
         except QzoneBridgeError as exc:
             if profile_task is not None:
                 profile_task.cancel()
@@ -5242,7 +5326,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            post, payload = await self._publish_post_payload(post)
+            post, payload = await self._publish_post_payload(post, event=event)
         except QzoneBridgeError as exc:
             llm_payload = self._llm_error_payload("qzone_publish_post", exc)
             return await self._ask_llm_tool_reply(
@@ -5492,7 +5576,7 @@ class QzoneStablePlugin(Star):
         )
         try:
             await self._ensure_cookie_ready(event)
-            post, payload = await self._publish_post_payload(post, sync_weibo=sync_weibo)
+            post, payload = await self._publish_post_payload(post, sync_weibo=sync_weibo, event=event)
         except QzoneBridgeError as exc:
             text = await self._ask_llm_tool_reply(
                 event,
