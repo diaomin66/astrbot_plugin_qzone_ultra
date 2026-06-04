@@ -96,7 +96,7 @@ QQ/空间客户端内部还有一条静默或插件内发布路径：
 - 裸 `file` / `file_id` 只当作文件标识或文件名，不当作本地路径。
 - 如果视频源可读取，daemon 先本地化视频；单个本地视频优先进入 Tencent upload 后台直发链路，渲染结果仍可使用视频封面图保留播放标识。
 - 运行时已废除 `mqqapi://qzone/publish` / QQ/QQNT 客户端确认发布路径；客户端跳转只保留在逆向背景说明中，不再由插件调用。
-- daemon 原生视频发布仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供或视频组合不适合原生发布时会阻止发布并提示绑定/调整媒体，不再把视频封面帧当作图片说说发出。只有关闭 `native_video_publish` 后才明确走视频封面图发布。
+- daemon 原生视频发布仅当提供 QQ upload 二进制登录材料时启用后台上传发布；未提供、视频组合不适合原生发布或关闭 `native_video_publish` 时都会阻止视频发布并提示绑定/调整媒体，不再把视频封面帧或渲染图当作图片说说发出。
 - `/qzone autovideoauth` 面向 OneBot 协议端做通用扩展 action 探测：优先尝试 `get_qzone_video_upload_credentials` / `get_video_upload_credentials` 等协议端自定义 action，其次尝试 `get_login_misc_data(key/name/field=a2/vLoginData/...)`，再尝试 LLOneBot `llonebot_debug` 的登录 misc/A2 入口；`get_cookies`、`get_credentials`、`get_clientkey`、`forceFetchClientKey` 返回的 Web Cookie/CSRF/clientkey/keyIndex 只记录诊断，不会冒充 A2。
 
 ## v0.6.8 进展：发布体嵌入上传业务数据
@@ -197,3 +197,10 @@ OneBot 侧继续按协议端抽象处理：通用自定义 action 和 `get_login
 - Default video-auth binding source is now `onebot` instead of `aiocqhttp`; AstrBot's adapter may still be named aiocqhttp, but the compatibility contract is the OneBot protocol end, not NapCat or any single implementation.
 - Generic extension probing now also tries leading-underscore custom action names such as `_get_qzone_video_upload_credentials` and `_get_login_misc_data(key=a2)`, matching common OneBot extension naming conventions.
 - OneBot action invocation now covers `call_action`, `call_api`, `request`, and `call`, plus keyword params, positional params, and `params`/`data`/`payload` wrappers. This keeps NapCat/LLOneBot as primary targets while allowing other OneBot protocol ends to expose the same A2/vLoginData contract.
+
+## v0.6.23 OneBot protocol-end binary shape update
+
+- Current NapCat source still exposes `NodeIKernelLoginService.getLoginMiscData(key)` internally and standard `get_clientkey` / cookie APIs externally; those external Web login materials are still not accepted as QQ upload A2/vLoginData.
+- Current LLOneBot source registers `llonebot_debug` and its PMHQ bridge can call `loginService.getLoginMiscData`; probing now covers `pmhq.invoke(...)`, `pmhq.call(...)`, and `pmhq.httpSend({type:"call", data:{func:"loginService.getLoginMiscData", args:[key]}})` shapes.
+- OneBot extension action responses may now return A2/vLoginData as `a2`/`a2_hex`/`a2_b64`, `vLoginData`/`vLoginDataHex`/`vLoginDataB64`, Node `Buffer`, numeric byte arrays, or a targeted login-misc raw binary JavaScript string. Printable Web clientKey-like strings remain rejected.
+- The publish success invariant remains unchanged: daemon only reports success after upload plus feed/detail verification of the same `sVid`; otherwise the result is an explicit failure, never a cover-image fallback.

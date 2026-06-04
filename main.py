@@ -5444,7 +5444,8 @@ class QzoneStablePlugin(Star):
                     "请让当前 OneBot 协议端暴露返回 vLoginData/A2 的扩展 action，"
                     "例如 get_qzone_video_upload_credentials / get_video_upload_credentials，"
                     "或 get_login_misc_data(key=a2/vLoginData)；"
-                    "NapCat、LLOneBot、LLBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可。"
+                    "NapCat、LLOneBot、LLBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可，"
+                    "字段支持 a2/a2_hex/a2_b64、vLoginData/vLoginDataHex/vLoginDataB64、Buffer/数字数组或原始二进制字符串。"
                     "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
                     f"{suffix}",
                 )

@@ -158,6 +158,22 @@ IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] 
         )
         for key in LOGIN_MISC_DATA_KEYS
     ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "httpSend",
+                "args": [
+                    {
+                        "type": "call",
+                        "data": {"func": "loginService.getLoginMiscData", "args": [key]},
+                    }
+                ],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
     ("llonebot_debug", {"apiClass": "pmhq", "method": "call", "args": ["getSelfInfo", []]}),
     ("get_clientkey", {}),
     ("get_client_key", {}),
@@ -173,33 +189,87 @@ LOGIN_DATA_KEYS = {
     "login_data",
     "logindata",
     "login_data_b64",
+    "login_data_base64",
+    "login_data_hex",
+    "login_data_bytes",
     "vlogindata",
     "v_login_data",
     "v_login_data_b64",
+    "v_login_data_base64",
+    "v_login_data_hex",
+    "v_login_data_bytes",
     "vLoginData",
+    "vLoginDataB64",
+    "vLoginDataBase64",
+    "vLoginDataHex",
+    "vLoginDataBytes",
     "upload_login_data",
     "uploadLoginData",
     "upload_login_data_b64",
+    "upload_login_data_base64",
+    "upload_login_data_hex",
+    "upload_login_data_bytes",
+    "uploadLoginDataB64",
+    "uploadLoginDataBase64",
+    "uploadLoginDataHex",
+    "uploadLoginDataBytes",
     "qzone_upload_login_data",
     "qzoneUploadLoginData",
+    "qzoneUploadLoginDataB64",
+    "qzoneUploadLoginDataBase64",
+    "qzoneUploadLoginDataHex",
+    "qzoneUploadLoginDataBytes",
     "a2",
     "a2_b64",
+    "a2_base64",
+    "a2_hex",
+    "a2_bytes",
+    "A2",
+    "A2B64",
+    "A2Base64",
+    "A2Hex",
+    "A2Bytes",
 }
 LOGIN_KEY_KEYS = {
     "login_key",
     "loginkey",
     "login_key_b64",
+    "login_key_base64",
+    "login_key_hex",
+    "login_key_bytes",
     "vloginkey",
     "v_login_key",
     "v_login_key_b64",
+    "v_login_key_base64",
+    "v_login_key_hex",
+    "v_login_key_bytes",
     "vLoginKey",
+    "vLoginKeyB64",
+    "vLoginKeyBase64",
+    "vLoginKeyHex",
+    "vLoginKeyBytes",
     "upload_login_key",
     "uploadLoginKey",
     "upload_login_key_b64",
+    "upload_login_key_base64",
+    "upload_login_key_hex",
+    "upload_login_key_bytes",
+    "uploadLoginKeyB64",
+    "uploadLoginKeyBase64",
+    "uploadLoginKeyHex",
+    "uploadLoginKeyBytes",
     "qzone_upload_login_key",
     "qzoneUploadLoginKey",
+    "qzoneUploadLoginKeyB64",
+    "qzoneUploadLoginKeyBase64",
+    "qzoneUploadLoginKeyHex",
+    "qzoneUploadLoginKeyBytes",
     "a2_key",
     "a2Key",
+    "a2_key_b64",
+    "a2_key_base64",
+    "a2_key_hex",
+    "a2_key_bytes",
 }
 TOKEN_TYPE_KEYS = {"token_type", "tokenType", "type"}
 TOKEN_APPID_KEYS = {"token_appid", "tokenAppid", "appid", "app_id"}
@@ -892,7 +962,11 @@ def _action_may_return_raw_login_data(action: str, params: dict[str, Any] | None
         return True
     args = params.get("args")
     if isinstance(args, (list, tuple)):
-        return any(_normalize_key(item) in RAW_LOGIN_DATA_METHOD_HINTS for item in args if isinstance(item, str))
+        if any(_normalize_key(item) in RAW_LOGIN_DATA_METHOD_HINTS for item in args if isinstance(item, str)):
+            return True
+    func, _func_args = _pmhq_http_send_call(params)
+    if _normalize_key(func) in RAW_LOGIN_DATA_METHOD_HINTS:
+        return True
     return False
 
 
@@ -934,7 +1008,30 @@ def _action_targets_login_data(action: str, params: dict[str, Any] | None = None
             if isinstance(values, (list, tuple)):
                 return any(_normalize_key(item) in normalized_login_keys for item in values)
             return _normalize_key(values) in normalized_login_keys
+    func, func_args = _pmhq_http_send_call(params)
+    if _normalize_key(func) in {
+        "nodeikernelloginservicegetloginmiscdata",
+        "loginservicegetloginmiscdata",
+        "wrappersessiongetloginservicegetloginmiscdata",
+    }:
+        if isinstance(func_args, (list, tuple)):
+            return any(_normalize_key(item) in normalized_login_keys for item in func_args)
+        return _normalize_key(func_args) in normalized_login_keys
     return False
+
+
+def _pmhq_http_send_call(params: dict[str, Any] | None = None) -> tuple[str, Any]:
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if method not in {"httpsend", "wssend"}:
+        return "", []
+    args = params.get("args")
+    if not isinstance(args, (list, tuple)) or not args or not isinstance(args[0], dict):
+        return "", []
+    data = args[0].get("data")
+    if not isinstance(data, dict):
+        return "", []
+    return str(data.get("func") or ""), data.get("args") or []
 
 
 def _extract_raw_login_data_payload(
@@ -945,34 +1042,45 @@ def _extract_raw_login_data_payload(
 ) -> OneBotVideoUploadCredentials | None:
     if _payload_has_client_key(payload) and not trusted_raw:
         return None
-    encoded = _find_raw_login_data(payload)
+    encoded = _find_raw_login_data(payload, trusted_text=trusted_raw)
     if not encoded:
         return None
     return OneBotVideoUploadCredentials(login_data_b64=encoded, source=source)
 
 
-def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
+def _find_raw_login_data(
+    payload: Any,
+    *,
+    trusted_text: bool = False,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> str:
     if _seen is None:
         _seen = set()
     if payload is None or _depth > 8:
         return ""
     if isinstance(payload, (bytes, bytearray)):
-        return _raw_scalar_to_b64(payload)
+        return _raw_scalar_to_b64(payload, trusted_text=trusted_text)
     if isinstance(payload, str):
         text = payload.strip()
         if not text:
             return ""
         if text.startswith("{") or text.startswith("["):
             try:
-                return _find_raw_login_data(json.loads(text), _depth=_depth + 1, _seen=_seen)
+                return _find_raw_login_data(
+                    json.loads(text),
+                    trusted_text=trusted_text,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                )
             except Exception:
                 return ""
-        return _raw_scalar_to_b64(text)
+        return _raw_scalar_to_b64(text, trusted_text=trusted_text)
     if isinstance(payload, (list, tuple)):
         if all(isinstance(item, int) for item in payload):
-            return _raw_scalar_to_b64(payload)
+            return _raw_scalar_to_b64(payload, trusted_text=trusted_text)
         for item in payload:
-            found = _find_raw_login_data(item, _depth=_depth + 1, _seen=_seen)
+            found = _find_raw_login_data(item, trusted_text=trusted_text, _depth=_depth + 1, _seen=_seen)
             if found:
                 return found
         return ""
@@ -981,7 +1089,7 @@ def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | Non
 
     buffer_like = _buffer_like_to_bytes(payload)
     if buffer_like is not None:
-        return _raw_scalar_to_b64(buffer_like)
+        return _raw_scalar_to_b64(buffer_like, trusted_text=trusted_text)
 
     obj_id = id(payload)
     if obj_id in _seen:
@@ -991,7 +1099,12 @@ def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | Non
     normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
     for key in RAW_LOGIN_DATA_WRAPPER_KEYS:
         if key in payload and _normalize_key(key) not in normalized_client_keys:
-            found = _find_raw_login_data(payload.get(key), _depth=_depth + 1, _seen=_seen)
+            found = _find_raw_login_data(
+                payload.get(key),
+                trusted_text=trusted_text,
+                _depth=_depth + 1,
+                _seen=_seen,
+            )
             if found:
                 return found
     for key, value in payload.items():
@@ -999,25 +1112,57 @@ def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | Non
         if normalized in normalized_client_keys or normalized in {_normalize_key(item) for item in WEB_CREDENTIAL_KEYS}:
             continue
         if normalized in {_normalize_key(item) for item in LOGIN_DATA_KEYS}:
-            found = _raw_scalar_to_b64(value)
+            found = _raw_scalar_to_b64(value, trusted_text=trusted_text)
             if found:
                 return found
         if isinstance(value, (dict, list, tuple)):
-            found = _find_raw_login_data(value, _depth=_depth + 1, _seen=_seen)
+            found = _find_raw_login_data(value, trusted_text=trusted_text, _depth=_depth + 1, _seen=_seen)
             if found:
                 return found
     return ""
 
 
-def _raw_scalar_to_b64(value: Any) -> str:
+def _raw_scalar_to_b64(value: Any, *, trusted_text: bool = False) -> str:
     encoded = _value_to_b64(value)
-    if not encoded:
-        return ""
+    if encoded:
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return ""
+        return encoded if len(decoded) >= MIN_RAW_LOGIN_DATA_BYTES else ""
+    if trusted_text:
+        raw = _trusted_raw_text_to_bytes(value)
+        if len(raw) >= MIN_RAW_LOGIN_DATA_BYTES:
+            return _bytes_to_b64(raw)
+    return ""
+
+
+def _trusted_raw_text_to_bytes(value: Any) -> bytes:
+    """Encode targeted getLoginMiscData raw string values without accepting printable tokens.
+
+    Some NTQQ bridges expose binary login misc data as a JavaScript string
+    instead of hex/base64/Buffer.  Only targeted A2/vLoginData calls reach this
+    branch, and we still require non-printable or non-ASCII characters so Web
+    clientKey-like printable strings are not treated as QQ upload material.
+    """
+
+    if not isinstance(value, str):
+        return b""
+    text = value.strip()
+    if not text:
+        return b""
+    if not _looks_like_binary_text(text):
+        return b""
     try:
-        decoded = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        return ""
-    return encoded if len(decoded) >= MIN_RAW_LOGIN_DATA_BYTES else ""
+        if all(ord(ch) <= 0xFF for ch in text):
+            return bytes(ord(ch) for ch in text)
+        return text.encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return b""
+
+
+def _looks_like_binary_text(text: str) -> bool:
+    return any((ord(ch) < 32 and ch not in "\r\n\t") or ord(ch) > 126 for ch in text)
 
 
 def _value_to_b64(value: Any) -> str:

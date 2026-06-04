@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: accept more OneBot protocol-end A2/vLoginData shapes, including hex/base64 alias fields, targeted NTQQ raw binary strings, and LLOneBot `llonebot_debug` PMHQ `httpSend` login-misc forwarding.
 - fix: block video posts when `native_video_publish` is disabled so video attachments can no longer be reported as successful cover/rendered-image publishes.
 - fix: support generic OneBot protocol dispatchers for video auth probing, including `send_api`/`send_action`/`request_api`/`api_call`, nested protocol client wrappers, single `{"action": "...", "params": {...}}` envelopes, and the `llbot` platform alias.
 - fix: generalize OneBot video auth probing beyond aiocqhttp/NapCat by defaulting the source to `onebot`, trying leading-underscore extension actions, and supporting `request`/`call` wrappers with `params`/`data`/`payload`.

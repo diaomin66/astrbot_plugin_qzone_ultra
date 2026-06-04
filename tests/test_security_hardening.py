@@ -3826,6 +3826,42 @@ def test_onebot_video_upload_probe_accepts_targeted_login_misc_even_with_clientk
     assert probe.credentials.source == "test:get_login_misc_data"
 
 
+def test_onebot_video_upload_probe_accepts_targeted_login_misc_raw_binary_string() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_text = "\x01\x02binary-a2-from-js-string-\xff"
+    expected = bytes(ord(ch) for ch in raw_text)
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "get_login_misc_data" and params == {"key": "a2"}:
+                return {"result": 0, "value": raw_text}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(expected).decode("ascii")
+    assert probe.credentials.source == "test:get_login_misc_data"
+
+
+def test_onebot_video_upload_credentials_accept_hex_alias_fields() -> None:
+    from qzone_bridge.onebot_upload import extract_video_upload_credentials
+
+    payload = {
+        "data": {
+            "a2_hex": b"binary-a2-alias".hex(),
+            "vLoginKeyHex": b"binary-key-alias".hex(),
+        }
+    }
+
+    credentials = extract_video_upload_credentials(payload, source="test")
+
+    assert credentials is not None
+    assert credentials.login_data_b64 == base64.b64encode(b"binary-a2-alias").decode("ascii")
+    assert credentials.login_key_b64 == base64.b64encode(b"binary-key-alias").decode("ascii")
+
+
 def test_onebot_video_upload_probe_does_not_accept_login_misc_clientkey_as_a2() -> None:
     from qzone_bridge.onebot_upload import probe_video_upload_credentials
 
@@ -4016,6 +4052,52 @@ def test_onebot_video_upload_probe_accepts_generic_envelope_extension_action() -
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source == "onebot:get_qzone_video_upload_credentials"
     assert calls[0] == {"action": "get_qzone_video_upload_credentials", "params": {"domain": "qzone.qq.com"}}
+
+
+def test_onebot_video_upload_probe_uses_protocol_dispatcher_without_implementation_name() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"generic-protocol-dispatcher-a2"
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _ProtocolEndpoint:
+        async def api_call(self, action: str, params: dict[str, object]):
+            calls.append((action, dict(params)))
+            if action == "get_video_upload_credentials" and params == {"domain": "qzone.qq.com"}:
+                return {"status": "ok", "retcode": 0, "data": {"a2_hex": raw_a2.hex()}}
+            raise RuntimeError("unsupported action")
+
+    probe = asyncio.run(probe_video_upload_credentials(_ProtocolEndpoint(), source="onebot"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "onebot:get_video_upload_credentials"
+    assert calls[0] == ("get_qzone_video_upload_credentials", {"domain": "qzone.qq.com"})
+    assert ("get_video_upload_credentials", {"domain": "qzone.qq.com"}) in calls
+
+
+def test_onebot_video_upload_probe_accepts_llonebot_pmhq_httpsend_login_misc() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"llonebot-pmhq-httpsend-a2"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "httpSend"
+                and params.get("args")
+                == [{"type": "call", "data": {"func": "loginService.getLoginMiscData", "args": ["a2"]}}]
+            ):
+                return {"data": {"result": {"value": raw_a2.hex()}}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:llonebot_debug"
 
 
 def test_capture_onebot_client_from_context_supports_llbot_alias(monkeypatch: pytest.MonkeyPatch) -> None:
