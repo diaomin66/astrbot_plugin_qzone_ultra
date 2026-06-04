@@ -155,6 +155,33 @@ def test_main_import_recovers_from_renderer_with_false_comment_section_contract(
         sys.modules.pop("main", None)
 
 
+def test_main_import_reloads_cached_qzone_bridge_when_version_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge
+
+    try:
+        expected_version = qzone_bridge.__version__
+        monkeypatch.setattr(qzone_bridge, "__version__", "0.6.10", raising=False)
+
+        main = _import_main_with_stubs(monkeypatch)
+
+        assert main.QzoneStablePlugin.__name__ == "QzoneStablePlugin"
+        assert sys.modules["qzone_bridge"].__version__ == expected_version
+        assert sys.modules["qzone_bridge"] is not qzone_bridge
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_recovers_from_stale_media_without_video_collect_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

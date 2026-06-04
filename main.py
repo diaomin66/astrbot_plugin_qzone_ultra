@@ -498,6 +498,9 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     if package is None:
         return False
     _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+    expected_version = _local_qzone_bridge_expected_version(package_root)
+    if expected_version and str(getattr(package, "__version__", "") or "") != expected_version:
+        return False
     try:
         if int(getattr(package, "BRIDGE_API_VERSION", 0) or 0) < REQUIRED_QZONE_BRIDGE_API_VERSION:
             return False
@@ -620,6 +623,15 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             except (TypeError, ValueError):
                 return False
     return True
+
+
+def _local_qzone_bridge_expected_version(package_root: Path) -> str:
+    try:
+        text = (package_root / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"(?m)^__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
+    return match.group(1).strip() if match else ""
 
 
 def _evict_local_qzone_bridge_modules(package_root: Path) -> None:
