@@ -2908,6 +2908,164 @@ def test_plugin_collects_astrbot_reply_video_component_without_extension(
     assert post.media[0].trusted_local is True
 
 
+def test_plugin_resolves_astrbot_reply_video_component_via_onebot_file_action(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.get_file_params: list[dict[str, object]] = []
+
+        async def get_msg(self, **_kwargs):
+            raise RuntimeError("get_msg unavailable")
+
+        async def get_file(self, **params):
+            self.get_file_params.append(params)
+            if params != {"file": "95d20307dfb960194a9210eff4824876.mp4"}:
+                raise RuntimeError("unsupported get_file params")
+            return {"data": {"file": str(source), "file_name": "clip.mp4", "file_size": source.stat().st_size}}
+
+    class _Video:
+        type = "Video"
+        file = "95d20307dfb960194a9210eff4824876.mp4"
+        mime_type = "video/mp4"
+
+        async def convert_to_file_path(self):
+            raise RuntimeError("not a local path")
+
+    class _Reply:
+        type = "Reply"
+        id = 123456
+        chain = [_Video()]
+
+    bot = _Bot()
+    event = types.SimpleNamespace(
+        bot=bot,
+        message_obj=types.SimpleNamespace(
+            message=[
+                _Reply(),
+                {"type": "text", "data": {"text": "post"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert {"file": "95d20307dfb960194a9210eff4824876.mp4"} in bot.get_file_params
+    assert post.content == ""
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].trusted_local is True
+
+
+def test_plugin_resolves_quoted_video_file_identifier_with_get_video_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.get_video_params: list[dict[str, object]] = []
+
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {
+                "data": {
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": "95d20307dfb960194a9210eff4824876.mp4",
+                                "url": "empty",
+                                "path": "empty",
+                                "mime": "video/mp4",
+                            },
+                        }
+                    ]
+                }
+            }
+
+        async def get_file(self, **_params):
+            raise RuntimeError("get_file unsupported for video")
+
+        async def get_video(self, **params):
+            self.get_video_params.append(params)
+            if params != {"file": "95d20307dfb960194a9210eff4824876.mp4"}:
+                raise RuntimeError("unsupported get_video params")
+            return {
+                "data": {
+                    "download_url": "https://example.test/video/clip.mp4",
+                    "file_name": "clip.mp4",
+                    "file_size": 1234,
+                }
+            }
+
+    bot = _Bot()
+    event = types.SimpleNamespace(
+        bot=bot,
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "post"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert {"file": "95d20307dfb960194a9210eff4824876.mp4"} in bot.get_video_params
+    assert post.content == ""
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == "https://example.test/video/clip.mp4"
+
+
+def test_plugin_resolves_raw_cq_video_file_stem_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.get_file_params: list[dict[str, object]] = []
+
+        async def get_msg(self, *, message_id):
+            assert message_id == 123456
+            return {"data": {"raw_message": "[CQ:video,file=95d20307dfb960194a9210eff4824876.mp4]"}}
+
+        async def get_file(self, **params):
+            self.get_file_params.append(params)
+            if params != {"file": "95d20307dfb960194a9210eff4824876"}:
+                raise RuntimeError("unsupported get_file params")
+            return {"data": {"file": str(source), "file_name": "clip.mp4", "file_size": source.stat().st_size}}
+
+    bot = _Bot()
+    event = types.SimpleNamespace(
+        bot=bot,
+        message_obj=types.SimpleNamespace(raw_message="[CQ:reply,id=123456]post"),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert {"file": "95d20307dfb960194a9210eff4824876"} in bot.get_file_params
+    assert post.content == ""
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].trusted_local is True
+
+
 def test_materialize_video_sources_accepts_trusted_no_extension_video(tmp_path: Path) -> None:
     from qzone_bridge.media import PostMedia, PostPayload
     from qzone_bridge.video import materialize_video_sources

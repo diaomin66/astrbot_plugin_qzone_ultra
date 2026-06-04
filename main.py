@@ -2872,6 +2872,158 @@ class QzoneStablePlugin(Star):
         name = cls._onebot_media_name(data, cls._onebot_source_from_data(data))
         return is_video_media({"type": kind, **data, "name": name})
 
+    @staticmethod
+    def _onebot_identifier_stem(value: str) -> str:
+        text = str(value or "").strip()
+        if not text or text.startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return ""
+        name = source_name(text) or text
+        suffix = Path(name).suffix.lower()
+        if suffix not in QZONE_VIDEO_SUFFIXES:
+            return ""
+        stem = Path(name).stem.strip()
+        return stem if stem and stem != text else ""
+
+    @classmethod
+    def _onebot_media_identifier_candidates(cls, data: dict[str, Any], *, kind: str = "") -> list[str]:
+        candidates: list[str] = []
+        for key in (
+            "file_id",
+            "fileId",
+            "file",
+            "file_",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "attachment_id",
+            "attachmentId",
+            "md5",
+            "sha",
+            "sha1",
+        ):
+            value = data.get(key)
+            if cls._source_placeholder(value):
+                continue
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        if kind == "video" or cls._onebot_segment_is_video(kind, data):
+            for value in list(candidates):
+                stem = cls._onebot_identifier_stem(value)
+                if stem and stem not in candidates:
+                    candidates.append(stem)
+        return candidates
+
+    @staticmethod
+    def _dedupe_onebot_action_calls(calls: Iterable[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        result: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for action, params in calls:
+            key = (action, tuple(sorted((item_key, str(item_value)) for item_key, item_value in params.items())))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((action, params))
+        return result
+
+    @classmethod
+    def _onebot_video_file_action_calls(cls, data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        identifiers = cls._onebot_media_identifier_candidates(data, kind="video")
+        direct_file_keys = {"file", "file_", "attachment_id", "attachmentId"}
+        direct_id_keys = {
+            "file_id",
+            "fileId",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "md5",
+            "sha",
+            "sha1",
+        }
+        direct_files: set[str] = set()
+        direct_ids: set[str] = set()
+        for key in direct_file_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_files.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_files.add(stem)
+        for key in direct_id_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_ids.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_ids.add(stem)
+        for value in identifiers:
+            param_variants: list[dict[str, Any]] = []
+            if value in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file_id": value},
+                        {"type": "path", "file_id": value},
+                        {"type": "url", "file_id": value},
+                        {"type": "base64", "file_id": value},
+                        {"id": value},
+                    ]
+                )
+            if value in direct_files or value not in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file": value},
+                        {"type": "path", "file": value},
+                        {"type": "url", "file": value},
+                        {"type": "base64", "file": value},
+                    ]
+                )
+            param_variants.extend([{"video": value}, {"id": value}])
+            for params in param_variants:
+                calls.append(("get_file", params))
+            for params in param_variants:
+                calls.append(("get_video", params))
+        return cls._dedupe_onebot_action_calls(calls)
+
+    def _onebot_file_url_action_calls(
+        self,
+        data: dict[str, Any],
+        event: AstrMessageEvent | None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        identifiers = self._onebot_media_identifier_candidates(data, kind="video")
+        if not identifiers:
+            return []
+        calls: list[tuple[str, dict[str, Any]]] = []
+        group_id = self._group_id(event) if event is not None else 0
+        busid = data.get("busid") or data.get("bus_id") or data.get("busId")
+        for file_id in identifiers:
+            group_params: list[dict[str, Any]] = []
+            for key in ("file_id", "file", "id"):
+                base = {key: file_id}
+                if not self._source_placeholder(busid):
+                    with_busid = {**base, "busid": busid}
+                    group_params.append(with_busid)
+                group_params.append(base)
+            if group_id:
+                for params in group_params:
+                    calls.append(("get_group_file_url", {"group_id": group_id, **params}))
+                    calls.append(("get_group_file_url", {"group": group_id, **params}))
+            for key in ("file_id", "file", "id"):
+                calls.append(("get_private_file_url", {key: file_id}))
+                calls.append(("get_file_url", {key: file_id}))
+                calls.append(("get_video_url", {key: file_id}))
+        return self._dedupe_onebot_action_calls(calls)
+
     def _iter_onebot_segments(self, payload: Any, *, seen: set[int] | None = None, depth: int = 0) -> list[Any]:
         if depth > 6 or payload in (None, "", [], (), {}):
             return []
@@ -2946,33 +3098,11 @@ class QzoneStablePlugin(Star):
         kind: str,
         data: dict[str, Any],
     ) -> PostMedia | None:
-        candidates: list[tuple[str, Any]] = []
-        for key in ("file_id", "fileId", "file", "file_unique", "fileUnique", "file_uuid", "fileUuid", "fid", "id"):
-            value = data.get(key)
-            if self._source_placeholder(value):
-                continue
-            text = str(value or "").strip()
-            if not text:
-                continue
-            if (key, text) not in candidates:
-                candidates.append((key, text))
-        param_sets: list[dict[str, Any]] = []
-        for key, value in candidates:
-            if key in {"file_id", "fileId", "file_unique", "fileUnique", "file_uuid", "fileUuid", "fid", "id"}:
-                param_sets.append({"file_id": value})
-                param_sets.append({"type": "path", "file_id": value})
-                param_sets.append({"type": "url", "file_id": value})
-            param_sets.append({"file": value})
-        seen_params: set[tuple[tuple[str, str], ...]] = set()
-        for params in param_sets:
-            key = tuple(sorted((item_key, str(item_value)) for item_key, item_value in params.items()))
-            if key in seen_params:
-                continue
-            seen_params.add(key)
+        for action, params in self._onebot_video_file_action_calls(data):
             try:
-                payload = await self._query_onebot_action(bot, "get_file", **params)
+                payload = await self._query_onebot_action(bot, action, **params)
             except Exception as exc:
-                logger.debug("qzone OneBot get_file failed params=%s: %s", params, exc)
+                logger.debug("qzone OneBot %s failed params=%s: %s", action, params, exc)
                 continue
             result = self._onebot_data_payload(payload)
             if isinstance(result, dict):
@@ -2990,32 +3120,7 @@ class QzoneStablePlugin(Star):
         data: dict[str, Any],
         event: AstrMessageEvent | None,
     ) -> PostMedia | None:
-        file_id = str(
-            data.get("file_id")
-            or data.get("fileId")
-            or data.get("file_unique")
-            or data.get("fileUnique")
-            or data.get("file_uuid")
-            or data.get("fileUuid")
-            or data.get("fid")
-            or data.get("id")
-            or data.get("file")
-            or ""
-        ).strip()
-        if not file_id or self._source_placeholder(file_id):
-            return None
-        calls: list[tuple[str, dict[str, Any]]] = []
-        group_id = self._group_id(event) if event is not None else 0
-        busid = data.get("busid") or data.get("bus_id") or data.get("busId")
-        if group_id:
-            if not self._source_placeholder(busid):
-                calls.append(("get_group_file_url", {"group_id": group_id, "file_id": file_id, "busid": busid}))
-                calls.append(("get_group_file_url", {"group": group_id, "file_id": file_id, "busid": busid}))
-            calls.append(("get_group_file_url", {"group_id": group_id, "file_id": file_id}))
-            calls.append(("get_group_file_url", {"group": group_id, "file_id": file_id}))
-        calls.append(("get_private_file_url", {"file_id": file_id}))
-        calls.append(("get_private_file_url", {"file": file_id}))
-        for action, params in calls:
+        for action, params in self._onebot_file_url_action_calls(data, event):
             try:
                 payload = await self._query_onebot_action(bot, action, **params)
             except Exception as exc:
@@ -3068,26 +3173,48 @@ class QzoneStablePlugin(Star):
                 media.append(item)
         return self._dedupe_media(media)
 
-    async def _component_file_media(self, component: Any, kind: str) -> PostMedia | None:
+    async def _component_file_media(
+        self,
+        component: Any,
+        kind: str,
+        *,
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+    ) -> PostMedia | None:
         data = self._onebot_segment_data(component)
         source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
         if source:
             return self._onebot_post_media(kind, data, source, require_existing_local=True)
         method_name = "get_file" if kind == "file" else "convert_to_file_path"
         method = getattr(component, method_name, None)
-        if not callable(method):
-            return None
         if kind == "file" and not self._onebot_segment_is_video(kind, data):
             return None
-        try:
-            resolved = await self._maybe_await(method())
-        except Exception as exc:
-            logger.debug("qzone component media materialize failed kind=%s: %s", kind, exc)
-            return None
         media_kind = "video" if kind == "file" and self._onebot_segment_is_video(kind, data) else kind
-        return self._onebot_post_media(media_kind, data, str(resolved or ""), require_existing_local=True)
+        if callable(method):
+            try:
+                resolved = await self._maybe_await(method())
+            except Exception as exc:
+                logger.debug("qzone component media materialize failed kind=%s: %s", kind, exc)
+            else:
+                media = self._onebot_post_media(media_kind, data, str(resolved or ""), require_existing_local=True)
+                if media is not None:
+                    return media
+        if bot is not None and media_kind == "video":
+            media = await self._onebot_get_file_media(bot, "video", data)
+            if media is not None:
+                return media
+            return await self._onebot_file_url_media(bot, "video", data, event)
+        return None
 
-    async def _component_runtime_media(self, component: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
+    async def _component_runtime_media(
+        self,
+        component: Any,
+        *,
+        seen: set[int],
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+        depth: int = 0,
+    ) -> list[PostMedia]:
         if depth > 6 or component in (None, "", [], (), {}):
             return []
         if not isinstance(component, (str, bytes, bytearray, int, float, bool)):
@@ -3098,7 +3225,15 @@ class QzoneStablePlugin(Star):
         if isinstance(component, (list, tuple, set)):
             media: list[PostMedia] = []
             for item in component:
-                media.extend(await self._component_runtime_media(item, seen=seen, depth=depth + 1))
+                media.extend(
+                    await self._component_runtime_media(
+                        item,
+                        seen=seen,
+                        bot=bot,
+                        event=event,
+                        depth=depth + 1,
+                    )
+                )
             return media
         if isinstance(component, str):
             return []
@@ -3106,7 +3241,7 @@ class QzoneStablePlugin(Star):
         kind = self._onebot_segment_kind(component)
         media: list[PostMedia] = []
         if kind in {"image", "video", "record", "file"}:
-            item = await self._component_file_media(component, kind)
+            item = await self._component_file_media(component, kind, bot=bot, event=event)
             if item is not None:
                 media.append(item)
         data = self._onebot_segment_data(component)
@@ -3114,15 +3249,23 @@ class QzoneStablePlugin(Star):
             nested = data.get(key)
             if nested in (None, "", [], (), {}):
                 continue
-            media.extend(await self._component_runtime_media(nested, seen=seen, depth=depth + 1))
+            media.extend(
+                await self._component_runtime_media(
+                    nested,
+                    seen=seen,
+                    bot=bot,
+                    event=event,
+                    depth=depth + 1,
+                )
+            )
         return self._dedupe_media(media)
 
     async def _event_runtime_media(self, event: AstrMessageEvent) -> list[PostMedia]:
         media: list[PostMedia] = []
         seen: set[int] = set()
-        for component in iter_event_components(event):
-            media.extend(await self._component_runtime_media(component, seen=seen))
         bot = self._capture_onebot_client(event)
+        for component in iter_event_components(event):
+            media.extend(await self._component_runtime_media(component, seen=seen, bot=bot, event=event))
         if bot is not None:
             message_obj = getattr(event, "message_obj", None)
             for payload in (
