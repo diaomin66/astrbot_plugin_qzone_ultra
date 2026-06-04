@@ -4202,7 +4202,19 @@ class QzoneStablePlugin(Star):
         context = getattr(self, "_context", None) or getattr(self, "context", None)
         platform = None
         if context is not None:
-            for platform_type in ("aiocqhttp", "onebot", "onebot11", "onebot_v11", "napcat", "llonebot"):
+            for platform_type in (
+                "aiocqhttp",
+                "onebot",
+                "onebot11",
+                "onebot_v11",
+                "onebot_v12",
+                "go-cqhttp",
+                "gocqhttp",
+                "napcat",
+                "llonebot",
+                "lagrange",
+                "shamrock",
+            ):
                 try:
                     platform = context.get_platform(platform_type)
                 except Exception:
@@ -4221,8 +4233,14 @@ class QzoneStablePlugin(Star):
                             or "onebot" in platform_name
                             or "napcat" in platform_name
                             or "llonebot" in platform_name
+                            or "lagrange" in platform_name
+                            or "shamrock" in platform_name
                             or platform_type == "aiocqhttp"
                             or "onebot" in platform_type
+                            or "napcat" in platform_type
+                            or "llonebot" in platform_type
+                            or "lagrange" in platform_type
+                            or "shamrock" in platform_type
                         ):
                             platform = candidate
                             break

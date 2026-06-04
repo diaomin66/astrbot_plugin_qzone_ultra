@@ -6,6 +6,7 @@ import base64
 import binascii
 import asyncio
 from dataclasses import dataclass
+import inspect
 import json
 import re
 from typing import Any
@@ -18,13 +19,26 @@ VIDEO_UPLOAD_CREDENTIAL_ACTIONS = (
     "get_video_upload_credentials",
     "get_qzone_video_upload_auth",
     "get_video_upload_auth",
+    "get_qzone_video_upload_a2",
+    "get_video_upload_a2",
+    "get_qzone_video_vlogin_data",
+    "get_video_vlogin_data",
     "get_qzone_upload_credentials",
     "get_upload_credentials",
     "get_qzone_upload_auth",
     "get_upload_auth",
+    "get_qzone_upload_a2",
+    "get_upload_a2",
+    "get_qzone_vlogin_data",
+    "get_vlogin_data",
     "get_qq_upload_credentials",
     "get_qq_upload_login_data",
     "get_qq_upload_auth",
+    "get_qq_upload_a2",
+    "get_qq_vlogin_data",
+    "get_ntqq_a2",
+    "get_ntqq_vlogin_data",
+    "get_a2",
     "get_upload_login_data",
     "get_qzone_upload_login_data",
     "get_ntqq_login_data",
@@ -46,9 +60,17 @@ LOGIN_MISC_DATA_KEYS = (
 )
 ONEBOT_LOGIN_MISC_ACTIONS = (
     "get_login_misc_data",
+    "get_login_misc",
     "get_ntqq_login_misc_data",
+    "get_ntqq_login_misc",
+    "get_nt_login_misc_data",
+    "get_nt_login_misc",
     "get_qq_login_misc_data",
+    "get_qq_login_misc",
     "get_qzone_login_misc_data",
+    "get_qzone_login_misc",
+    "get_qzone_upload_login_misc_data",
+    "get_qzone_video_login_misc_data",
 )
 LOGIN_MISC_ACTION_PARAM_VARIANTS: tuple[dict[str, str], ...] = tuple(
     params
@@ -65,11 +87,21 @@ PROTOCOL_ENDPOINT_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
         for action in ONEBOT_LOGIN_MISC_ACTIONS
         for params in LOGIN_MISC_ACTION_PARAM_VARIANTS
     ),
+    ("get_a2", {}),
+    ("get_ntqq_a2", {}),
+    ("get_qq_upload_a2", {}),
+    ("get_qzone_upload_a2", {}),
+    ("get_video_upload_a2", {}),
+    ("get_vlogin_data", {}),
+    ("get_ntqq_vlogin_data", {}),
+    ("get_qzone_vlogin_data", {}),
+    ("get_video_vlogin_data", {}),
+)
+IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2", "args": []}),
     ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Bytes", "args": []}),
     ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQQUploadData", "args": []}),
     ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQzoneUploadData", "args": []}),
-    ("llonebot_debug", {"apiClass": "pmhq", "method": "call", "args": ["getSelfInfo", []]}),
     *(
         (
             "llonebot_debug",
@@ -81,6 +113,29 @@ PROTOCOL_ENDPOINT_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
         )
         for key in LOGIN_MISC_DATA_KEYS
     ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "call",
+                "args": ["loginService.getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "call",
+                "args": ["wrapperSession.getLoginService().getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    ("llonebot_debug", {"apiClass": "pmhq", "method": "call", "args": ["getSelfInfo", []]}),
     ("get_clientkey", {}),
     ("get_client_key", {}),
     ("get_ntqq_clientkey", {}),
@@ -156,30 +211,50 @@ RAW_LOGIN_DATA_METHOD_HINTS = {
     "getqzoneuploaddata",
     "getloginmiscdata",
     "nodeikernelloginservicegetloginmiscdata",
+    "loginservicegetloginmiscdata",
+    "wrappersessiongetloginservicegetloginmiscdata",
 }
 RAW_LOGIN_DATA_ACTION_HINTS = {
     "getqzonevideouploadcredentials",
     "getvideouploadcredentials",
     "getqzonevideouploadauth",
     "getvideouploadauth",
+    "getqzonevideouploada2",
+    "getvideouploada2",
+    "getqzonevideovlogindata",
+    "getvideovlogindata",
     "getqzoneuploadcredentials",
     "getuploadcredentials",
     "getqzoneuploadauth",
     "getuploadauth",
+    "getqzoneuploada2",
+    "getuploada2",
+    "getqzonevlogindata",
+    "getvlogindata",
     "getqquploadcredentials",
     "getqquploadlogindata",
     "getqquploadauth",
+    "getqquploada2",
+    "getqqvlogindata",
+    "getntqqa2",
+    "getntqqvlogindata",
+    "geta2",
     "getuploadlogindata",
     "getqzoneuploadlogindata",
     "getntqqlogindata",
     "getlogindata",
     "getloginmiscdata",
+    "getloginmisc",
     "getntqqloginmiscdata",
+    "getntqqloginmisc",
+    "getntloginmiscdata",
+    "getntloginmisc",
     "getqqloginmiscdata",
+    "getqqloginmisc",
     "getqzoneloginmiscdata",
-    "getqquploada2",
-    "getqzoneuploada2",
-    "getvideouploada2",
+    "getqzoneloginmisc",
+    "getqzoneuploadloginmiscdata",
+    "getqzonevideologinmiscdata",
 }
 RAW_LOGIN_DATA_WRAPPER_KEYS = WRAPPER_KEYS + ("value", "ticket", "buffer")
 MIN_RAW_LOGIN_DATA_BYTES = 8
@@ -312,6 +387,56 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
             web_only.append(action)
         if _payload_has_client_key(payload):
             client_key_only.append(action)
+    embedded_credentials, error_count = await _probe_embedded_ntqq_login_misc(
+        bot,
+        source=source,
+        attempted=attempted,
+        returned=returned,
+        web_only=web_only,
+        client_key_only=client_key_only,
+        error_count=error_count,
+    )
+    if embedded_credentials is not None:
+        return OneBotVideoUploadProbe(
+            credentials=embedded_credentials,
+            attempted_actions=tuple(_unique(attempted)),
+            returned_actions=tuple(_unique(returned)),
+            web_credential_actions=tuple(_unique(web_only)),
+            client_key_actions=tuple(_unique(client_key_only)),
+            error_count=error_count,
+        )
+    for action, params in IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS:
+        attempted.append(_action_label(action, params))
+        try:
+            payload = await asyncio.wait_for(
+                call_onebot_action(bot, action, **params),
+                timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            error_count += 1
+            continue
+        returned.append(action)
+        source_name = f"{source}:{action}"
+        credentials = extract_video_upload_credentials(payload, source=source_name)
+        if credentials is None and _action_may_return_raw_login_data(action, params):
+            credentials = _extract_raw_login_data_payload(
+                payload,
+                source=source_name,
+                trusted_raw=_action_targets_login_data(action, params),
+            )
+        if credentials is not None:
+            return OneBotVideoUploadProbe(
+                credentials=credentials,
+                attempted_actions=tuple(_unique(attempted)),
+                returned_actions=tuple(_unique(returned)),
+                web_credential_actions=tuple(_unique(web_only)),
+                client_key_actions=tuple(_unique(client_key_only)),
+                error_count=error_count,
+            )
+        if _payload_has_web_credentials(payload):
+            web_only.append(action)
+        if _payload_has_client_key(payload):
+            client_key_only.append(action)
     return OneBotVideoUploadProbe(
         credentials=None,
         attempted_actions=tuple(_unique(attempted)),
@@ -330,9 +455,202 @@ def _video_upload_action_param_variants() -> tuple[dict[str, Any], ...]:
         {"appid": "video_qzone"},
         {"app_id": "video_qzone"},
         {"service": "video_qzone"},
+        {"business": "video_qzone"},
+        {"business_type": "video_qzone"},
+        {"cmd": "video_qzone"},
         {"type": "video_qzone"},
         {},
     )
+
+
+async def _probe_embedded_ntqq_login_misc(
+    bot: Any,
+    *,
+    source: str,
+    attempted: list[str],
+    returned: list[str],
+    web_only: list[str],
+    client_key_only: list[str],
+    error_count: int,
+) -> tuple[OneBotVideoUploadCredentials | None, int]:
+    """Try native NTQQ service handles when an AstrBot adapter exposes them.
+
+    The preferred contract is still a OneBot action such as
+    ``get_login_misc_data(key=a2)``.  This fallback exists because current
+    NapCat exposes ``NodeIKernelLoginService.getLoginMiscData`` internally
+    while not exposing a matching OneBot action in its default HTTP/WS API.
+    If an adapter passes that internal object through, use it without logging
+    or returning the secret material.
+    """
+
+    for key in LOGIN_MISC_DATA_KEYS:
+        for label, call in _embedded_ntqq_login_misc_callables(bot, key):
+            attempted.append(label)
+            try:
+                payload = await asyncio.wait_for(_maybe_await(call()), timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS)
+            except Exception:
+                error_count += 1
+                continue
+            returned.append(label)
+            source_name = f"{source}:{label}"
+            credentials = extract_video_upload_credentials(payload, source=source_name)
+            if credentials is None:
+                credentials = _extract_raw_login_data_payload(payload, source=source_name, trusted_raw=True)
+            if credentials is not None:
+                return credentials, error_count
+            if _payload_has_web_credentials(payload):
+                web_only.append(label)
+            if _payload_has_client_key(payload):
+                client_key_only.append(label)
+    return None, error_count
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _embedded_ntqq_login_misc_callables(bot: Any, key: str) -> list[tuple[str, Any]]:
+    calls: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    normalized_key = _normalize_key(key)
+
+    def add(label: str, fn: Any) -> None:
+        if label in seen or not callable(fn):
+            return
+        seen.add(label)
+        calls.append((label, fn))
+
+    for owner_label, owner in _embedded_owner_candidates(bot):
+        for method_name in ("get_login_misc_data", "getLoginMiscData"):
+            method = _safe_getattr(owner, method_name)
+            if callable(method):
+                add(f"embedded:{owner_label}.{method_name}:key={key}", lambda method=method, key=key: method(key))
+        if normalized_key == "a2":
+            for method_name in ("get_a2", "getA2", "getA2Bytes", "getQQUploadData", "getQzoneUploadData"):
+                method = _safe_getattr(owner, method_name)
+                if callable(method):
+                    add(f"embedded:{owner_label}.{method_name}", lambda method=method: method())
+
+        for event_wrapper_label, event_wrapper in _event_wrapper_candidates(owner_label, owner):
+            caller = _safe_getattr(event_wrapper, "callNoListenerEvent")
+            if callable(caller):
+                add(
+                    f"embedded:{event_wrapper_label}.callNoListenerEvent:NodeIKernelLoginService/getLoginMiscData,key={key}",
+                    lambda caller=caller, key=key: caller("NodeIKernelLoginService/getLoginMiscData", key),
+                )
+
+        for service_label, service in _login_service_candidates(owner_label, owner):
+            method = _safe_getattr(service, "getLoginMiscData")
+            if callable(method):
+                add(f"embedded:{service_label}.getLoginMiscData:key={key}", lambda method=method, key=key: method(key))
+
+        for pmhq_label, pmhq in _pmhq_candidates(owner_label, owner):
+            invoke = _safe_getattr(pmhq, "invoke")
+            if callable(invoke):
+                add(
+                    f"embedded:{pmhq_label}.invoke:NodeIKernelLoginService/getLoginMiscData,key={key}",
+                    lambda invoke=invoke, key=key: invoke("nodeIKernelLoginService/getLoginMiscData", [key]),
+                )
+            call = _safe_getattr(pmhq, "call")
+            if callable(call):
+                add(
+                    f"embedded:{pmhq_label}.call:loginService.getLoginMiscData,key={key}",
+                    lambda call=call, key=key: call("loginService.getLoginMiscData", [key]),
+                )
+                add(
+                    f"embedded:{pmhq_label}.call:wrapperSession.getLoginService().getLoginMiscData,key={key}",
+                    lambda call=call, key=key: call("wrapperSession.getLoginService().getLoginMiscData", [key]),
+                )
+    return calls
+
+
+def _embedded_owner_candidates(bot: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    def add(label: str, value: Any) -> None:
+        if value is None:
+            return
+        obj_id = id(value)
+        if obj_id in seen_ids:
+            return
+        seen_ids.add(obj_id)
+        candidates.append((label, value))
+
+    add("bot", bot)
+    for attr in ("api", "client", "bot", "onebot", "cqhttp", "api_client", "core", "context", "ctx", "session"):
+        value = _safe_getattr(bot, attr)
+        add(f"bot.{attr}", value)
+    return candidates
+
+
+def _event_wrapper_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for prefix, value in (
+        (owner_label, _safe_getattr(owner, "eventWrapper")),
+        (f"{owner_label}.core", _safe_getattr(_safe_getattr(owner, "core"), "eventWrapper")),
+    ):
+        if value is not None:
+            candidates.append((f"{prefix}.eventWrapper", value))
+    return candidates
+
+
+def _login_service_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for session_label, session in (
+        (f"{owner_label}.session", _safe_getattr(owner, "session")),
+        (f"{owner_label}.wrapperSession", _safe_getattr(owner, "wrapperSession")),
+        (f"{owner_label}.context.session", _safe_getattr(_safe_getattr(owner, "context"), "session")),
+        (f"{owner_label}.ctx.session", _safe_getattr(_safe_getattr(owner, "ctx"), "session")),
+    ):
+        if session is None:
+            continue
+        getter = _safe_getattr(session, "getLoginService")
+        if callable(getter):
+            try:
+                service = getter()
+            except Exception:
+                service = None
+            if service is not None:
+                candidates.append((f"{session_label}.getLoginService()", service))
+        service = _safe_getattr(session, "NodeIKernelLoginService")
+        if service is not None:
+            candidates.append((f"{session_label}.NodeIKernelLoginService", service))
+    wrapper_login_service = _safe_getattr(_safe_getattr(owner, "wrapper"), "NodeIKernelLoginService")
+    if wrapper_login_service is not None:
+        getter = _safe_getattr(wrapper_login_service, "get")
+        if callable(getter):
+            try:
+                wrapper_login_service = getter()
+            except Exception:
+                pass
+        candidates.append((f"{owner_label}.wrapper.NodeIKernelLoginService", wrapper_login_service))
+    return candidates
+
+
+def _pmhq_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    pmhq = _safe_getattr(owner, "pmhq")
+    if pmhq is not None:
+        candidates.append((f"{owner_label}.pmhq", pmhq))
+    getter = _safe_getattr(owner, "get")
+    if callable(getter):
+        try:
+            pmhq = getter("pmhq")
+        except Exception:
+            pmhq = None
+        if pmhq is not None:
+            candidates.append((f"{owner_label}.get(pmhq)", pmhq))
+    return candidates
+
+
+def _safe_getattr(owner: Any, attr: str) -> Any:
+    try:
+        return getattr(owner, attr, None)
+    except Exception:
+        return None
 
 
 def _action_label(action: str, params: dict[str, Any]) -> str:
@@ -560,6 +878,11 @@ def _action_targets_login_data(action: str, params: dict[str, Any] | None = None
     params = params or {}
     normalized_login_keys = {_normalize_key(item) for item in (*LOGIN_MISC_DATA_KEYS, *LOGIN_DATA_KEYS)}
 
+    if normalized_action in RAW_LOGIN_DATA_ACTION_HINTS and (
+        "a2" in normalized_action or "vlogindata" in normalized_action or "logindata" in normalized_action
+    ):
+        return True
+
     if normalized_action in {_normalize_key(item) for item in ONEBOT_LOGIN_MISC_ACTIONS}:
         for key in ("key", "name", "field"):
             if _normalize_key(params.get(key)) in normalized_login_keys:
@@ -570,7 +893,11 @@ def _action_targets_login_data(action: str, params: dict[str, Any] | None = None
         return True
     args = params.get("args")
     if isinstance(args, (list, tuple)) and args:
-        if _normalize_key(args[0]) == "nodeikernelloginservicegetloginmiscdata":
+        if _normalize_key(args[0]) in {
+            "nodeikernelloginservicegetloginmiscdata",
+            "loginservicegetloginmiscdata",
+            "wrappersessiongetloginservicegetloginmiscdata",
+        }:
             values = args[1] if len(args) > 1 else []
             if isinstance(values, (list, tuple)):
                 return any(_normalize_key(item) in normalized_login_keys for item in values)
@@ -620,6 +947,10 @@ def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | Non
     if not isinstance(payload, dict):
         return ""
 
+    buffer_like = _buffer_like_to_bytes(payload)
+    if buffer_like is not None:
+        return _raw_scalar_to_b64(buffer_like)
+
     obj_id = id(payload)
     if obj_id in _seen:
         return ""
@@ -660,10 +991,15 @@ def _raw_scalar_to_b64(value: Any) -> str:
 def _value_to_b64(value: Any) -> str:
     if value is None:
         return ""
+    buffer_like = _buffer_like_to_bytes(value)
+    if buffer_like is not None:
+        return _bytes_to_b64(buffer_like)
     if isinstance(value, bytes):
         return _bytes_to_b64(value)
     if isinstance(value, bytearray):
         return _bytes_to_b64(bytes(value))
+    if isinstance(value, memoryview):
+        return _bytes_to_b64(value.tobytes())
     if isinstance(value, list) and all(isinstance(item, int) for item in value):
         try:
             return _bytes_to_b64(bytes(item & 0xFF for item in value))
@@ -684,8 +1020,40 @@ def _value_to_b64(value: Any) -> str:
     try:
         decoded = base64.b64decode("".join(text.split()), validate=True)
     except (binascii.Error, ValueError):
-        return ""
+        compact = "".join(text.split())
+        if "-" not in compact and "_" not in compact:
+            return ""
+        padded = compact + "=" * ((4 - len(compact) % 4) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+        except (binascii.Error, ValueError):
+            return ""
     return _bytes_to_b64(decoded) if decoded else ""
+
+
+def _buffer_like_to_bytes(value: Any) -> bytes | None:
+    if not isinstance(value, dict):
+        return None
+    data = value.get("data")
+    type_name = _normalize_key(value.get("type"))
+    if isinstance(data, (list, tuple)) and all(isinstance(item, int) for item in data):
+        if type_name in {"buffer", "uint8array", "bytes", "bytearray"} or set(value).issubset({"type", "data"}):
+            try:
+                return bytes(item & 0xFF for item in data)
+            except ValueError:
+                return None
+    numeric_items: list[tuple[int, int]] = []
+    for key, item in value.items():
+        if not str(key).isdigit() or not isinstance(item, int):
+            numeric_items = []
+            break
+        numeric_items.append((int(key), item))
+    if numeric_items and {index for index, _ in numeric_items} == set(range(len(numeric_items))):
+        try:
+            return bytes(item & 0xFF for _, item in sorted(numeric_items))
+        except ValueError:
+            return None
+    return None
 
 
 def _bytes_to_b64(value: bytes) -> str:

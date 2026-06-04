@@ -183,3 +183,11 @@ OneBot 侧继续按协议端抽象处理：通用自定义 action 和 `get_login
 1. OneBot action 调用不再只假设 aiocqhttp/NapCat 的 `call_action(action, **params)` 形态，也兼容协议端封装常见的 `call_action(action, params)` / `call_action(action=..., params=...)`。
 2. A2 探测保持协议优先：通用自定义 action 与 `get_login_misc_data` 都可返回 bytes、base64、hex、`{"type":"Buffer","data":[...]}` 等二进制材料；如果响应里同时带 `clientKey/keyIndex` 这类 bookkeeping 字段，只有明确请求的是 `a2/vLoginData` 时才接受 `value/data` 里的原始材料，避免把普通 clientkey 误当 QQ upload A2。
 3. Android 视频上传与封面上传现在共享同一个 `upload_time`：`UploadVideoInfoReq.iUploadTime`、`publishmood.publish_time`、`UploadPicInfoReq.iUploadTime`、`stExtendInfo.clientkey`、`mapExt.mobile_fakefeeds_clientkey` 全部使用同一个 daemon 生成的 `uin_uploadTime`。这对齐了 Android `ImageUploadTask` 继承 `VideoUploadTask.iUploadTime` 的行为，减少视频资源和封面 fake feed 不能关联的风险。
+
+
+## v0.6.19 OneBot protocol-end auth probing update
+
+- The auth probe remains protocol-first: generic OneBot extension actions such as `get_qzone_video_upload_credentials`, `get_video_upload_credentials`, `get_login_misc_data(key=a2)`, `get_qzone_video_upload_a2`, and `get_vlogin_data` are tried before implementation-specific fallbacks.
+- NapCat compatibility is handled through the same protocol contract first. Current NapCat source exposes `NodeIKernelLoginService.getLoginMiscData(key)` internally but does not expose it as a default OneBot action; if an AstrBot adapter surfaces that internal NTQQ service object, the daemon can now call it as an embedded fallback without logging secret material.
+- LLOneBot compatibility now covers both `llonebot_debug` -> `pmhq.invoke("nodeIKernelLoginService/getLoginMiscData", [key])` and `llonebot_debug` -> `pmhq.call("loginService.getLoginMiscData", [key])` shapes.
+- Node/OneBot binary shapes are normalized more broadly, including `Buffer`/`Uint8Array` JSON (`{"type":"Buffer","data":[...]}`), numeric-key byte objects, hex, base64, and base64url. Cookie/CSRF/clientKey/keyIndex responses are still diagnostic-only and are not accepted as QQ upload A2/vLoginData.

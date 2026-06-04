@@ -3636,6 +3636,29 @@ def test_onebot_video_upload_probe_accepts_llonebot_login_misc_a2_material() -> 
     assert probe.credentials.source == "test:llonebot_debug"
 
 
+def test_onebot_video_upload_probe_accepts_llonebot_pmhq_call_login_misc() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-pmhq-call"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "call"
+                and params.get("args") == ["loginService.getLoginMiscData", ["a2"]]
+            ):
+                return {"result": 0, "value": {"type": "Buffer", "data": list(raw_a2)}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:llonebot_debug"
+
+
 def test_onebot_video_upload_probe_accepts_generic_onebot_login_misc_a2_material() -> None:
     from qzone_bridge.onebot_upload import probe_video_upload_credentials
 
@@ -3653,6 +3676,56 @@ def test_onebot_video_upload_probe_accepts_generic_onebot_login_misc_a2_material
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source == "test:get_login_misc_data"
     assert "get_login_misc_data:key=a2" in probe.attempted_actions
+
+
+def test_onebot_video_upload_probe_accepts_generic_onebot_a2_action_buffer() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-generic-action"
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == "get_qzone_video_upload_a2":
+                return {"result": 0, "value": {"type": "Buffer", "data": list(raw_a2)}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:get_qzone_video_upload_a2"
+
+
+def test_onebot_video_upload_probe_accepts_embedded_ntqq_login_misc_service() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-embedded-napcat-service"
+
+    class _LoginService:
+        async def getLoginMiscData(self, key: str):
+            if key == "a2":
+                return {"result": 0, "value": raw_a2.hex()}
+            raise RuntimeError("unsupported key")
+
+    class _Session:
+        def getLoginService(self):
+            return _LoginService()
+
+    class _Context:
+        session = _Session()
+
+    class _Bot:
+        context = _Context()
+
+        async def call_action(self, *_args, **_params):
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source.startswith("test:embedded:")
+    assert any("getLoginService().getLoginMiscData:key=a2" in item for item in probe.returned_actions)
 
 
 def test_onebot_video_upload_probe_accepts_targeted_login_misc_even_with_clientkey_metadata() -> None:
@@ -3734,6 +3807,23 @@ def test_onebot_video_upload_credentials_accept_binary_a2_material() -> None:
     assert credentials.login_data_b64 == base64.b64encode(b"binary-a2-login-data").decode("ascii")
     assert credentials.login_key_b64 == base64.b64encode(b"binary-login-key").decode("ascii")
     assert credentials.source == "test"
+
+
+def test_onebot_video_upload_credentials_accept_node_buffer_login_data() -> None:
+    from qzone_bridge.onebot_upload import extract_video_upload_credentials
+
+    payload = {
+        "data": {
+            "vLoginData": {"type": "Buffer", "data": list(b"node-buffer-a2")},
+            "vLoginKey": {"0": 110, "1": 111, "2": 100, "3": 101, "4": 45, "5": 107, "6": 101, "7": 121},
+        }
+    }
+
+    credentials = extract_video_upload_credentials(payload, source="test")
+
+    assert credentials is not None
+    assert credentials.login_data_b64 == base64.b64encode(b"node-buffer-a2").decode("ascii")
+    assert credentials.login_key_b64 == base64.b64encode(b"node-key").decode("ascii")
 
 
 def test_onebot_call_action_supports_nested_api() -> None:
@@ -4715,6 +4805,31 @@ def test_capture_onebot_client_from_context_onebot_alias(monkeypatch: pytest.Mon
     assert plugin._capture_onebot_client_from_context() is bot
     assert plugin._onebot_client is bot
     assert seen[:2] == ["aiocqhttp", "onebot"]
+
+
+def test_capture_onebot_client_from_context_extended_onebot_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def call_api(self, action: str, params: dict[str, object]): ...
+
+    bot = _Bot()
+    seen: list[str] = []
+
+    class _Context:
+        def get_platform(self, platform_type: str):
+            seen.append(platform_type)
+            if platform_type == "onebot_v12":
+                return types.SimpleNamespace(client=bot)
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._context = _Context()
+    plugin._onebot_client = None
+
+    assert plugin._capture_onebot_client_from_context() is bot
+    assert plugin._onebot_client is bot
+    assert "onebot_v12" in seen
 
 
 def test_capture_onebot_client_from_platform_manager_onebot_name(monkeypatch: pytest.MonkeyPatch) -> None:
