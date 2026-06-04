@@ -1,6 +1,6 @@
 # QQ 空间 daemon 原生视频发布逆向记录
 
-日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05；Android has_video/封面业务体对齐：2026-06-05
+日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05；Android has_video/封面业务体对齐：2026-06-05；OneBot 协议端通用化：2026-06-05
 
 ## 结论
 
@@ -191,3 +191,9 @@ OneBot 侧继续按协议端抽象处理：通用自定义 action 和 `get_login
 - NapCat compatibility is handled through the same protocol contract first. Current NapCat source exposes `NodeIKernelLoginService.getLoginMiscData(key)` internally but does not expose it as a default OneBot action; if an AstrBot adapter surfaces that internal NTQQ service object, the daemon can now call it as an embedded fallback without logging secret material.
 - LLOneBot compatibility now covers both `llonebot_debug` -> `pmhq.invoke("nodeIKernelLoginService/getLoginMiscData", [key])` and `llonebot_debug` -> `pmhq.call("loginService.getLoginMiscData", [key])` shapes.
 - Node/OneBot binary shapes are normalized more broadly, including `Buffer`/`Uint8Array` JSON (`{"type":"Buffer","data":[...]}`), numeric-key byte objects, hex, base64, and base64url. Cookie/CSRF/clientKey/keyIndex responses are still diagnostic-only and are not accepted as QQ upload A2/vLoginData.
+
+## v0.6.20 OneBot protocol-end compatibility update
+
+- Default video-auth binding source is now `onebot` instead of `aiocqhttp`; AstrBot's adapter may still be named aiocqhttp, but the compatibility contract is the OneBot protocol end, not NapCat or any single implementation.
+- Generic extension probing now also tries leading-underscore custom action names such as `_get_qzone_video_upload_credentials` and `_get_login_misc_data(key=a2)`, matching common OneBot extension naming conventions.
+- OneBot action invocation now covers `call_action`, `call_api`, `request`, and `call`, plus keyword params, positional params, and `params`/`data`/`payload` wrappers. This keeps NapCat/LLOneBot as primary targets while allowing other OneBot protocol ends to expose the same A2/vLoginData contract.

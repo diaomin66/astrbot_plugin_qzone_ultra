@@ -11,6 +11,7 @@ from .parser import cookie_header, normalize_cookie_fields, normalize_uin, parse
 
 COOKIE_ACTIONS = ("get_cookies", "get_credentials")
 LOGIN_INFO_ACTIONS = ("get_login_info",)
+ONEBOT_ACTION_CALLER_ATTRS = ("call_action", "call_api", "request", "call")
 COOKIE_DOMAIN_FALLBACKS = ("user.qzone.qq.com", "qzone.qq.com", "h5.qzone.qq.com", "mobile.qzone.qq.com")
 COOKIE_VALUE_KEYS = (
     "cookies",
@@ -327,13 +328,7 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
 
     method = getattr(bot, action, None)
     if callable(method):
-        try:
-            result = method(**params)
-        except TypeError as keyword_error:
-            try:
-                result = method(params)
-            except TypeError:
-                raise keyword_error
+        result = _invoke_onebot_action_callable(method, "", params)
         if inspect.isawaitable(result):
             return await result
         return result
@@ -342,35 +337,67 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
     for owner in (bot, getattr(bot, "api", None)):
         if owner is None:
             continue
-        for attr in ("call_action", "call_api"):
+        for attr in ONEBOT_ACTION_CALLER_ATTRS:
             caller = getattr(owner, attr, None)
             if callable(caller):
                 callers.append(caller)
     if not callers:
-        raise AttributeError("OneBot client does not expose call_action/call_api")
+        raise AttributeError("OneBot client does not expose a supported action caller")
 
     last_error: TypeError | None = None
     for call_action in callers:
         try:
-            result = call_action(action, **params)
-        except TypeError as positional_error:
-            try:
-                result = call_action(action=action, **params)
-            except TypeError as keyword_error:
-                try:
-                    result = call_action(action, params)
-                except TypeError:
-                    try:
-                        result = call_action(action=action, params=params)
-                    except TypeError:
-                        last_error = positional_error
-                        continue
+            result = _invoke_onebot_action_callable(call_action, action, params)
+        except TypeError as exc:
+            last_error = exc
+            continue
         if inspect.isawaitable(result):
             return await result
         return result
     if last_error is not None:
         raise last_error
-    raise AttributeError("OneBot client does not expose call_action/call_api")
+    raise AttributeError("OneBot client does not expose a supported action caller")
+
+
+def _invoke_onebot_action_callable(call_action: Any, action: str, params: dict[str, Any]) -> Any:
+    """Invoke OneBot client callables across common protocol-end wrappers."""
+
+    attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    if action:
+        attempts.extend(
+            [
+                ((action,), dict(params)),
+                ((), {"action": action, **params}),
+                ((action, params), {}),
+                ((action,), {"params": params}),
+                ((), {"action": action, "params": params}),
+                ((action,), {"data": params}),
+                ((), {"action": action, "data": params}),
+                ((action,), {"payload": params}),
+                ((), {"action": action, "payload": params}),
+            ]
+        )
+    else:
+        attempts.extend(
+            [
+                ((), dict(params)),
+                ((params,), {}),
+                ((), {"params": params}),
+                ((), {"data": params}),
+                ((), {"payload": params}),
+            ]
+        )
+
+    last_error: TypeError | None = None
+    for args, kwargs in attempts:
+        try:
+            return call_action(*args, **kwargs)
+        except TypeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    return call_action(action, **params) if action else call_action(**params)
 
 
 async def fetch_cookie_text(bot: Any, *, domain: str) -> str:

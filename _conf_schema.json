@@ -369,7 +369,7 @@
     "description": "自动绑定 Cookie",
     "type": "bool",
     "default": true,
-    "hint": "插件初始化、AstrBot 加载或首次捕获 aiocqhttp 客户端时，若登录态缺失会尝试从 OneBot 自动获取 Cookie；自动绑定最多重试 3 次，仍失败时请使用 /qzone autobind 或 /qzone bind。"
+    "hint": "插件初始化、AstrBot 加载或首次捕获 OneBot/aiocqhttp 客户端时，若登录态缺失会尝试从 OneBot 自动获取 Cookie；自动绑定最多重试 3 次，仍失败时请使用 /qzone autobind 或 /qzone bind。"
   },
   "cookie_domain": {
     "description": "OneBot Cookie 域名",

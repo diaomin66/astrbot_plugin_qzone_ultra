@@ -14,7 +14,21 @@ from typing import Any
 from .onebot_cookie import call_onebot_action
 
 
-VIDEO_UPLOAD_CREDENTIAL_ACTIONS = (
+def _with_onebot_extension_aliases(*actions: str) -> tuple[str, ...]:
+    """Return plain and leading-underscore action names for OneBot extensions."""
+
+    result: list[str] = []
+    for action in actions:
+        text = str(action or "").strip()
+        if not text:
+            continue
+        result.append(text)
+        if not text.startswith("_"):
+            result.append(f"_{text}")
+    return tuple(result)
+
+
+VIDEO_UPLOAD_CREDENTIAL_ACTIONS = _with_onebot_extension_aliases(
     "get_qzone_video_upload_credentials",
     "get_video_upload_credentials",
     "get_qzone_video_upload_auth",
@@ -58,7 +72,7 @@ LOGIN_MISC_DATA_KEYS = (
     "uploadLoginData",
     "qzoneUploadLoginData",
 )
-ONEBOT_LOGIN_MISC_ACTIONS = (
+ONEBOT_LOGIN_MISC_ACTIONS = _with_onebot_extension_aliases(
     "get_login_misc_data",
     "get_login_misc",
     "get_ntqq_login_misc_data",
@@ -267,7 +281,7 @@ class OneBotVideoUploadCredentials:
     token_type: int = 2
     token_appid: int = 0
     token_wt_appid: int = 0
-    source: str = "aiocqhttp"
+    source: str = "onebot"
 
     def to_request_body(self) -> dict[str, Any]:
         return {
@@ -300,14 +314,14 @@ class OneBotVideoUploadProbe:
         }
 
 
-async def fetch_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadCredentials | None:
+async def fetch_video_upload_credentials(bot: Any, *, source: str = "onebot") -> OneBotVideoUploadCredentials | None:
     """Try protocol-end extension actions and return upload credentials if exposed."""
 
     probe = await probe_video_upload_credentials(bot, source=source)
     return probe.credentials
 
 
-async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadProbe:
+async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") -> OneBotVideoUploadProbe:
     """Probe OneBot standard and extension actions for QQ upload binary material.
 
     Standard OneBot implementation ``get_credentials`` usually returns web
@@ -683,7 +697,7 @@ def _unique(values: tuple[str, ...] | list[str]) -> list[str]:
     return result
 
 
-def extract_video_upload_credentials(payload: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadCredentials | None:
+def extract_video_upload_credentials(payload: Any, *, source: str = "onebot") -> OneBotVideoUploadCredentials | None:
     found = _find_credentials(payload)
     if not found:
         return None
@@ -908,7 +922,7 @@ def _action_targets_login_data(action: str, params: dict[str, Any] | None = None
 def _extract_raw_login_data_payload(
     payload: Any,
     *,
-    source: str = "aiocqhttp",
+    source: str = "onebot",
     trusted_raw: bool = False,
 ) -> OneBotVideoUploadCredentials | None:
     if _payload_has_client_key(payload) and not trusted_raw:

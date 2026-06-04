@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- fix: generalize OneBot video auth probing beyond aiocqhttp/NapCat by defaulting the source to `onebot`, trying leading-underscore extension actions, and supporting `request`/`call` wrappers with `params`/`data`/`payload`.
+
 ## 未发布
 - 修复：视频封面 `pic_qzone` 上传现在和 Android 一样携带同一份 `iBusiNessType=1` / `vBusiNessData=publishmood`，避免只在 `video_qzone` 阶段带发布体导致封面 fake feed 不能触发真实视频动态。
 - 修复：解析 Tencent upload 返回的 `operation_publishmood_rsp`，记录 `tid/msg/verifyurl`；当 `ret` 非 0 时直接报出服务端发布失败，当返回 `tid` 时优先用该 fid 做详情验证，加快真实视频 feed 确认。

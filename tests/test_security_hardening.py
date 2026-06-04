@@ -3531,6 +3531,62 @@ def test_plugin_auto_binds_onebot_video_upload_credentials(
     }
 
 
+def test_plugin_video_upload_auto_bind_defaults_to_onebot_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+    bot = object()
+
+    class _Credentials:
+        source = "onebot:_get_login_misc_data"
+
+        def to_request_body(self):
+            return {
+                "login_data_b64": "bG9naW4=",
+                "login_key_b64": "",
+                "token_type": 2,
+                "token_appid": 0,
+                "token_wt_appid": 0,
+                "source": self.source,
+            }
+
+    class _Probe:
+        credentials = _Credentials()
+
+        def public_detail(self):
+            return {"credentials_found": True, "attempted_actions": ["_get_login_misc_data:key=a2"]}
+
+    async def fake_probe(client, *, source="onebot"):
+        captured["fetch_client"] = client
+        captured["fetch_source"] = source
+        return _Probe()
+
+    class _Controller:
+        async def get_status(self, **kwargs):
+            captured["status_kwargs"] = kwargs
+            return {"video_upload": {"configured": False}}
+
+        async def bind_video_upload_credentials_local(self, **kwargs):
+            captured["bind_kwargs"] = kwargs
+            return {"video_upload": {"configured": True, "source": kwargs["source"]}}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.controller = _Controller()
+    plugin._onebot_client = bot
+    plugin._context = None
+    plugin._video_upload_lock = None
+    monkeypatch.setattr(main, "probe_video_upload_credentials", fake_probe)
+
+    payload = asyncio.run(plugin._auto_bind_video_upload_credentials(force=True))
+
+    assert payload == {"video_upload": {"configured": True, "source": "onebot:_get_login_misc_data"}}
+    assert captured["fetch_client"] is bot
+    assert captured["fetch_source"] == "onebot"
+    assert captured["bind_kwargs"]["source"] == "onebot:_get_login_misc_data"
+
+
 def test_onebot_video_upload_credentials_ignore_web_cookie_tokens() -> None:
     from qzone_bridge.onebot_upload import extract_video_upload_credentials
 
@@ -3676,6 +3732,25 @@ def test_onebot_video_upload_probe_accepts_generic_onebot_login_misc_a2_material
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source == "test:get_login_misc_data"
     assert "get_login_misc_data:key=a2" in probe.attempted_actions
+
+
+def test_onebot_video_upload_probe_accepts_underscored_protocol_extension() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-underscored-onebot-extension"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "_get_login_misc_data" and params == {"key": "a2"}:
+                return {"status": "ok", "retcode": 0, "data": {"value": raw_a2.hex()}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:_get_login_misc_data"
+    assert "_get_login_misc_data:key=a2" in probe.attempted_actions
 
 
 def test_onebot_video_upload_probe_accepts_generic_onebot_a2_action_buffer() -> None:
@@ -3871,6 +3946,22 @@ def test_onebot_call_action_supports_call_api_alias() -> None:
     result = asyncio.run(call_onebot_action(_Bot(), "get_msg", message_id=123456))
 
     assert result == {"ok": True, "params": {"message_id": 123456}}
+    assert calls == [("get_msg", {"message_id": 123456})]
+
+
+def test_onebot_call_action_supports_generic_request_data_wrapper() -> None:
+    from qzone_bridge.onebot_cookie import call_onebot_action
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Api:
+        async def request(self, action: str, data: dict[str, object]):
+            calls.append((action, dict(data)))
+            return {"ok": True, "data": data}
+
+    result = asyncio.run(call_onebot_action(types.SimpleNamespace(api=_Api()), "get_msg", message_id=123456))
+
+    assert result == {"ok": True, "data": {"message_id": 123456}}
     assert calls == [("get_msg", {"message_id": 123456})]
 
 
@@ -4731,6 +4822,28 @@ def test_admin_notification_supports_onebot_direct_call_action(monkeypatch: pyte
     plugin._context = _Context()
 
     sent = asyncio.run(plugin._send_admin_outgoing(_Bot(), "hello"))
+
+    assert sent == 1
+    assert calls == [("send_private_msg", {"user_id": 2134084530, "message": "hello"})]
+
+
+def test_admin_notification_supports_onebot_request_data_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Context:
+        def get_config(self):
+            return {"admins_id": ["2134084530"]}
+
+    class _Api:
+        async def request(self, action: str, data: dict[str, object]):
+            calls.append((action, dict(data)))
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(manage_group=0, admin_uins=[])
+    plugin._context = _Context()
+
+    sent = asyncio.run(plugin._send_admin_outgoing(types.SimpleNamespace(api=_Api()), "hello"))
 
     assert sent == 1
     assert calls == [("send_private_msg", {"user_id": 2134084530, "message": "hello"})]

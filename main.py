@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060503
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060505
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -1802,7 +1802,7 @@ class QzoneStablePlugin(Star):
     async def _call_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> None:
         method = getattr(bot, action, None)
         if callable(method):
-            await self._maybe_await(method(**kwargs))
+            await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
             return
         last_type_error: TypeError | None = None
         for call_action in self._iter_onebot_action_callers(bot):
@@ -1822,31 +1822,53 @@ class QzoneStablePlugin(Star):
         for owner in (bot, getattr(bot, "api", None)):
             if owner is None:
                 continue
-            for attr in ("call_action", "call_api"):
+            for attr in ("call_action", "call_api", "request", "call"):
                 caller = getattr(owner, attr, None)
                 if callable(caller):
                     callers.append(caller)
         return callers
 
     async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
-        try:
-            return await self._maybe_await(call_action(action, **kwargs))
-        except TypeError as positional_error:
+        attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        if action:
+            attempts.extend(
+                [
+                    ((action,), dict(kwargs)),
+                    ((), {"action": action, **kwargs}),
+                    ((action, kwargs), {}),
+                    ((action,), {"params": kwargs}),
+                    ((), {"action": action, "params": kwargs}),
+                    ((action,), {"data": kwargs}),
+                    ((), {"action": action, "data": kwargs}),
+                    ((action,), {"payload": kwargs}),
+                    ((), {"action": action, "payload": kwargs}),
+                ]
+            )
+        else:
+            attempts.extend(
+                [
+                    ((), dict(kwargs)),
+                    ((kwargs,), {}),
+                    ((), {"params": kwargs}),
+                    ((), {"data": kwargs}),
+                    ((), {"payload": kwargs}),
+                ]
+            )
+        last_error: TypeError | None = None
+        for args, params in attempts:
             try:
-                return await self._maybe_await(call_action(action=action, **kwargs))
-            except TypeError as keyword_error:
-                try:
-                    return await self._maybe_await(call_action(action, kwargs))
-                except TypeError:
-                    try:
-                        return await self._maybe_await(call_action(action=action, params=kwargs))
-                    except TypeError:
-                        raise positional_error from keyword_error
+                return await self._maybe_await(call_action(*args, **params))
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return await self._maybe_await(call_action(action, **kwargs) if action else call_action(**kwargs))
 
     async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
         method = getattr(bot, action, None)
         if callable(method):
-            return await self._maybe_await(method(**kwargs))
+            return await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
         last_type_error: TypeError | None = None
         for call_action in self._iter_onebot_action_callers(bot):
             try:
@@ -4167,11 +4189,13 @@ class QzoneStablePlugin(Star):
             "send_private_msg",
             "get_group_file_url",
             "get_private_file_url",
+            "request",
+            "call",
         ):
             if callable(getattr(candidate, action, None)):
                 return True
         api = getattr(candidate, "api", None)
-        return callable(getattr(api, "call_action", None)) or callable(getattr(api, "call_api", None))
+        return any(callable(getattr(api, action, None)) for action in ("call_action", "call_api", "request", "call"))
 
     @classmethod
     def _extract_onebot_client(cls, owner: Any) -> Any | None:
@@ -4269,14 +4293,14 @@ class QzoneStablePlugin(Star):
         return self._capture_onebot_client_from_context()
 
     def _cookie_binding_hint(self) -> str:
-        return "没有从 AstrBot 拿到 aiocqhttp(OneBot v11) 客户端，请先用 /qzone bind 手动绑定 Cookie。"
+        return "没有从 AstrBot 拿到 OneBot 协议端客户端，请先用 /qzone bind 手动绑定 Cookie。"
 
     async def _auto_bind_cookie(
         self,
         event: AstrMessageEvent | None = None,
         *,
         force: bool = False,
-        source: str = "aiocqhttp",
+        source: str = "onebot",
     ) -> dict[str, Any]:
         async with self._get_cookie_lock():
             if not self.settings.auto_bind_cookie and not force:
@@ -4332,7 +4356,7 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None = None,
         *,
         force: bool = False,
-        source: str = "aiocqhttp",
+        source: str = "onebot",
     ) -> dict[str, Any] | None:
         try:
             status = await self.controller.get_status(probe_daemon=False)
@@ -4357,7 +4381,7 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None = None,
         *,
         force: bool = False,
-        source: str = "aiocqhttp",
+        source: str = "onebot",
     ) -> dict[str, Any] | None:
         async with self._get_video_upload_lock():
             try:
@@ -4419,7 +4443,7 @@ class QzoneStablePlugin(Star):
             await self._prewarm_daemon_if_cookie_ready(trigger)
             return True
         try:
-            await self._ensure_cookie_ready(event, force=force_refresh, source="aiocqhttp")
+            await self._ensure_cookie_ready(event, force=force_refresh, source="onebot")
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
             return False
@@ -5326,7 +5350,7 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, "只有管理员可以自动绑定 Cookie。")
             return
         try:
-            payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
+            payload = await self._auto_bind_cookie(event, force=True, source="onebot")
             await self._maybe_bind_video_upload_credentials(event)
         except QzoneBridgeError as exc:
             logger.warning("qzone autobind failed: %s", exc)
@@ -5383,7 +5407,7 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
             return
         try:
-            payload = await self._auto_bind_video_upload_credentials(event, force=True, source="aiocqhttp")
+            payload = await self._auto_bind_video_upload_credentials(event, force=True, source="onebot")
             if not self._status_has_video_upload_credentials(payload):
                 probe = getattr(self, "_last_video_upload_probe", {}) or {}
                 attempted = len(probe.get("attempted_actions") or [])
