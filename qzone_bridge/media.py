@@ -779,7 +779,11 @@ def _local_media_source_exists(
         suffixes = QZONE_IMAGE_SUFFIXES
     else:
         suffixes = QZONE_IMAGE_SUFFIXES | QZONE_VIDEO_SUFFIXES
-    return resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None
+    if resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None:
+        return True
+    if is_video_media(descriptor):
+        return resolve_trusted_local_media_path(source, name=name, suffixes=None) is not None
+    return False
 
 
 def _choose_media_source(data: dict[str, Any], *, kind: str = "") -> str:
@@ -840,14 +844,17 @@ def _reference_media_is_usable(item: PostMedia) -> bool:
     if _is_url(item.source) or _is_base64_source(item.source):
         return True
     if item.kind == "video" or is_video_media(item):
-        return (
+        name = item.name or source_name(item.source)
+        if (
             resolve_trusted_local_media_path(
                 item.source,
-                name=item.name or source_name(item.source),
+                name=name,
                 suffixes=QZONE_VIDEO_SUFFIXES,
             )
             is not None
-        )
+        ):
+            return True
+        return resolve_trusted_local_media_path(item.source, name=name, suffixes=None) is not None
     return True
 
 

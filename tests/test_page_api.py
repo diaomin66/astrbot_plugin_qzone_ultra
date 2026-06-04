@@ -361,6 +361,27 @@ def test_page_publish_normalizes_uploaded_data_urls() -> None:
     assert payload["data"]["post"]["images"] == ["data:image/png;base64,AA=="]
 
 
+def test_page_publish_accepts_video_only_media_without_text() -> None:
+    controller = _Controller()
+    media = [
+        {
+            "kind": "video",
+            "name": "clip",
+            "mime_type": "video/mp4",
+            "source": "base64://" + base64.b64encode(b"fake video bytes").decode("ascii"),
+        }
+    ]
+
+    payload = asyncio.run(_api(controller).publish({"content": "  ", "media": media}))
+
+    assert payload["ok"] is True
+    assert controller.published["content"] == "  "
+    assert controller.published["media"][0]["kind"] == "video"
+    assert controller.published["media"][0]["mime_type"] == "video/mp4"
+    assert payload["data"]["media_count"] == 1
+    assert payload["data"]["post"]["images"][0].startswith("base64://")
+
+
 def test_page_publish_created_post_can_delete_with_created_at(monkeypatch) -> None:
     controller = _Controller()
     monkeypatch.setattr(page_api_module.time, "time", lambda: 1710000999)
@@ -529,6 +550,19 @@ def test_page_upload_accepts_images_above_old_page_limit() -> None:
     assert payload["data"]["media"]["size"] == len(data)
 
 
+def test_page_upload_accepts_video_bytes_and_marks_video_kind() -> None:
+    data = b"fake video bytes"
+
+    payload = asyncio.run(_api().upload_media(filename="clip.mp4", content_type="video/mp4", data=data))
+
+    media = payload["data"]["media"]
+    assert payload["ok"] is True
+    assert media["kind"] == "video"
+    assert media["name"] == "clip.mp4"
+    assert media["mime_type"] == "video/mp4"
+    assert media["source"].startswith("base64://")
+
+
 def test_page_upload_accepts_json_data_url_fallback() -> None:
     data = _png_bytes()
     body = {
@@ -581,6 +615,29 @@ def test_page_upload_uses_local_token_when_controller_has_data_dir(tmp_path: Pat
     assert Path(sent_media["source"]).read_bytes() == data
     assert "preview_url" not in sent_media
     assert publish_payload["data"]["post"]["images"] == []
+
+
+def test_page_upload_video_token_can_publish_video_only_without_text(tmp_path: Path) -> None:
+    data = b"fake video bytes"
+    controller = _Controller()
+    controller.data_dir = tmp_path
+    api = _api(controller)
+
+    upload_payload = asyncio.run(api.upload_media(filename="clip", content_type="video/mp4", data=data))
+    media = upload_payload["data"]["media"]
+    publish_payload = asyncio.run(
+        api.publish({"content": "", "media": [{**media, "preview_url": "blob:video-preview"}]})
+    )
+
+    sent_media = controller.published["media"][0]
+    assert publish_payload["ok"] is True
+    assert media["kind"] == "video"
+    assert media["upload_id"]
+    assert sent_media["kind"] == "video"
+    assert sent_media["trusted_local"] is True
+    assert Path(sent_media["source"]).read_bytes() == data
+    assert Path(sent_media["source"]).suffix == ""
+    assert "preview_url" not in sent_media
 
 
 def test_page_delete_rejects_other_users_posts() -> None:

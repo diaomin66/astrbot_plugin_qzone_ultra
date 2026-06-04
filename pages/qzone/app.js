@@ -531,7 +531,7 @@ function fileToDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.addEventListener("load", () => resolve(String(reader.result || "")));
-    reader.addEventListener("error", () => reject(new Error("读取图片失败")));
+    reader.addEventListener("error", () => reject(new Error("读取媒体失败")));
     reader.readAsDataURL(file);
   });
 }
@@ -542,7 +542,7 @@ async function uploadPageMedia(file) {
       const result = await withTimeout(
         bridge.upload("page/upload-media", file),
         BRIDGE_REQUEST_TIMEOUT_MS,
-        "上传图片超时，请刷新页面后重试。"
+        "上传媒体超时，请刷新页面后重试。"
       );
       return normalizeBridgeResult(result, "上传失败");
     } catch (error) {
@@ -590,7 +590,25 @@ function mediaDisplaySource(item) {
 }
 
 function isVideoSource(url) {
-  return /\.(mp4|webm|ogg)(?:[?#].*)?$/i.test(text(url));
+  const value = text(url);
+  return value.startsWith("data:video/") || /\.(mp4|m4v|mov|webm|ogg)(?:[?#].*)?$/i.test(value);
+}
+
+function isVideoMediaItem(item, source = "") {
+  if (item && typeof item === "object") {
+    const kind = text(item.kind || item.type || item.raw_type).toLowerCase();
+    const mimeType = text(item.mime_type || item.content_type || item.mime).toLowerCase();
+    if (kind === "video" || mimeType.startsWith("video/")) return true;
+  }
+  return isVideoSource(source || mediaDisplaySource(item));
+}
+
+function fileLooksLikeVideo(file) {
+  return text(file?.type).toLowerCase().startsWith("video/") || isVideoSource(file?.name);
+}
+
+function queuedMediaHasVideo() {
+  return (state.media || []).some((item) => isVideoMediaItem(item));
 }
 
 function createLocalPreviewUrl(file) {
@@ -686,28 +704,37 @@ function renderMedia() {
 
     const source = mediaDisplaySource(item);
     if (source.startsWith("data:") || source.startsWith("blob:") || source.startsWith("http://") || source.startsWith("https://")) {
+      if (isVideoMediaItem(item, source)) {
+        const video = document.createElement("video");
+        video.src = source;
+        video.controls = true;
+        video.muted = true;
+        video.playsInline = true;
+        chip.appendChild(video);
+      } else {
         const img = document.createElement("img");
         img.src = source;
         chip.appendChild(img);
+      }
     } else {
-        const fallback = document.createElement("div");
-        fallback.style.background = "var(--surface-hover)";
-        fallback.style.width = "100%";
-        fallback.style.height = "100%";
-        fallback.style.display = "flex";
-        fallback.style.alignItems = "center";
-        fallback.style.justifyContent = "center";
-        fallback.style.fontSize = "12px";
-        fallback.textContent = "图片 " + (index + 1);
-        chip.appendChild(fallback);
+      const fallback = document.createElement("div");
+      fallback.style.background = "var(--surface-hover)";
+      fallback.style.width = "100%";
+      fallback.style.height = "100%";
+      fallback.style.display = "flex";
+      fallback.style.alignItems = "center";
+      fallback.style.justifyContent = "center";
+      fallback.style.fontSize = "12px";
+      fallback.textContent = (isVideoMediaItem(item, source) ? "视频 " : "媒体 ") + (index + 1);
+      chip.appendChild(fallback);
     }
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "media-preview-remove";
     remove.textContent = "x";
-    remove.title = "移除图片";
-    remove.setAttribute("aria-label", "移除图片");
+    remove.title = "移除媒体";
+    remove.setAttribute("aria-label", "移除媒体");
     remove.addEventListener("click", () => {
       revokeLocalPreviewUrl(state.media[index]);
       state.media.splice(index, 1);
@@ -812,7 +839,7 @@ function openLightbox(url) {
   closeBtn.onclick = cleanup;
   
   let mediaElement;
-  if (url.match(/\.(mp4|webm|ogg)$/i)) {
+  if (isVideoSource(url)) {
     mediaElement = document.createElement("video");
     mediaElement.src = url;
     mediaElement.controls = true;
@@ -830,13 +857,16 @@ function openLightbox(url) {
 }
 
 function renderMediaGrid(items, className = "post-media") {
-  const sources = (items || []).map(mediaDisplaySource).filter(Boolean).slice(0, 9);
-  if (!sources.length) return null;
+  const entries = (items || [])
+    .map((item) => ({ item, source: mediaDisplaySource(item) }))
+    .filter((entry) => entry.source)
+    .slice(0, 9);
+  if (!entries.length) return null;
 
   const media = document.createElement("div");
-  media.className = `${className} media-grid ${mediaLayoutClass(sources.length)}`;
-  for (const url of sources) {
-    if (isVideoSource(url)) {
+  media.className = `${className} media-grid ${mediaLayoutClass(entries.length)}`;
+  for (const { item, source: url } of entries) {
+    if (isVideoMediaItem(item, url)) {
       const video = document.createElement("video");
       video.src = url;
       video.className = "preview-video";
@@ -1510,7 +1540,7 @@ async function publish(event) {
   event.preventDefault();
   const content = el.publishContent.value;
   if (!content.trim() && !state.media.length) {
-    setNotice("写点文字或添加图片再发布。", "warn");
+    setNotice("写点文字或添加图片/视频再发布。", "warn");
     return;
   }
   el.publishButton.disabled = true;
@@ -1540,10 +1570,15 @@ async function publish(event) {
 }
 
 async function uploadFiles(files) {
-  const maxImages = state.status?.limits?.images || 9;
+  const maxMedia = state.status?.limits?.images || 9;
   for (const file of files) {
-    if (state.media.length >= maxImages) {
-      setNotice(`最多只能添加 ${maxImages} 张图片。`, "warn");
+    const incomingVideo = fileLooksLikeVideo(file);
+    if ((incomingVideo && state.media.length) || (!incomingVideo && queuedMediaHasVideo())) {
+      setNotice("视频说说请只添加一个视频，不要和图片混发。", "warn");
+      break;
+    }
+    if (state.media.length >= maxMedia) {
+      setNotice(`最多只能添加 ${maxMedia} 个图片/视频。`, "warn");
       break;
     }
     try {
@@ -1559,7 +1594,7 @@ async function uploadFiles(files) {
       }
       state.media.push(media);
     } catch (error) {
-      setNotice(error.message || "图片上传失败", "error");
+      setNotice(error.message || "媒体上传失败", "error");
     }
   }
   renderMedia();

@@ -25,9 +25,11 @@ from .media import (
     QZONE_IMAGE_SUFFIXES,
     QZONE_MAX_IMAGES,
     QZONE_MIN_IMAGE_SIDE,
+    QZONE_VIDEO_SUFFIXES,
     guess_mime_type,
     image_dimensions_from_bytes,
     is_supported_image,
+    is_video_media,
     looks_like_supported_image_bytes,
 )
 from .models import FeedEntry
@@ -287,13 +289,13 @@ class QzonePageApi:
 
     def _page_media_item(self, item: Any) -> dict[str, Any]:
         if not isinstance(item, dict):
-            raise QzoneParseError("图片列表格式不正确。")
+            raise QzoneParseError("媒体列表格式不正确。")
         payload = dict(item)
         upload_id = str(payload.get("upload_id") or "").strip()
         if upload_id:
             stored = self._uploaded_media_by_id.get(upload_id)
             if stored is None:
-                raise QzoneParseError("图片上传缓存已过期，请重新选择图片后再发布。")
+                raise QzoneParseError("媒体上传缓存已过期，请重新选择图片/视频后再发布。")
             return dict(stored)
         payload.pop("preview_url", None)
         payload.pop("previewUrl", None)
@@ -308,19 +310,19 @@ class QzonePageApi:
         if not payload.get("name") and payload.get("filename"):
             payload["name"] = payload["filename"]
         if not payload.get("source"):
-            raise QzoneParseError("图片缺少可上传的数据。")
-        if not is_supported_image(payload):
-            raise QzoneParseError("只支持上传图片文件。")
+            raise QzoneParseError("媒体缺少可上传的数据。")
+        if not is_supported_image(payload) and not is_video_media(payload):
+            raise QzoneParseError("只支持上传图片或视频文件。")
         return payload
 
     def _page_media_list(self, value: Any) -> list[dict[str, Any]]:
         if value in (None, ""):
             return []
         if not isinstance(value, list):
-            raise QzoneParseError("图片列表格式不正确。")
+            raise QzoneParseError("媒体列表格式不正确。")
         media = [self._page_media_item(item) for item in value]
         if len(media) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ空间一次最多只能上传 {QZONE_MAX_IMAGES} 张图片。")
+            raise QzoneParseError(f"QQ空间一次最多只能上传 {QZONE_MAX_IMAGES} 个图片/视频。")
         return media
 
     @staticmethod
@@ -621,11 +623,11 @@ class QzonePageApi:
         content = str(body.get("content") or "")
         media = self._page_media_list(body.get("media"))
         if not content.strip() and not media:
-            raise QzoneParseError("说说内容或图片不能为空。")
+            raise QzoneParseError("说说内容或图片/视频不能为空。")
         if not isinstance(media, list):
-            raise QzoneParseError("图片列表格式不正确。")
+            raise QzoneParseError("媒体列表格式不正确。")
         if len(media) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ空间一次最多只能上传 {QZONE_MAX_IMAGES} 张图片。")
+            raise QzoneParseError(f"QQ空间一次最多只能上传 {QZONE_MAX_IMAGES} 个图片/视频。")
         payload = await self.controller.publish_post(
             content=content,
             sync_weibo=_to_bool(body.get("sync_weibo"), False),
@@ -768,17 +770,19 @@ class QzonePageApi:
 
     async def upload_media(self, *, filename: str, content_type: str = "", data: bytes) -> dict[str, Any]:
         if not data:
-            raise QzoneParseError("图片内容为空。")
+            raise QzoneParseError("媒体内容为空。")
         name = Path(filename or "image.jpg").name
         mime_type = (content_type or mimetypes.guess_type(name)[0] or guess_mime_type(name) or "").split(";", 1)[0]
         suffix = Path(name).suffix.lower()
-        if suffix not in QZONE_IMAGE_SUFFIXES and not mime_type.lower().startswith("image/"):
-            raise QzoneParseError("只支持上传图片文件。")
-        if not looks_like_supported_image_bytes(data):
-            raise QzoneParseError("图片内容不是可上传的图片文件。")
-        dimensions = image_dimensions_from_bytes(data)
-        if dimensions is not None and min(dimensions) < QZONE_MIN_IMAGE_SIDE:
-            raise QzoneParseError(f"图片尺寸过小，请选择至少 {QZONE_MIN_IMAGE_SIDE}×{QZONE_MIN_IMAGE_SIDE} 的图片。")
+        media_kind = "video" if suffix in QZONE_VIDEO_SUFFIXES or mime_type.lower().startswith("video/") else "image"
+        if media_kind == "image":
+            if suffix not in QZONE_IMAGE_SUFFIXES and not mime_type.lower().startswith("image/"):
+                raise QzoneParseError("只支持上传图片或视频文件。")
+            if not looks_like_supported_image_bytes(data):
+                raise QzoneParseError("图片内容不是可上传的图片文件。")
+            dimensions = image_dimensions_from_bytes(data)
+            if dimensions is not None and min(dimensions) < QZONE_MIN_IMAGE_SIDE:
+                raise QzoneParseError(f"图片尺寸过小，请选择至少 {QZONE_MIN_IMAGE_SIDE}×{QZONE_MIN_IMAGE_SIDE} 的图片。")
         upload_dir = self._page_upload_dir()
         if upload_dir is not None:
             upload_id = "upload_" + secrets.token_urlsafe(18)
@@ -787,7 +791,7 @@ class QzonePageApi:
             await asyncio.to_thread(path.write_bytes, data)
             self._cleanup_upload_dir(upload_dir)
             stored_media = {
-                "kind": "image",
+                "kind": media_kind,
                 "source": str(path),
                 "name": name,
                 "mime_type": mime_type,
@@ -799,46 +803,46 @@ class QzonePageApi:
             return _success(
                 {
                     "media": {
-                        "kind": "image",
+                        "kind": media_kind,
                         "upload_id": upload_id,
                         "name": name,
                         "mime_type": mime_type,
                         "size": len(data),
                     }
                 },
-                message="图片已加入发布队列。",
+                message="媒体已加入发布队列。",
             )
         media = {
-            "kind": "image",
+            "kind": media_kind,
             "source": "base64://" + base64.b64encode(data).decode("ascii"),
             "name": name,
             "mime_type": mime_type,
             "size": len(data),
         }
-        if not is_supported_image(media):
-            raise QzoneParseError("只支持上传图片文件。")
-        return _success({"media": media}, message="图片已加入发布队列。")
+        if not is_supported_image(media) and not is_video_media(media):
+            raise QzoneParseError("只支持上传图片或视频文件。")
+        return _success({"media": media}, message="媒体已加入发布队列。")
 
     @staticmethod
     def _decode_base64_upload(value: Any) -> bytes:
         compact = "".join(str(value or "").split())
         if not compact:
-            raise QzoneParseError("图片内容为空。")
+            raise QzoneParseError("媒体内容为空。")
         compact += "=" * (-len(compact) % 4)
         try:
             return base64.b64decode(compact.encode("ascii"), altchars=b"-_", validate=True)
         except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
-            raise QzoneParseError("图片 Base64 数据格式不正确。") from exc
+            raise QzoneParseError("媒体 Base64 数据格式不正确。") from exc
 
     @staticmethod
     def _decode_upload_source(value: Any) -> tuple[bytes, str]:
         text = str(value or "").strip()
         if not text:
-            raise QzoneParseError("图片内容为空。")
+            raise QzoneParseError("媒体内容为空。")
         if text.startswith("data:"):
             header, separator, payload = text.partition(",")
             if not separator:
-                raise QzoneParseError("图片 data_url 格式不正确。")
+                raise QzoneParseError("媒体 data_url 格式不正确。")
             media_header = header[5:]
             parts = media_header.split(";") if media_header else []
             mime_type = parts[0] if parts and "/" in parts[0] else ""
@@ -852,7 +856,7 @@ class QzonePageApi:
     async def upload_media_payload(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         body = body or {}
         if not isinstance(body, dict):
-            raise QzoneParseError("图片上传请求格式不正确。")
+            raise QzoneParseError("媒体上传请求格式不正确。")
         source = (
             body.get("data_url")
             or body.get("source")

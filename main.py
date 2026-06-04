@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060301
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060401
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -2749,8 +2749,13 @@ class QzoneStablePlugin(Star):
         if source.startswith(("http://", "https://", "base64://", "data:")):
             return True
         name = cls._onebot_media_name(data, source)
-        suffixes = QZONE_VIDEO_SUFFIXES if cls._onebot_segment_is_video(kind, {**data, "source": source}) else set()
-        return resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None
+        is_video = cls._onebot_segment_is_video(kind, {**data, "source": source})
+        suffixes = QZONE_VIDEO_SUFFIXES if is_video else set()
+        if resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None:
+            return True
+        if is_video:
+            return resolve_trusted_local_media_path(source, name=name, suffixes=None) is not None
+        return False
 
     @classmethod
     def _onebot_source_from_data(

@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 修复：引用视频或 Pages 上传视频落到无扩展名临时文件时仍按视频保留，避免媒体被丢弃后误报“说说内容或图片不能为空”。
+- 修复：Pages 发布入口支持视频上传、视频预览和视频-only 发布，上传按钮与提示从图片扩展为图片/视频。
 - 新增：daemon 原生视频直发优先使用 Qzone H5 `sliceUpload/FileUploadVideo`，直接复用已绑定 Cookie 的 `p_skey` 上传视频取得 `sVid`，再通过 Web 视频 `richval` 调 `emotion_cgi_publish_v6` 发布真实视频说说。
 - 新增：H5 视频分片上传使用 `filename="blob"` 且默认 `Content-Type: application/octet-stream` 的 multipart `data` 片段；若接口返回 `-115`，自动后备重试无 part `Content-Type` 形态；发布成功前继续轮询最近动态验证同一 `sVid`。
 - 变更：QQ upload A2/vLoginData 材料和 `/qzone autovideoauth` 变为旧 Tencent upload SDK 后备；已有 Qzone Cookie/`p_skey` 时不再因 OneBot 没有返回 A2 材料而阻止 daemon 原生视频直发。

@@ -182,6 +182,14 @@ def _trusted_local_video_path(video: PostMedia, source: str) -> Path:
         name=video.name or source_name(source),
         suffixes=QZONE_VIDEO_SUFFIXES,
     )
+    if path is None and is_video_media(video):
+        candidate = resolve_trusted_local_media_path(
+            source,
+            name=video.name or source_name(source),
+            suffixes=None,
+        )
+        if candidate is not None and _valid_local_video_file(candidate, video):
+            path = candidate
     if path is None:
         raise QzoneParseError(
             "视频文件不存在，无法提取封面",

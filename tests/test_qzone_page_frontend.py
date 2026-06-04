@@ -37,8 +37,12 @@ def test_page_theme_uses_astrbot_context_not_system_fallback() -> None:
 
 def test_page_upload_preview_accepts_local_blob_urls() -> None:
     app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    html = (ROOT / "pages" / "qzone" / "index.html").read_text(encoding="utf-8")
 
+    assert 'accept="image/*,video/*"' in html
     assert 'source.startsWith("blob:")' in app
+    assert "isVideoMediaItem" in app
+    assert "document.createElement(\"video\")" in app
     assert "delete payload.preview_url" in app
 
 

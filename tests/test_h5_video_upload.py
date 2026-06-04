@@ -272,6 +272,68 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     assert captured["publish_kwargs"] == {"vid": "vid-h5", "sync_weibo": False}
 
 
+def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
+    captured: dict[str, object] = {}
+
+    class _Client:
+        timeout = 1.5
+
+        async def upload_h5_video(self, path, **kwargs):
+            captured["h5_upload_path"] = path
+            captured["h5_upload_kwargs"] = kwargs
+            return types.SimpleNamespace(
+                vid="vid-h5-noext",
+                to_dict=lambda: {"vid": "vid-h5-noext"},
+            )
+
+        async def publish_video_mood(self, content, **kwargs):
+            captured["publish_content"] = content
+            captured["publish_kwargs"] = kwargs
+            return {"tid": "fid-video", "feedinfo": "qzvideo/vid-h5-noext"}
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**_kwargs):
+        return {"fid": "fid-video", "raw": {"vid": "vid-h5-noext"}}
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "videoseg_no_extension"
+    video_path.write_bytes(b"chunk")
+    video = PostMedia(
+        kind="video",
+        source=str(video_path),
+        name="clip",
+        mime_type="video/mp4",
+        raw_type="video",
+        trusted_local=True,
+    )
+
+    payload = asyncio.run(service.publish_post(content="", media=[video.to_dict()], content_sanitized=True))
+
+    assert payload["native_video"] is True
+    assert payload["status"] == "published_native_video"
+    assert payload["vid"] == "vid-h5-noext"
+    assert captured["h5_upload_path"] == video_path
+    assert captured["h5_upload_kwargs"]["play_time"] == 2345
+    assert captured["publish_content"] == ""
+
+
 def test_daemon_h5_video_publish_accepts_publish_result_feedinfo_verification(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

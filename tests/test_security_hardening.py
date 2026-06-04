@@ -2198,6 +2198,32 @@ def test_collect_message_media_accepts_object_file_url_for_video() -> None:
     assert media[0].source == "https://example.test/video/clip.mp4"
 
 
+def test_collect_message_media_accepts_video_reference_field_without_extension(tmp_path: Path) -> None:
+    from qzone_bridge.media import collect_message_media
+
+    source = tmp_path / "videoseg_no_extension"
+    source.write_bytes(b"fake video bytes")
+    payload = {
+        "referenced_message": {
+            "attachments": [
+                {
+                    "kind": "video",
+                    "source": str(source),
+                    "name": "clip",
+                    "mime_type": "video/mp4",
+                }
+            ]
+        }
+    }
+
+    media = collect_message_media(payload)
+
+    assert len(media) == 1
+    assert media[0].kind == "video"
+    assert media[0].source == str(source)
+    assert media[0].trusted_local is True
+
+
 def test_collect_message_media_ignores_bad_video_reference_fields() -> None:
     from qzone_bridge.media import collect_message_media
 
@@ -2791,6 +2817,73 @@ def test_plugin_prefers_astrbot_video_converter_over_stale_path(
     assert post.media[0].source == str(source)
     assert post.media[0].trusted_local is True
 
+
+def test_plugin_collects_astrbot_reply_video_component_without_extension(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "videoseg_no_extension"
+    source.write_bytes(b"fake video bytes")
+
+    class _Video:
+        type = "Video"
+        file = str(source)
+        mime_type = "video/mp4"
+
+        async def convert_to_file_path(self):
+            return str(source)
+
+    class _Reply:
+        type = "Reply"
+        id = 123456
+        chain = [_Video()]
+
+    event = types.SimpleNamespace(
+        message_obj=types.SimpleNamespace(
+            message=[
+                _Reply(),
+                {"type": "text", "data": {"text": "post"}},
+            ]
+        )
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert post.content == ""
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].mime_type == "video/mp4"
+    assert post.media[0].trusted_local is True
+
+
+def test_materialize_video_sources_accepts_trusted_no_extension_video(tmp_path: Path) -> None:
+    from qzone_bridge.media import PostMedia, PostPayload
+    from qzone_bridge.video import materialize_video_sources
+
+    source = tmp_path / "videoseg_no_extension"
+    source.write_bytes(b"fake video bytes")
+    post = PostPayload(
+        content="",
+        media=[
+            PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip",
+                mime_type="video/mp4",
+                raw_type="video",
+                trusted_local=True,
+            )
+        ],
+    )
+
+    prepared = materialize_video_sources(post, tmp_path / "sources")
+
+    assert prepared.media[0].kind == "video"
+    assert prepared.media[0].source == str(source)
+    assert prepared.media[0].trusted_local is True
 
 def test_plugin_publish_sends_native_video_to_daemon_without_client_handoff(
     monkeypatch: pytest.MonkeyPatch,

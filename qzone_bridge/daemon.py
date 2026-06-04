@@ -190,11 +190,28 @@ def _trusted_daemon_video_path(video: PostMedia) -> Path | None:
     if not video.trusted_local:
         return None
     source = normalize_source(video.source)
-    return resolve_trusted_local_media_path(
+    path = resolve_trusted_local_media_path(
         source,
         name=video.name or source_name(source),
         suffixes=QZONE_VIDEO_SUFFIXES,
     )
+    if path is not None:
+        return path
+    if not is_video_media(video):
+        return None
+    candidate = resolve_trusted_local_media_path(
+        source,
+        name=video.name or source_name(source),
+        suffixes=None,
+    )
+    if candidate is None:
+        return None
+    try:
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            return None
+    except OSError:
+        return None
+    return candidate
 
 
 def _trusted_daemon_image_path(image: PostMedia) -> Path | None:
@@ -1091,7 +1108,7 @@ class QzoneDaemonService:
             refs = "\n".join(media_reference_text(item) for item in fallback_media)
             content = "\n".join(part for part in (content.strip(), refs) if part)
         if not content.strip() and not photos:
-            raise QzoneParseError("说说内容或图片不能为空")
+            raise QzoneParseError("说说内容或图片/视频不能为空")
         self._ensure_session_ready()
         payload = unwrap_payload(
             await self.client.publish_mood(
