@@ -1790,14 +1790,23 @@ class QzoneStablePlugin(Star):
             return
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
-            await self._maybe_await(call_action(action, **kwargs))
+            await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
             return
         api = getattr(bot, "api", None)
         call_action = getattr(api, "call_action", None)
         if callable(call_action):
-            await self._maybe_await(call_action(action, **kwargs))
+            await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
             return
         raise AttributeError(f"OneBot client does not support {action}")
+
+    async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
+        try:
+            return await self._maybe_await(call_action(action, **kwargs))
+        except TypeError as positional_error:
+            try:
+                return await self._maybe_await(call_action(action=action, **kwargs))
+            except TypeError:
+                raise positional_error
 
     async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
         method = getattr(bot, action, None)
@@ -1805,12 +1814,48 @@ class QzoneStablePlugin(Star):
             return await self._maybe_await(method(**kwargs))
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
-            return await self._maybe_await(call_action(action, **kwargs))
+            return await self._invoke_onebot_call_action(call_action, action, kwargs)
         api = getattr(bot, "api", None)
         call_action = getattr(api, "call_action", None)
         if callable(call_action):
-            return await self._maybe_await(call_action(action, **kwargs))
+            return await self._invoke_onebot_call_action(call_action, action, kwargs)
         raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _onebot_identifier_param_variants(identifier: Any) -> list[dict[str, Any]]:
+        text = str(identifier or "").strip()
+        if not text:
+            return []
+        values: list[Any] = [identifier]
+        if text != identifier:
+            values.append(text)
+        if text.isdigit():
+            number = int(text)
+            values.append(number)
+        variants: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for key in ("message_id", "id"):
+            for value in values:
+                if value in (None, ""):
+                    continue
+                marker = (key, f"{type(value).__name__}:{value}")
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                variants.append({key: value})
+        return variants
+
+    async def _query_onebot_message(self, bot: Any, message_id: Any) -> Any:
+        last_error: Exception | None = None
+        for params in self._onebot_identifier_param_variants(message_id):
+            try:
+                return await self._query_onebot_action(bot, "get_msg", **params)
+            except Exception as exc:
+                last_error = exc
+                logger.debug("qzone OneBot get_msg failed params=%s: %s", params, exc)
+        if last_error is not None:
+            raise last_error
+        raise ValueError("empty message id")
 
     async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> int:
         sent = 0
@@ -3097,7 +3142,7 @@ class QzoneStablePlugin(Star):
         media: list[PostMedia] = []
         for message_id in message_ids:
             try:
-                payload = await self._query_onebot_action(bot, "get_msg", message_id=message_id)
+                payload = await self._query_onebot_message(bot, message_id)
             except Exception as exc:
                 logger.debug("qzone referenced message lookup failed message_id=%s: %s", message_id, exc)
                 continue
@@ -3120,13 +3165,24 @@ class QzoneStablePlugin(Star):
         combined_extra_media: list[Any] = [*runtime_media, *referenced_media]
         if extra_media is not None:
             combined_extra_media.extend(extra_media)
-        return collect_post_payload(
+        post = collect_post_payload(
             event,
             fallback_content=content,
             include_event_text=include_event_text,
             command_prefixes=prefixes,
             extra_media=combined_extra_media,
         )
+        if not post.content.strip() and not post.media and not post.attachments:
+            message_ids = iter_reference_message_ids(event)
+            if message_ids:
+                component_kinds = [self._onebot_segment_kind(item) for item in iter_event_components(event)[:8]]
+                logger.warning(
+                    "qzone publish payload empty after referenced message lookup reference_ids=%s onebot_client=%s components=%s",
+                    [str(item) for item in message_ids],
+                    bool(self._capture_onebot_client(event)),
+                    component_kinds,
+                )
+        return post
 
     async def _prepare_video_sources(self, post: PostPayload) -> PostPayload:
         return await asyncio.to_thread(
@@ -3919,6 +3975,48 @@ class QzoneStablePlugin(Star):
             self._video_upload_lock = asyncio.Lock()
         return self._video_upload_lock
 
+    @staticmethod
+    def _looks_like_onebot_client(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        for action in (
+            "call_action",
+            "get_msg",
+            "send_group_msg",
+            "send_private_msg",
+            "get_group_file_url",
+            "get_private_file_url",
+        ):
+            if callable(getattr(candidate, action, None)):
+                return True
+        api = getattr(candidate, "api", None)
+        return callable(getattr(api, "call_action", None))
+
+    @classmethod
+    def _extract_onebot_client(cls, owner: Any) -> Any | None:
+        if owner is None:
+            return None
+        if cls._looks_like_onebot_client(owner):
+            return owner
+        for attr in ("bot", "client", "onebot_client", "onebot", "cqhttp", "api_client"):
+            try:
+                candidate = getattr(owner, attr, None)
+            except Exception:
+                continue
+            if attr == "bot" and candidate is not None:
+                return candidate
+            if cls._looks_like_onebot_client(candidate):
+                return candidate
+        getter = getattr(owner, "get_client", None)
+        if callable(getter):
+            try:
+                candidate = getter()
+            except Exception:
+                candidate = None
+            if cls._looks_like_onebot_client(candidate):
+                return candidate
+        return None
+
     def _capture_onebot_client_from_context(self) -> Any | None:
         context = getattr(self, "_context", None) or getattr(self, "context", None)
         platform = None
@@ -3938,16 +4036,25 @@ class QzoneStablePlugin(Star):
                 except Exception:
                     platform = None
         if platform is not None:
-            bot = getattr(platform, "bot", None)
+            bot = self._extract_onebot_client(platform)
             if bot is not None:
                 self._onebot_client = bot
         return getattr(self, "_onebot_client", None)
 
     def _capture_onebot_client(self, event: AstrMessageEvent | None = None) -> Any | None:
-        bot = getattr(event, "bot", None) if event is not None else None
-        if bot is not None:
-            self._onebot_client = bot
-            return bot
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "platform", None),
+                getattr(event, "platform_meta", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_client(owner)
+                if bot is not None:
+                    self._onebot_client = bot
+                    return bot
         return self._capture_onebot_client_from_context()
 
     def _cookie_binding_hint(self) -> str:

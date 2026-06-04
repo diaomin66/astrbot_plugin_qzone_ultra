@@ -334,9 +334,18 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
 
     call_action = getattr(bot, "call_action", None)
     if not callable(call_action):
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+    if not callable(call_action):
         raise AttributeError("OneBot client does not expose call_action")
 
-    result = call_action(action, **params)
+    try:
+        result = call_action(action, **params)
+    except TypeError as positional_error:
+        try:
+            result = call_action(action=action, **params)
+        except TypeError:
+            raise positional_error
     if inspect.isawaitable(result):
         return await result
     return result

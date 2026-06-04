@@ -2738,6 +2738,55 @@ def test_plugin_collects_quoted_video_from_raw_cq_get_msg(
     assert post.media[0].trusted_local is True
 
 
+def test_plugin_resolves_quoted_video_with_onebot_call_action_id_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    source = tmp_path / "videoseg_no_extension"
+    source.write_bytes(b"fake video bytes")
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Api:
+        async def call_action(self, action: str, **kwargs):
+            calls.append((action, kwargs))
+            if action != "get_msg" or kwargs != {"id": "123456"}:
+                raise RuntimeError("unsupported get_msg params")
+            return {
+                "data": {
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": str(source),
+                                "mime": "video/mp4",
+                            },
+                        }
+                    ]
+                }
+            }
+
+    event = types.SimpleNamespace(
+        bot=types.SimpleNamespace(api=_Api()),
+        message_obj=types.SimpleNamespace(
+            message=[
+                {"type": "reply", "data": {"id": "123456"}},
+                {"type": "text", "data": {"text": "post"}},
+            ]
+        ),
+    )
+    plugin = object.__new__(main.QzoneStablePlugin)
+
+    post = asyncio.run(plugin._collect_target_post_payload(event, "", ("post",)))
+
+    assert ("get_msg", {"id": "123456"}) in calls
+    assert post.content == ""
+    assert len(post.media) == 1
+    assert post.media[0].kind == "video"
+    assert post.media[0].source == str(source)
+    assert post.media[0].trusted_local is True
+
+
 def test_plugin_collects_astrbot_reply_video_component_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3033,6 +3082,22 @@ def test_onebot_video_upload_credentials_accept_binary_a2_material() -> None:
     assert credentials.login_data_b64 == base64.b64encode(b"binary-a2-login-data").decode("ascii")
     assert credentials.login_key_b64 == base64.b64encode(b"binary-login-key").decode("ascii")
     assert credentials.source == "test"
+
+
+def test_onebot_call_action_supports_nested_api() -> None:
+    from qzone_bridge.onebot_cookie import call_onebot_action
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Api:
+        async def call_action(self, action: str, **params):
+            calls.append((action, params))
+            return {"ok": True}
+
+    result = asyncio.run(call_onebot_action(types.SimpleNamespace(api=_Api()), "get_msg", id="123456"))
+
+    assert result == {"ok": True}
+    assert calls == [("get_msg", {"id": "123456"})]
 
 
 def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
@@ -3899,7 +3964,11 @@ def test_admin_notification_supports_onebot_direct_call_action(monkeypatch: pyte
 
 def test_capture_onebot_client_from_context_get_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     main = _import_main_with_stubs(monkeypatch)
-    bot = object()
+
+    class _Bot:
+        async def call_action(self, action: str, **kwargs): ...
+
+    bot = _Bot()
 
     class _Context:
         def get_platform(self, platform_type: str):
@@ -3911,6 +3980,47 @@ def test_capture_onebot_client_from_context_get_platform(monkeypatch: pytest.Mon
     plugin._onebot_client = None
 
     assert plugin._capture_onebot_client_from_context() is bot
+    assert plugin._onebot_client is bot
+
+
+def test_capture_onebot_client_from_context_get_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def call_action(self, action: str, **kwargs): ...
+
+    bot = _Bot()
+
+    class _Platform:
+        def get_client(self):
+            return bot
+
+    class _Context:
+        def get_platform(self, platform_type: str):
+            assert platform_type == "aiocqhttp"
+            return _Platform()
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._context = _Context()
+    plugin._onebot_client = None
+
+    assert plugin._capture_onebot_client_from_context() is bot
+    assert plugin._onebot_client is bot
+
+
+def test_capture_onebot_client_from_message_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Bot:
+        async def call_action(self, action: str, **kwargs): ...
+
+    bot = _Bot()
+    event = types.SimpleNamespace(message_obj=types.SimpleNamespace(bot=bot))
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._context = None
+    plugin._onebot_client = None
+
+    assert plugin._capture_onebot_client(event) is bot
     assert plugin._onebot_client is bot
 
 
