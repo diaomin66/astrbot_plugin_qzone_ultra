@@ -7,7 +7,7 @@ import types
 import httpx
 import pytest
 
-from qzone_bridge.client import QzoneClient
+from qzone_bridge.client import H5_VIDEO_REQUEST_TIMEOUT_SECONDS, H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS, QzoneClient
 from qzone_bridge.models import SessionState
 
 
@@ -139,7 +139,12 @@ def test_qzone_client_h5_video_upload_posts_control_and_slices(tmp_path: Path) -
     assert result.vid == "vid-h5"
     assert result.uploaded_bytes == 5
     assert result.session == "sess"
-    assert [call["url"] for call in calls].count("https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUploadVideo") == 2
+    control_calls = [call for call in calls if "FileBatchControl" in str(call["url"])]
+    assert len(control_calls) == 1
+    assert control_calls[0]["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
+    slice_calls = [call for call in calls if call["url"] == "https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUploadVideo"]
+    assert len(slice_calls) == 2
+    assert all(call["timeout"] == H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS for call in slice_calls)
     assert all(call["params"]["g_tk"] == expected_gtk for call in calls)
 
 
@@ -198,6 +203,7 @@ def test_qzone_client_publish_video_mood_uses_web_richval() -> None:
     assert "rich_flag=4" in data["richval"]
     assert "vid=vid-h5" in data["richval"]
     assert "qzvideo%2Fvid-h5" in data["richval"]
+    assert captured["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
 
 
 def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(

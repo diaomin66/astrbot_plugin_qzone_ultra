@@ -58,6 +58,8 @@ from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, r
 from .utils import extract_callback_json, json_loads, now_iso
 
 log = get_logger(__name__)
+H5_VIDEO_REQUEST_TIMEOUT_SECONDS = 300.0
+H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS = 300.0
 
 AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = (
@@ -354,6 +356,7 @@ class QzoneClient:
         follow_qzone_redirects: bool = False,
         accept_qzone_redirects: bool = False,
         max_attempts: int | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
@@ -369,14 +372,15 @@ class QzoneClient:
                 current_params = params
                 redirects_left = 3
                 while True:
-                    response = await self._client.request(
-                        method,
-                        current_url,
-                        params=current_params,
-                        data=data,
-                        json=json_body,
-                        headers=self._headers(referer=referer, origin=origin),
-                    )
+                    request_kwargs: dict[str, Any] = {
+                        "params": current_params,
+                        "data": data,
+                        "json": json_body,
+                        "headers": self._headers(referer=referer, origin=origin),
+                    }
+                    if timeout is not None:
+                        request_kwargs["timeout"] = max(float(timeout), float(self.timeout or 0.001))
+                    response = await self._client.request(method, current_url, **request_kwargs)
                     self._persist_cookie_response(response)
                     location = response.headers.get("location") or response.headers.get("Location") or ""
                     if response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_qzone_home_redirect(response):
@@ -503,6 +507,7 @@ class QzoneClient:
         follow_qzone_redirects: bool = False,
         accept_qzone_redirects: bool = False,
         max_attempts: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         response = await self._request_text(
             method,
@@ -518,6 +523,7 @@ class QzoneClient:
             follow_qzone_redirects=follow_qzone_redirects,
             accept_qzone_redirects=accept_qzone_redirects,
             max_attempts=max_attempts,
+            timeout=timeout,
         )
         if accept_qzone_redirects and response.status_code in QZONE_REDIRECT_STATUS_CODES:
             return {"message": "accepted redirect", "redirect": self._response_detail(response)}
@@ -989,6 +995,7 @@ class QzoneClient:
             origin=QZONE_H5_UPLOAD_ORIGIN,
             hostuin=self.login_uin,
             attach_token=False,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
         )
         session, slice_size = extract_h5_control_session(control_response)
         if not session:
@@ -1035,6 +1042,7 @@ class QzoneClient:
                             origin=QZONE_H5_UPLOAD_ORIGIN,
                             extra={"Content-Type": content_type},
                         ),
+                        timeout=max(float(self.timeout or 0.0), H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS),
                     )
                     self._persist_cookie_response(response)
                     if response.status_code >= 400:
@@ -1137,6 +1145,8 @@ class QzoneClient:
             origin="https://user.qzone.qq.com",
             hostuin=self.login_uin,
             attach_token=False,
+            max_attempts=1,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
         )
 
     async def add_comment(

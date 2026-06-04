@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import types
 
+import httpx
 import pytest
 
 from qzone_bridge.client import QzoneClient
@@ -20,7 +21,7 @@ from qzone_bridge.auto_comment import (
     AutoCommentStateStore,
 )
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import QzoneBridgeError, QzoneCookieAcquireError, QzoneParseError, QzoneRequestError
+from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneParseError, QzoneRequestError
 from qzone_bridge.models import BridgeState, SessionState
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.social import QzonePost
@@ -1223,6 +1224,93 @@ def test_detail_card_after_stale_daemon_restart_has_images_and_real_time(
     assert post.images == ["https://m.qpic.cn/restarted-card.jpg"]
     assert post.created_at == created_at
     assert profile.time_text != "未知时间"
+
+
+
+def test_controller_video_publish_uses_long_daemon_request_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge.controller import DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS
+
+    controller = QzoneDaemonController(
+        plugin_root=tmp_path,
+        data_dir=tmp_path / "data",
+        request_timeout=15.0,
+        auto_start_daemon=False,
+    )
+    captured: dict[str, object] = {}
+
+    class _Response:
+        text = "{}"
+
+        def json(self):
+            return {"ok": True, "data": {"fid": "fid-video"}}
+
+    class _Client:
+        async def request(self, method, url, **kwargs):
+            captured.update({"method": method, "url": url, **kwargs})
+            return _Response()
+
+    async def fake_probe_health(_port: int) -> bool:
+        return True
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_probe_health", fake_probe_health)
+
+    payload = asyncio.run(
+        controller.publish_post(
+            content="",
+            media=[{"kind": "video", "source": str(tmp_path / "clip.mp4"), "name": "clip.mp4"}],
+            content_sanitized=True,
+        )
+    )
+
+    assert payload == {"fid": "fid-video"}
+    assert captured["method"] == "POST"
+    assert str(captured["url"]).endswith("/post")
+    assert captured["timeout"] == DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS
+
+
+def test_controller_video_publish_timeout_is_not_retried_to_avoid_duplicate_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge.controller import DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS
+
+    controller = QzoneDaemonController(
+        plugin_root=tmp_path,
+        data_dir=tmp_path / "data",
+        request_timeout=15.0,
+        auto_start_daemon=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _Client:
+        async def request(self, method, url, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            raise httpx.ReadTimeout("daemon still uploading video")
+
+    async def fake_probe_health(_port: int) -> bool:
+        return True
+
+    controller._client = _Client()
+    monkeypatch.setattr(controller, "_probe_health", fake_probe_health)
+
+    with pytest.raises(DaemonUnavailableError) as error:
+        asyncio.run(
+            controller.publish_post(
+                content="",
+                media=[{"kind": "video", "source": str(tmp_path / "clip.mp4"), "name": "clip.mp4"}],
+                content_sanitized=True,
+            )
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS
+    assert error.value.detail["error_type"] == "ReadTimeout"
+    assert error.value.detail["path"] == "/post"
+    assert error.value.detail["timeout"] == DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS
 
 
 def test_public_error_text_redacts_detail(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -19,7 +19,7 @@ import httpx
 from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import get_logger
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .media import sanitize_publish_content
+from .media import is_video_media, sanitize_publish_content
 from .models import SessionState, VideoUploadCredentialState
 from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
@@ -30,6 +30,8 @@ from .tencent_upload import QzoneNativeVideoCredentialError, qzone_video_upload_
 log = get_logger(__name__)
 SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
 SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS = 300.0
+DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS = 7200.0
 
 
 def _port_is_free(port: int) -> bool:
@@ -602,6 +604,8 @@ class QzoneDaemonController:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        retry_on_timeout: bool = True,
     ) -> Any:
         last_exc: httpx.HTTPError | None = None
         response: httpx.Response | None = None
@@ -613,26 +617,27 @@ class QzoneDaemonController:
             elif not await self._probe_health(runtime.daemon_port):
                 raise DaemonUnavailableError("daemon 未运行")
             try:
-                response = await self._client.request(
-                    method,
-                    f"{self._base_url(runtime.daemon_port)}{path}",
-                    headers={SECRET_HEADER: runtime.secret},
-                    params=params,
-                    json=json_body,
-                )
+                request_kwargs: dict[str, Any] = {
+                    "headers": {SECRET_HEADER: runtime.secret},
+                    "params": params,
+                    "json": json_body,
+                }
+                if timeout is not None:
+                    request_kwargs["timeout"] = max(float(timeout), float(self.request_timeout or 0.001))
+                response = await self._client.request(method, f"{self._base_url(runtime.daemon_port)}{path}", **request_kwargs)
                 break
             except httpx.HTTPError as exc:
                 self._invalidate_health_cache()
                 last_exc = exc
+                detail = self._daemon_request_error_detail(exc, path=path, runtime=runtime, attempt=attempt + 1, timeout=timeout)
+                if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                    raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
                 if not self.auto_start_daemon or attempt > 0:
-                    raise DaemonUnavailableError(
-                        "daemon 请求失败",
-                        detail={"error": str(exc), "path": path},
-                    ) from exc
+                    raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
         if response is None:
             raise DaemonUnavailableError(
                 "daemon 请求失败",
-                detail={"error": str(last_exc), "path": path},
+                detail=self._daemon_request_error_detail(last_exc, path=path, runtime=self._runtime(), attempt=2, timeout=timeout),
             )
         try:
             payload = response.json()
@@ -658,6 +663,34 @@ class QzoneDaemonController:
                 raise QzoneRequestError(message, status_code=_detail_status_code(detail), detail=detail)
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
+
+    def _daemon_request_error_detail(
+        self,
+        exc: BaseException | None,
+        *,
+        path: str,
+        runtime: Any,
+        attempt: int,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        error_type = type(exc).__name__ if exc is not None else ""
+        error_text = str(exc or "") or error_type
+        return {
+            "error": error_text,
+            "error_type": error_type,
+            "path": path,
+            "attempt": int(attempt or 0),
+            "daemon_port": int(getattr(runtime, "daemon_port", 0) or self.default_port or 0),
+            "timeout": float(timeout if timeout is not None else self.request_timeout),
+        }
+
+    def _publish_request_timeout(self, media: list[dict[str, Any]] | None) -> float | None:
+        items = list(media or [])
+        if any(is_video_media(item) for item in items):
+            return max(float(self.request_timeout or 0.0), DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS)
+        if items:
+            return max(float(self.request_timeout or 0.0), DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS)
+        return None
 
     async def get_status(self, *, probe_daemon: bool = True) -> dict[str, Any]:
         state = self.store.read()
@@ -856,15 +889,18 @@ class QzoneDaemonController:
         content_sanitized: bool = False,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
+        media_items = media or []
         return await self._request(
             "POST",
             "/post",
             json_body={
                 "content": content,
                 "sync_weibo": sync_weibo,
-                "media": media or [],
+                "media": media_items,
                 "content_sanitized": True,
             },
+            timeout=self._publish_request_timeout(media_items),
+            retry_on_timeout=False,
         )
 
     async def comment_post(
