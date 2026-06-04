@@ -14,12 +14,14 @@ from qzone_bridge.tencent_upload import (
     PicExtendInfo,
     QZONE_PIC_UPLOAD_APPID,
     QZONE_PIC_UPLOAD_HOST,
+    QZONE_PUBLISH_MOOD_RSP_TYPE,
     QZONE_PUBLISH_MOOD_TYPE,
     QZONE_PUBLISH_MOOD_UNI_KEY,
     QZONE_RECORD_VIDEO_BUSINESS_TYPE,
     QZONE_UNI_INT64_TYPE,
     QZONE_VIDEO_UPLOAD_APPID,
     QzoneNativeVideoCredentialError,
+    QzoneTencentVideoUploadError,
     QzoneTencentVideoUploader,
     StResult,
     TENCENT_UPLOAD_CMD_CONTROL,
@@ -32,6 +34,8 @@ from qzone_bridge.tencent_upload import (
     decode_file_upload_rsp,
     decode_upload_pic_info_rsp,
     decode_upload_video_info_rsp,
+    decode_record_video_publish_business_response,
+    encode_old_uni_attribute,
     encode_record_video_publish_business_data,
     encode_file_batch_control_req,
     encode_file_upload_req,
@@ -194,6 +198,30 @@ def test_record_video_publish_business_data_encodes_mobile_uni_attribute() -> No
     source = field_value(publish_req, 8)
     assert field_value(source, 1) == 4
     assert field_value(source, 2) == 1
+
+
+def test_record_video_publish_business_response_decodes_publishmood_rsp() -> None:
+    publish_rsp = jce_struct(
+        [
+            JceField(0, 0),
+            JceField(1, "https://verify.example.test/"),
+            JceField(2, "fid-video"),
+            JceField(3, "ok"),
+        ]
+    )
+    payload = encode_old_uni_attribute(
+        {
+            QZONE_PUBLISH_MOOD_UNI_KEY: (QZONE_PUBLISH_MOOD_RSP_TYPE, publish_rsp),
+        }
+    )
+
+    decoded = decode_record_video_publish_business_response(payload)
+
+    assert decoded is not None
+    assert decoded.ret == 0
+    assert decoded.verify_url == "https://verify.example.test/"
+    assert decoded.tid == "fid-video"
+    assert decoded.msg == "ok"
 
 
 def test_file_batch_control_req_nests_auth_env_and_video_biz_req() -> None:
@@ -407,6 +435,57 @@ def test_qzone_tencent_video_uploader_uses_shared_android_upload_time(tmp_path: 
     assert uploaded.upload_time == 1780329600
     assert uploaded.client_key == "3112333596_1780329600"
     assert uploaded.to_dict()["upload_time"] == 1780329600
+
+
+def test_qzone_tencent_video_uploader_decodes_publishmood_response(tmp_path: Path) -> None:
+    publish_rsp = jce_struct([JceField(0, 0), JceField(2, "fid-video"), JceField(3, "ok")])
+    business_rsp = encode_old_uni_attribute(
+        {QZONE_PUBLISH_MOOD_UNI_KEY: (QZONE_PUBLISH_MOOD_RSP_TYPE, publish_rsp)}
+    )
+    video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 1), JceField(2, business_rsp)])
+    result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
+    control_rsp = jce_struct([JceField(1, result), JceField(2, "session-1"), JceField(3, 5), JceField(5, video_rsp)])
+    socket = _FakeSocket(
+        [encode_upload_pdu(TENCENT_UPLOAD_CMD_CONTROL, 101, encode_struct([JceField(0, {"1": control_rsp})]))]
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"chunk")
+
+    uploader = QzoneTencentVideoUploader(
+        uin=3112333596,
+        login_data=b"login-data",
+        login_key=b"login-key",
+        socket_factory=lambda *args, **kwargs: socket,
+    )
+    uploaded = uploader.upload_video(video, title="clip.mp4")
+
+    assert uploaded.publish_response is not None
+    assert uploaded.publish_response.tid == "fid-video"
+    assert uploaded.to_dict()["publish_response"]["tid"] == "fid-video"
+
+
+def test_qzone_tencent_video_uploader_rejects_publishmood_failure(tmp_path: Path) -> None:
+    publish_rsp = jce_struct([JceField(0, 1001), JceField(3, "publish denied")])
+    business_rsp = encode_old_uni_attribute(
+        {QZONE_PUBLISH_MOOD_UNI_KEY: (QZONE_PUBLISH_MOOD_RSP_TYPE, publish_rsp)}
+    )
+    video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 1), JceField(2, business_rsp)])
+    result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
+    control_rsp = jce_struct([JceField(1, result), JceField(2, "session-1"), JceField(3, 5), JceField(5, video_rsp)])
+    socket = _FakeSocket(
+        [encode_upload_pdu(TENCENT_UPLOAD_CMD_CONTROL, 101, encode_struct([JceField(0, {"1": control_rsp})]))]
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"chunk")
+    uploader = QzoneTencentVideoUploader(
+        uin=3112333596,
+        login_data=b"login-data",
+        login_key=b"login-key",
+        socket_factory=lambda *args, **kwargs: socket,
+    )
+
+    with pytest.raises(QzoneTencentVideoUploadError, match="publish denied"):
+        uploader.upload_video(video, title="clip.mp4")
 
 
 def test_qzone_tencent_video_uploader_embeds_record_video_publish_data(tmp_path: Path) -> None:

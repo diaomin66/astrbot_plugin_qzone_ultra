@@ -1,6 +1,6 @@
 # QQ 空间 daemon 原生视频发布逆向记录
 
-日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05；Android has_video 对齐：2026-06-05
+日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05；Android has_video/封面业务体对齐：2026-06-05
 
 ## 结论
 
@@ -152,6 +152,17 @@ playurl=<encoded qqplayer swf>&detailurl=<encoded /qzvideo/sVid>&who=5&rich_flag
 ```
 
 发布说说时调用 `emotion_cgi_publish_v6`，携带 `richtype=3`、`subrichtype=7`、上述 `richval`、正文、`ugc_right=1` 等字段。daemon 只在显式开启 `QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH` 且没有 QQ upload 登录材料时尝试这条 H5 路径，然后仍然轮询最近动态验证同一 `sVid`；只有验证到 feed 才返回成功。默认稳定路径仍是 A2/vLoginData 驱动的 Tencent upload SDK 链路。
+
+## v0.6.18 进展：封面上传也携带 publishmood 与响应 tid 验证
+
+继续追 `QzoneMediaUploadRequest` 后确认，Android 创建视频封面 `ImageUploadTask` 时如果 `uploadParams.iBusiNessType == 1`，会把同一份 `uploadParams.vBusiNessData` 继续写入封面上传任务。也就是说，真实视频动态不是“视频上传带发布体、封面只带 vid/clientkey”这么简单；封面 `pic_qzone` 控制包也需要携带同一个 `publishmood` 业务体，才能和视频 `sVid`、`clientkey`、`mobile_fakefeeds_clientkey` 共同触发 fake feed/真实 feed 关联。
+
+本轮实现：
+
+- daemon 在上传前生成一次 `publishmood` OldUniAttribute，并同时传给 `video_qzone` 与后续 `pic_qzone` 封面上传。
+- `UploadVideoInfoRsp.vBusiNessData` 会按 Android 的 `operation_publishmood_rsp` 解码，保留 `ret`、`verifyurl`、`tid`、`msg`。
+- 若服务端返回 `publishmood_rsp.ret != 0`，直接报出发布失败，而不是继续等待一个永远不会出现的 feed。
+- 若服务端返回 `tid`，feed 验证会优先请求该 fid 的详情并检查同一 `sVid`，再退回最近动态列表轮询；这样成功路径更快，失败诊断也更准。
 
 ## v0.6.17 进展：Android 录制视频发布体与通用 OneBot 客户端对齐
 

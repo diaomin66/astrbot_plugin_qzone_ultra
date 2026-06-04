@@ -1945,6 +1945,10 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
     assert payload["vid"] == "vid-1"
     assert captured["upload_path"] == video_path
     assert captured["cover_path"] == cover_path
+    assert captured["upload_kwargs"]["business_type"] == 1
+    assert captured["cover_kwargs"]["business_type"] == 1
+    assert captured["upload_kwargs"]["business_data"]
+    assert captured["cover_kwargs"]["business_data"] == captured["upload_kwargs"]["business_data"]
     assert captured["upload_kwargs"]["publish_content"] == "hello"
     assert captured["upload_kwargs"]["play_time"] == 2345
     assert captured["upload_kwargs"]["upload_time"] == captured["cover_kwargs"]["upload_time"]
@@ -2068,6 +2072,42 @@ def test_daemon_native_video_verification_checks_feed_detail_for_vid(
     assert verified["fid"] == "fid-no-inline-vid"
     assert verified["verification_source"] == "self_detail"
     assert calls["details"] == [{"hostuin": 3112333596, "fid": "fid-no-inline-vid", "appid": 311}]
+
+
+def test_daemon_native_video_verification_uses_publishmood_tid_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0,))
+    calls: dict[str, object] = {"details": [], "listed": False}
+
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+
+    async def fake_detail_feed(**kwargs):
+        calls["details"].append(kwargs)
+        return {
+            "entry": {"fid": kwargs["fid"], "summary": "detail"},
+            "raw": {"video": {"vid": "1074_target_vid"}},
+        }
+
+    async def fake_list_feeds(**_kwargs):
+        calls["listed"] = True
+        return {"items": []}
+
+    service.detail_feed = fake_detail_feed
+    service.list_feeds = fake_list_feeds
+
+    verified = asyncio.run(service._wait_for_native_video_feed(vid="1074_target_vid", fid="fid-from-publishmood"))
+
+    assert verified is not None
+    assert verified["fid"] == "fid-from-publishmood"
+    assert verified["verification_source"] == "publishmood_rsp_detail"
+    assert calls["details"] == [{"hostuin": 3112333596, "fid": "fid-from-publishmood", "appid": 311}]
+    assert calls["listed"] is False
 
 
 def test_native_video_module_removes_client_handoff_helpers() -> None:

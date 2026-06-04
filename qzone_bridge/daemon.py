@@ -44,6 +44,7 @@ from .tencent_upload import (
     QzoneTencentVideoUploadError,
     TencentUploadPduError,
     TencentUploadProtocolError,
+    encode_record_video_publish_business_data,
     encode_video_shuoshuo_upload_finish_uni_attribute,
     qzone_video_upload_credentials_from_base64,
     qzone_video_upload_credentials_configured,
@@ -879,15 +880,32 @@ class QzoneDaemonService:
         self._set_success(defer_save=True)
         return {"items": visitors, "count": len(visitors), "raw": payload}
 
-    async def _wait_for_native_video_feed(self, *, vid: str) -> dict[str, Any] | None:
+    async def _wait_for_native_video_feed(self, *, vid: str, fid: str = "") -> dict[str, Any] | None:
         vid = str(vid or "").strip()
         if not vid:
             return None
+        fid = str(fid or "").strip()
         last_error: Exception | None = None
         checked_detail_keys: set[tuple[int, str, int]] = set()
         for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
             if delay > 0:
                 await asyncio.sleep(delay)
+            if fid:
+                hostuin = int(self.state.session.uin or 0)
+                try:
+                    detail = await self.detail_feed(hostuin=hostuin, fid=fid, appid=311)
+                except (QzoneRequestError, QzoneParseError) as exc:
+                    last_error = exc
+                    log.debug("qzone native video direct detail verification failed fid=%s: %s", fid, exc)
+                else:
+                    if _raw_contains_text(detail, vid):
+                        entry = detail.get("entry") if isinstance(detail, dict) else None
+                        verified = dict(entry) if isinstance(entry, dict) else {"fid": fid, "hostuin": hostuin}
+                        verified.setdefault("fid", fid)
+                        verified.setdefault("hostuin", hostuin)
+                        verified.setdefault("raw", detail.get("raw") if isinstance(detail, dict) else detail)
+                        verified.setdefault("verification_source", "publishmood_rsp_detail")
+                        return verified
             for scope in ("self", "active", "profile"):
                 try:
                     page = await self.list_feeds(
@@ -1053,12 +1071,21 @@ class QzoneDaemonService:
                 token_wt_appid=credentials.token_wt_appid,
                 timeout=float(getattr(self.client, "timeout", 30.0) or 30.0),
             )
+            publish_business_data = encode_record_video_publish_business_data(
+                uin=self.state.session.uin,
+                content=content,
+                video_size=file_size,
+                sync_weibo=sync_weibo,
+                client_key=client_key,
+                publish_time=upload_time,
+            )
             result = await asyncio.to_thread(
                 uploader.upload_video,
                 path,
                 title=video.name or path.name,
                 desc=content,
                 play_time=duration_ms,
+                business_data=publish_business_data,
                 publish_content=content,
                 sync_weibo=sync_weibo,
                 client_key=client_key,
@@ -1077,6 +1104,8 @@ class QzoneDaemonService:
                 video_size=file_size,
                 duration_ms=duration_ms,
                 desc=content,
+                business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+                business_data=publish_business_data,
             )
         except QzoneNativeVideoCredentialError as exc:
             raise QzoneParseError(str(exc)) from exc
@@ -1089,7 +1118,9 @@ class QzoneDaemonService:
             size=file_size,
             time_length=duration_ms,
         )
-        verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
+        publish_response = getattr(result, "publish_response", None)
+        publish_tid = str(getattr(publish_response, "tid", "") or "")
+        verified_feed = await self._wait_for_native_video_feed(vid=result.vid, fid=publish_tid)
         if verified_feed is None:
             raise QzoneRequestError(
                 "QQ 空间原生视频后台上传已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",

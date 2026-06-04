@@ -42,6 +42,7 @@ QZONE_VIDEO_CONNECT_TYPE = "Epoll"
 QZONE_RECORD_VIDEO_BUSINESS_TYPE = 1
 QZONE_PUBLISH_MOOD_UNI_KEY = "publishmood"
 QZONE_PUBLISH_MOOD_TYPE = "NS_MOBILE_OPERATION.operation_publishmood_req"
+QZONE_PUBLISH_MOOD_RSP_TYPE = "NS_MOBILE_OPERATION.operation_publishmood_rsp"
 QZONE_VIDEO_UPLOAD_FINISH_UNI_KEY = "rptVSUploadFinish"
 QZONE_VIDEO_UPLOAD_FINISH_TYPE = "NS_MOBILE_EXTRA.mobile_video_shuoshuo_upload_finish_req"
 QZONE_UNI_INT64_TYPE = "int64"
@@ -157,6 +158,22 @@ class UploadVideoInfoRsp:
     vid: str = ""
     business_type: int = 0
     business_data: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class QzonePublishMoodResponse:
+    ret: int = 0
+    verify_url: str = ""
+    tid: str = ""
+    msg: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ret": self.ret,
+            "verify_url": self.verify_url,
+            "tid": self.tid,
+            "msg": self.msg,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,9 +383,10 @@ class QzoneTencentVideoUploadResult:
     session: str
     upload_time: int = 0
     client_key: str = ""
+    publish_response: QzonePublishMoodResponse | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "vid": self.vid,
             "business_type": self.business_type,
             "business_data_length": len(self.business_data),
@@ -377,6 +395,9 @@ class QzoneTencentVideoUploadResult:
             "upload_time": self.upload_time,
             "client_key": self.client_key,
         }
+        if self.publish_response is not None:
+            data["publish_response"] = self.publish_response.to_dict()
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +577,58 @@ def decode_upload_video_info_rsp(payload: bytes) -> UploadVideoInfoRsp:
         business_type=as_int(field_value(nodes, 1), 0),
         business_data=as_bytes(field_value(nodes, 2), b""),
     )
+
+
+def decode_operation_publish_mood_rsp(payload: bytes) -> QzonePublishMoodResponse:
+    """Decode NS_MOBILE_OPERATION.operation_publishmood_rsp.
+
+    Android reads this struct from UploadVideoInfoRsp.vBusiNessData after
+    record-video upload; ret=0 plus tid means the embedded publishmood request
+    was accepted by Qzone.
+    """
+
+    nodes = decode_struct(payload)
+    wrapped = field_value(nodes, 0)
+    if as_nodes(wrapped):
+        nodes = as_nodes(wrapped)
+    return QzonePublishMoodResponse(
+        ret=as_int(field_value(nodes, 0), 0),
+        verify_url=as_str(field_value(nodes, 1), ""),
+        tid=as_str(field_value(nodes, 2), ""),
+        msg=as_str(field_value(nodes, 3), ""),
+    )
+
+
+def decode_record_video_publish_business_response(payload: bytes) -> QzonePublishMoodResponse | None:
+    """Decode UploadVideoInfoRsp.vBusiNessData publishmood response if present."""
+
+    data = bytes(payload or b"")
+    if not data:
+        return None
+    try:
+        uni_map = field_value(decode_struct(data), 0)
+    except Exception:
+        return None
+    if not isinstance(uni_map, dict):
+        return None
+    entry = uni_map.get(QZONE_PUBLISH_MOOD_UNI_KEY)
+    if not isinstance(entry, dict):
+        return None
+    response_payload = entry.get(QZONE_PUBLISH_MOOD_RSP_TYPE)
+    if response_payload is None:
+        for type_name, value in entry.items():
+            if str(type_name or "").endswith("operation_publishmood_rsp"):
+                response_payload = value
+                break
+    if response_payload is None:
+        return None
+    raw = as_bytes(response_payload, b"")
+    if not raw:
+        return None
+    try:
+        return decode_operation_publish_mood_rsp(raw)
+    except Exception:
+        return None
 
 
 def decode_upload_pic_info_rsp(payload: bytes) -> UploadPicInfoRsp:
@@ -1030,10 +1103,8 @@ class QzoneTencentVideoUploader:
             if control_rsp.biz_rsp:
                 video_rsp = decode_upload_video_info_rsp(control_rsp.biz_rsp)
                 if video_rsp.vid:
-                    return QzoneTencentVideoUploadResult(
-                        vid=video_rsp.vid,
-                        business_type=video_rsp.business_type,
-                        business_data=video_rsp.business_data,
+                    return self._video_upload_result_from_rsp(
+                        video_rsp,
                         uploaded_bytes=control_rsp.offset or file_size,
                         session=control_rsp.session,
                         upload_time=upload_time,
@@ -1161,10 +1232,8 @@ class QzoneTencentVideoUploader:
             video_rsp = decode_upload_video_info_rsp(payload)
             if not video_rsp.vid:
                 raise TencentUploadProtocolError("UploadVideoInfoRsp 缺少 sVid")
-            return QzoneTencentVideoUploadResult(
-                vid=video_rsp.vid,
-                business_type=video_rsp.business_type,
-                business_data=video_rsp.business_data,
+            return self._video_upload_result_from_rsp(
+                video_rsp,
                 uploaded_bytes=uploaded_bytes,
                 session=session,
                 upload_time=upload_time,
@@ -1181,6 +1250,30 @@ class QzoneTencentVideoUploader:
             reject_message="视频分片上传被拒绝",
             missing_message="Tencent upload finished without UploadVideoInfoRsp",
             decode_result=decode_result,
+        )
+
+    @staticmethod
+    def _video_upload_result_from_rsp(
+        video_rsp: UploadVideoInfoRsp,
+        *,
+        uploaded_bytes: int,
+        session: str,
+        upload_time: int,
+        client_key: str,
+    ) -> QzoneTencentVideoUploadResult:
+        publish_response = decode_record_video_publish_business_response(video_rsp.business_data)
+        if publish_response is not None and int(publish_response.ret or 0) != 0:
+            message = publish_response.msg or publish_response.verify_url or f"ret={publish_response.ret}"
+            raise QzoneTencentVideoUploadError(f"Qzone publishmood failed: {message}")
+        return QzoneTencentVideoUploadResult(
+            vid=video_rsp.vid,
+            business_type=video_rsp.business_type,
+            business_data=video_rsp.business_data,
+            uploaded_bytes=uploaded_bytes,
+            session=session,
+            upload_time=upload_time,
+            client_key=client_key,
+            publish_response=publish_response,
         )
 
     def _upload_pic_slices(
