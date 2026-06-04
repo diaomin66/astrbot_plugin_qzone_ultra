@@ -1,6 +1,8 @@
 # Changelog
 
 ## 未发布
+- 修复：daemon 原生视频发布的 `publishmood` 业务体对齐 Android 录制视频路径，默认写入 `mediatype=1`、`mediabittype=1` 和 `extend_info["has_video"]="1"`，避免只拿到 `sVid` 但 feed 不按视频动态落库。
+- 修复：OneBot 客户端调用不再只识别 `call_action`，同时兼容 `call_api`、`call_action(action, params)`、`call_action(action=..., params=...)`，并从 AstrBot 上下文按通用 OneBot 平台别名获取客户端，NapCat/LLOneBot 只是重点适配实现而不是唯一目标。
 - 修复：引用视频发布会按 OneBot `get_msg` 的 `message_id/id`、字符串/整数参数变体依次获取原消息，并兼容 `bot.api.call_action` 与平台 `get_client()` 暴露的客户端，避免只回复视频时 payload 为空而报“说说内容或图片/视频不能为空”。
 
 - 修复：引用视频或 Pages 上传视频落到无扩展名临时文件时仍按视频保留，避免媒体被丢弃后误报“说说内容或图片不能为空”。

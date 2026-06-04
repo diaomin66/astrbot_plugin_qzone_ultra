@@ -673,8 +673,8 @@ def encode_record_video_publish_business_data(
     sync_weibo: bool = False,
     client_key: str = "",
     publish_time: int = 0,
-    media_type: int = 0,
-    media_bit_type: int = 0,
+    media_type: int = 1,
+    media_bit_type: int = 1,
     media_sub_type: int = 0,
     is_original_video: int = 0,
     is_format_f20: int = 0,
@@ -683,6 +683,7 @@ def encode_record_video_publish_business_data(
     proto_extend_info: dict[Any, Any] | None = None,
 ) -> bytes:
     extend_info = {str(key): value for key, value in dict(shoot_params or {}).items()}
+    extend_info.setdefault("has_video", "1")
     extend_info.setdefault("iIsOriginalVideo", str(int(is_original_video or 0)))
     extend_info.setdefault("iIsFormatF20", str(int(is_format_f20 or 0)))
     if int(video_size or 0) > 0:
@@ -966,8 +967,8 @@ class QzoneTencentVideoUploader:
         upload_time: int = 0,
         is_original_video: int = 0,
         is_format_f20: int = 0,
-        media_type: int = 0,
-        media_bit_type: int = 0,
+        media_type: int = 1,
+        media_bit_type: int = 1,
         media_sub_type: int = 0,
         shoot_params: dict[Any, Any] | None = None,
         stored_extend_info: dict[Any, Any] | None = None,

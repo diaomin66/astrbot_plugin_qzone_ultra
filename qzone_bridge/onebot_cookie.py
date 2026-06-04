@@ -338,29 +338,39 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
             return await result
         return result
 
-    call_action = getattr(bot, "call_action", None)
-    if not callable(call_action):
-        api = getattr(bot, "api", None)
-        call_action = getattr(api, "call_action", None)
-    if not callable(call_action):
-        raise AttributeError("OneBot client does not expose call_action")
+    callers: list[Any] = []
+    for owner in (bot, getattr(bot, "api", None)):
+        if owner is None:
+            continue
+        for attr in ("call_action", "call_api"):
+            caller = getattr(owner, attr, None)
+            if callable(caller):
+                callers.append(caller)
+    if not callers:
+        raise AttributeError("OneBot client does not expose call_action/call_api")
 
-    try:
-        result = call_action(action, **params)
-    except TypeError as positional_error:
+    last_error: TypeError | None = None
+    for call_action in callers:
         try:
-            result = call_action(action=action, **params)
-        except TypeError as keyword_error:
+            result = call_action(action, **params)
+        except TypeError as positional_error:
             try:
-                result = call_action(action, params)
-            except TypeError:
+                result = call_action(action=action, **params)
+            except TypeError as keyword_error:
                 try:
-                    result = call_action(action=action, params=params)
+                    result = call_action(action, params)
                 except TypeError:
-                    raise positional_error from keyword_error
-    if inspect.isawaitable(result):
-        return await result
-    return result
+                    try:
+                        result = call_action(action=action, params=params)
+                    except TypeError:
+                        last_error = positional_error
+                        continue
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    if last_error is not None:
+        raise last_error
+    raise AttributeError("OneBot client does not expose call_action/call_api")
 
 
 async def fetch_cookie_text(bot: Any, *, domain: str) -> str:

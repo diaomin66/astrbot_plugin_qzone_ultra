@@ -1,6 +1,6 @@
 # QQ 空间 daemon 原生视频发布逆向记录
 
-日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05
+日期：2026-06-02；H5 路径更新：2026-06-03；OneBot/Tencent upload 稳定化：2026-06-05；Android has_video 对齐：2026-06-05
 
 ## 结论
 
@@ -152,6 +152,18 @@ playurl=<encoded qqplayer swf>&detailurl=<encoded /qzvideo/sVid>&who=5&rich_flag
 ```
 
 发布说说时调用 `emotion_cgi_publish_v6`，携带 `richtype=3`、`subrichtype=7`、上述 `richval`、正文、`ugc_right=1` 等字段。daemon 只在显式开启 `QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH` 且没有 QQ upload 登录材料时尝试这条 H5 路径，然后仍然轮询最近动态验证同一 `sVid`；只有验证到 feed 才返回成功。默认稳定路径仍是 A2/vLoginData 驱动的 Tencent upload SDK 链路。
+
+## v0.6.17 进展：Android 录制视频发布体与通用 OneBot 客户端对齐
+
+继续对照 Android 9.2.5 `QZoneUploadShuoShuoTask.getUploadMoodBytes(...)` 的视频分支后，确认录制视频说说不仅会把视频大小、原画/格式标记写入 `extend_info`，还会显式写入 `extend_info["has_video"]="1"`，并把 `operation_publishmood_req.mediatype` 与 `mediabittype` 都置为 `1`。这三个字段用于让发布队列把 `vBusiNessData` 里的 `publishmood` 识别成视频动态，而不是普通文本/图片动态。
+
+本轮代码把这些字段设为 daemon 原生视频发布的默认值：
+
+- `encode_record_video_publish_business_data()` 默认 `media_type=1`、`media_bit_type=1`。
+- `publishmood.extend_info` 默认包含 `has_video=1`，同时保留已有 `iIsOriginalVideo`、`iIsFormatF20`、`videoSize`。
+- `QzoneTencentVideoUploader.upload_video(..., publish_content=...)` 继承同样默认值，daemon 无需写 NapCat 专用逻辑即可走 Android 同源业务体。
+
+OneBot 侧继续按协议端抽象处理：通用自定义 action 和 `get_login_misc_data(key/name/field=a2/vLoginData)` 仍优先于 LLOneBot debug 入口；客户端调用兼容 `call_action` 与 `call_api`，以及关键字参数、位置参数字典、`params=` 三种常见封装。AstrBot 上下文捕获也会先找 `aiocqhttp`，再找 `onebot` / `onebot11` / `napcat` / `llonebot` 等平台别名；NapCat、LLOneBot 是重点验证对象，但不是唯一兼容目标。
 
 ## v0.6.16 进展：OneBot 协议端兼容与 Android 时间绑定
 

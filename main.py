@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060501
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060502
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -1804,16 +1804,29 @@ class QzoneStablePlugin(Star):
         if callable(method):
             await self._maybe_await(method(**kwargs))
             return
-        call_action = getattr(bot, "call_action", None)
-        if callable(call_action):
-            await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
-            return
-        api = getattr(bot, "api", None)
-        call_action = getattr(api, "call_action", None)
-        if callable(call_action):
-            await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
-            return
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
+                return
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
         raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _iter_onebot_action_callers(bot: Any) -> list[Any]:
+        callers: list[Any] = []
+        for owner in (bot, getattr(bot, "api", None)):
+            if owner is None:
+                continue
+            for attr in ("call_action", "call_api"):
+                caller = getattr(owner, attr, None)
+                if callable(caller):
+                    callers.append(caller)
+        return callers
 
     async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
         try:
@@ -1821,20 +1834,28 @@ class QzoneStablePlugin(Star):
         except TypeError as positional_error:
             try:
                 return await self._maybe_await(call_action(action=action, **kwargs))
-            except TypeError:
-                raise positional_error
+            except TypeError as keyword_error:
+                try:
+                    return await self._maybe_await(call_action(action, kwargs))
+                except TypeError:
+                    try:
+                        return await self._maybe_await(call_action(action=action, params=kwargs))
+                    except TypeError:
+                        raise positional_error from keyword_error
 
     async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
         method = getattr(bot, action, None)
         if callable(method):
             return await self._maybe_await(method(**kwargs))
-        call_action = getattr(bot, "call_action", None)
-        if callable(call_action):
-            return await self._invoke_onebot_call_action(call_action, action, kwargs)
-        api = getattr(bot, "api", None)
-        call_action = getattr(api, "call_action", None)
-        if callable(call_action):
-            return await self._invoke_onebot_call_action(call_action, action, kwargs)
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                return await self._invoke_onebot_call_action(call_action, action, kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
         raise AttributeError(f"OneBot client does not support {action}")
 
     @staticmethod
@@ -4140,6 +4161,7 @@ class QzoneStablePlugin(Star):
             return False
         for action in (
             "call_action",
+            "call_api",
             "get_msg",
             "send_group_msg",
             "send_private_msg",
@@ -4149,7 +4171,7 @@ class QzoneStablePlugin(Star):
             if callable(getattr(candidate, action, None)):
                 return True
         api = getattr(candidate, "api", None)
-        return callable(getattr(api, "call_action", None))
+        return callable(getattr(api, "call_action", None)) or callable(getattr(api, "call_api", None))
 
     @classmethod
     def _extract_onebot_client(cls, owner: Any) -> Any | None:
@@ -4180,16 +4202,28 @@ class QzoneStablePlugin(Star):
         context = getattr(self, "_context", None) or getattr(self, "context", None)
         platform = None
         if context is not None:
-            try:
-                platform = context.get_platform("aiocqhttp")
-            except Exception:
-                platform = None
+            for platform_type in ("aiocqhttp", "onebot", "onebot11", "onebot_v11", "napcat", "llonebot"):
+                try:
+                    platform = context.get_platform(platform_type)
+                except Exception:
+                    platform = None
+                if platform is not None:
+                    break
             if platform is None:
                 try:
                     platform_manager = getattr(context, "platform_manager", None)
                     for candidate in getattr(platform_manager, "platform_insts", []):
                         meta = candidate.meta()
-                        if getattr(meta, "name", "") == "aiocqhttp":
+                        platform_name = str(getattr(meta, "name", "") or "").lower()
+                        platform_type = str(getattr(meta, "type", "") or "").lower()
+                        if (
+                            platform_name == "aiocqhttp"
+                            or "onebot" in platform_name
+                            or "napcat" in platform_name
+                            or "llonebot" in platform_name
+                            or platform_type == "aiocqhttp"
+                            or "onebot" in platform_type
+                        ):
                             platform = candidate
                             break
                 except Exception:

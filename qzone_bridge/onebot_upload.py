@@ -235,7 +235,7 @@ async def fetch_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
 async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadProbe:
     """Probe OneBot standard and extension actions for QQ upload binary material.
 
-    Standard OneBot/NapCat-style ``get_credentials`` usually returns web
+    Standard OneBot implementation ``get_credentials`` usually returns web
     cookies plus csrf/bkn. Those are useful for Qzone web binding, but are not
     enough for the stable mobile ``video_qzone`` upload protocol. This probe
     records cookie-only responses separately and only returns credentials when

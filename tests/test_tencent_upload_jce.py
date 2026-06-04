@@ -184,8 +184,11 @@ def test_record_video_publish_business_data_encodes_mobile_uni_attribute() -> No
     assert field_value(publish_req, 0) == 3112333596
     assert field_value(publish_req, 1) == "hello video"
     assert field_value(publish_req, 3) == 1
+    assert field_value(publish_req, 5) == 1
     assert field_value(publish_req, 6) is None
+    assert field_value(publish_req, 9) == 1
     assert field_value(publish_req, 11) == "client-1"
+    assert field_value(publish_req, 19)["has_video"] == "1"
     assert field_value(publish_req, 19)["videoSize"] == "4096"
 
     source = field_value(publish_req, 8)
@@ -438,6 +441,9 @@ def test_qzone_tencent_video_uploader_embeds_record_video_publish_data(tmp_path:
     publish_payload = uni_map[QZONE_PUBLISH_MOOD_UNI_KEY][QZONE_PUBLISH_MOOD_TYPE]
     publish_req = field_value(decode_struct(publish_payload), 0)
     assert field_value(publish_req, 1) == "hello"
+    assert field_value(publish_req, 5) == 1
+    assert field_value(publish_req, 9) == 1
+    assert field_value(publish_req, 19)["has_video"] == "1"
     assert field_value(publish_req, 19)["videoSize"] == "5"
 
 
