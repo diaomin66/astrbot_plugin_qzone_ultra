@@ -327,7 +327,13 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
 
     method = getattr(bot, action, None)
     if callable(method):
-        result = method(**params)
+        try:
+            result = method(**params)
+        except TypeError as keyword_error:
+            try:
+                result = method(params)
+            except TypeError:
+                raise keyword_error
         if inspect.isawaitable(result):
             return await result
         return result
@@ -344,8 +350,14 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
     except TypeError as positional_error:
         try:
             result = call_action(action=action, **params)
-        except TypeError:
-            raise positional_error
+        except TypeError as keyword_error:
+            try:
+                result = call_action(action, params)
+            except TypeError:
+                try:
+                    result = call_action(action=action, params=params)
+                except TypeError:
+                    raise positional_error from keyword_error
     if inspect.isawaitable(result):
         return await result
     return result

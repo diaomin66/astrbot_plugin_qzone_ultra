@@ -364,6 +364,48 @@ def test_qzone_tencent_video_uploader_control_and_slice_flow(tmp_path: Path) -> 
     ]
 
 
+def test_qzone_tencent_video_uploader_uses_shared_android_upload_time(tmp_path: Path) -> None:
+    video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 9), JceField(2, b"biz-rsp")])
+    result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
+    control_rsp = jce_struct([JceField(1, result), JceField(2, "session-1"), JceField(3, 5), JceField(5, video_rsp)])
+    socket = _FakeSocket(
+        [encode_upload_pdu(TENCENT_UPLOAD_CMD_CONTROL, 101, encode_struct([JceField(0, {"1": control_rsp})]))]
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"chunk")
+
+    uploader = QzoneTencentVideoUploader(
+        uin=3112333596,
+        login_data=b"login-data",
+        login_key=b"login-key",
+        socket_factory=lambda *args, **kwargs: socket,
+    )
+    uploaded = uploader.upload_video(
+        video,
+        title="clip.mp4",
+        publish_content="hello",
+        client_key="3112333596_1780329600",
+        upload_time=1780329600,
+    )
+
+    control_frame = decode_upload_pdu(socket.sent[0])
+    control_map = field_value(decode_struct(control_frame.payload), 0)
+    control_req = control_map["1"]
+    info_nodes = decode_struct(field_value(control_req, 8))
+    business_data = field_value(info_nodes, 5)
+    uni_map = field_value(decode_struct(business_data), 0)
+    publish_payload = uni_map[QZONE_PUBLISH_MOOD_UNI_KEY][QZONE_PUBLISH_MOOD_TYPE]
+    publish_req = field_value(decode_struct(publish_payload), 0)
+
+    assert field_value(info_nodes, 3) == 1780329600
+    assert field_value(info_nodes, 11)["clientkey"] == "3112333596_1780329600"
+    assert field_value(publish_req, 11) == "3112333596_1780329600"
+    assert field_value(publish_req, 15) == 1780329600
+    assert uploaded.upload_time == 1780329600
+    assert uploaded.client_key == "3112333596_1780329600"
+    assert uploaded.to_dict()["upload_time"] == 1780329600
+
+
 def test_qzone_tencent_video_uploader_embeds_record_video_publish_data(tmp_path: Path) -> None:
     video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 9), JceField(2, b"biz-rsp")])
     result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
@@ -433,7 +475,8 @@ def test_qzone_tencent_video_uploader_uploads_video_cover_with_pic_qzone(tmp_pat
         cover,
         vid="vid-1",
         video_path=video,
-        client_key="3112333596_1780329600123",
+        client_key="3112333596_1780329600",
+        upload_time=1780329600,
         video_size=5,
         duration_ms=1234,
         desc="hello cover",
@@ -454,7 +497,8 @@ def test_qzone_tencent_video_uploader_uploads_video_cover_with_pic_qzone(tmp_pat
     assert field_value(info_nodes, 11) == str(video)
     assert field_value(info_nodes, 12) == 2
     assert field_value(info_nodes, 13) == 1
-    assert field_value(info_nodes, 24) == {"mobile_fakefeeds_clientkey": "3112333596_1780329600123"}
+    assert field_value(info_nodes, 23) == 1780329600
+    assert field_value(info_nodes, 24) == {"mobile_fakefeeds_clientkey": "3112333596_1780329600"}
     assert field_value(info_nodes, 29) == 0
     assert field_value(info_nodes, 30) is None
     assert field_value(info_nodes, 31)["is_client_upload_cover"] == "1"
@@ -463,7 +507,7 @@ def test_qzone_tencent_video_uploader_uploads_video_cover_with_pic_qzone(tmp_pat
     assert field_value(info_nodes, 31)["mix_time"] == "1234"
     extend_nodes = field_value(info_nodes, 10)
     assert field_value(extend_nodes, 4)["vid"] == "vid-1"
-    assert field_value(extend_nodes, 4)["clientkey"] == "3112333596_1780329600123"
+    assert field_value(extend_nodes, 4)["clientkey"] == "3112333596_1780329600"
 
 
 def test_qzone_video_upload_credentials_from_env() -> None:

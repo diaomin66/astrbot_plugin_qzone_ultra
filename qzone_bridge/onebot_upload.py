@@ -262,7 +262,11 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
             source_name = f"{source}:{action}"
             credentials = extract_video_upload_credentials(payload, source=source_name)
             if credentials is None and _action_may_return_raw_login_data(action, params):
-                credentials = _extract_raw_login_data_payload(payload, source=source_name)
+                credentials = _extract_raw_login_data_payload(
+                    payload,
+                    source=source_name,
+                    trusted_raw=_action_targets_login_data(action, params),
+                )
             if credentials is not None:
                 return OneBotVideoUploadProbe(
                     credentials=credentials,
@@ -290,7 +294,11 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
         source_name = f"{source}:{action}"
         credentials = extract_video_upload_credentials(payload, source=source_name)
         if credentials is None and _action_may_return_raw_login_data(action, params):
-            credentials = _extract_raw_login_data_payload(payload, source=source_name)
+            credentials = _extract_raw_login_data_payload(
+                payload,
+                source=source_name,
+                trusted_raw=_action_targets_login_data(action, params),
+            )
         if credentials is not None:
             return OneBotVideoUploadProbe(
                 credentials=credentials,
@@ -538,8 +546,45 @@ def _action_may_return_raw_login_data(action: str, params: dict[str, Any] | None
     return False
 
 
-def _extract_raw_login_data_payload(payload: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadCredentials | None:
-    if _payload_has_client_key(payload):
+def _action_targets_login_data(action: str, params: dict[str, Any] | None = None) -> bool:
+    """Return True when the action/params explicitly name A2/vLoginData.
+
+    Some OneBot protocol ends include ``clientKey``/``keyIndex`` in generic
+    ticket responses.  Those are Web jump-login materials and must not be
+    accepted as Tencent-upload A2.  For targeted login-misc calls, however,
+    wrappers may return bookkeeping fields next to a raw ``value``/``data``
+    buffer; in that case the raw value is still the requested A2/vLoginData.
+    """
+
+    normalized_action = _normalize_key(action)
+    params = params or {}
+    normalized_login_keys = {_normalize_key(item) for item in (*LOGIN_MISC_DATA_KEYS, *LOGIN_DATA_KEYS)}
+
+    if normalized_action in {_normalize_key(item) for item in ONEBOT_LOGIN_MISC_ACTIONS}:
+        for key in ("key", "name", "field"):
+            if _normalize_key(params.get(key)) in normalized_login_keys:
+                return True
+
+    method = _normalize_key(params.get("method"))
+    if method in {"geta2", "geta2bytes", "getqquploaddata", "getqzoneuploaddata"}:
+        return True
+    args = params.get("args")
+    if isinstance(args, (list, tuple)) and args:
+        if _normalize_key(args[0]) == "nodeikernelloginservicegetloginmiscdata":
+            values = args[1] if len(args) > 1 else []
+            if isinstance(values, (list, tuple)):
+                return any(_normalize_key(item) in normalized_login_keys for item in values)
+            return _normalize_key(values) in normalized_login_keys
+    return False
+
+
+def _extract_raw_login_data_payload(
+    payload: Any,
+    *,
+    source: str = "aiocqhttp",
+    trusted_raw: bool = False,
+) -> OneBotVideoUploadCredentials | None:
+    if _payload_has_client_key(payload) and not trusted_raw:
         return None
     encoded = _find_raw_login_data(payload)
     if not encoded:

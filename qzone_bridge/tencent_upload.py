@@ -364,6 +364,8 @@ class QzoneTencentVideoUploadResult:
     business_data: bytes
     uploaded_bytes: int
     session: str
+    upload_time: int = 0
+    client_key: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,6 +374,8 @@ class QzoneTencentVideoUploadResult:
             "business_data_length": len(self.business_data),
             "uploaded_bytes": self.uploaded_bytes,
             "session": self.session,
+            "upload_time": self.upload_time,
+            "client_key": self.client_key,
         }
 
 
@@ -959,6 +963,7 @@ class QzoneTencentVideoUploader:
         sync_weibo: bool = False,
         client_key: str = "",
         publish_time: int = 0,
+        upload_time: int = 0,
         is_original_video: int = 0,
         is_format_f20: int = 0,
         media_type: int = 0,
@@ -972,6 +977,8 @@ class QzoneTencentVideoUploader:
         if not path.is_file():
             raise FileNotFoundError(str(path))
         file_size = path.stat().st_size
+        upload_time = int(upload_time or time.time())
+        publish_time = int(publish_time or upload_time)
         if not business_data and publish_content is not None:
             business_data = encode_record_video_publish_business_data(
                 uin=self.uin,
@@ -998,7 +1005,7 @@ class QzoneTencentVideoUploader:
         info_req = UploadVideoInfoReq(
             title=title or path.name,
             desc=desc,
-            upload_time=int(time.time()),
+            upload_time=upload_time,
             business_type=business_type,
             business_data=business_data,
             play_time=play_time,
@@ -1028,8 +1035,17 @@ class QzoneTencentVideoUploader:
                         business_data=video_rsp.business_data,
                         uploaded_bytes=control_rsp.offset or file_size,
                         session=control_rsp.session,
+                        upload_time=upload_time,
+                        client_key=client_key,
                     )
-            return self._upload_video_slices(sock, path, file_size, control_rsp)
+            return self._upload_video_slices(
+                sock,
+                path,
+                file_size,
+                control_rsp,
+                upload_time=upload_time,
+                client_key=client_key,
+            )
 
     def upload_video_cover(
         self,
@@ -1060,6 +1076,8 @@ class QzoneTencentVideoUploader:
             raise TencentUploadProtocolError("video cover upload requires sVid")
         file_size = path.stat().st_size
         upload_time = int(upload_time or time.time() * 1000)
+        if not client_key and self.uin and upload_time:
+            client_key = f"{self.uin}_{upload_time}"
         batch_id = int(batch_id or _batch_id_from_client_key(client_key) or upload_time)
         width, height = _resolve_image_size(path, width, height)
         params = {str(key): str(value) for key, value in dict(extra_params or {}).items()}
@@ -1134,6 +1152,9 @@ class QzoneTencentVideoUploader:
         path: Path,
         file_size: int,
         control_rsp: FileControlRsp,
+        *,
+        upload_time: int = 0,
+        client_key: str = "",
     ) -> QzoneTencentVideoUploadResult:
         def decode_result(payload: bytes, uploaded_bytes: int, session: str) -> QzoneTencentVideoUploadResult:
             video_rsp = decode_upload_video_info_rsp(payload)
@@ -1145,6 +1166,8 @@ class QzoneTencentVideoUploader:
                 business_data=video_rsp.business_data,
                 uploaded_bytes=uploaded_bytes,
                 session=session,
+                upload_time=upload_time,
+                client_key=client_key,
             )
 
         return self._upload_slices(

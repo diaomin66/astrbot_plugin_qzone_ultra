@@ -962,7 +962,9 @@ class QzoneDaemonService:
         self._ensure_session_ready()
         duration_ms = _probe_video_duration_ms(path)
         file_size = _file_size(path)
-        client_key = f"{getattr(getattr(self, 'state', None), 'session', SessionState()).uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+        upload_time = int(datetime.now(timezone.utc).timestamp())
+        upload_uin = getattr(getattr(self, "state", None), "session", SessionState()).uin
+        client_key = f"{upload_uin}_{upload_time}"
 
         if (
             self._h5_video_upload_configured()
@@ -1060,14 +1062,18 @@ class QzoneDaemonService:
                 publish_content=content,
                 sync_weibo=sync_weibo,
                 client_key=client_key,
+                publish_time=upload_time,
+                upload_time=upload_time,
                 business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
             )
+            result_upload_time = int(getattr(result, "upload_time", 0) or upload_time)
             cover_result = await asyncio.to_thread(
                 uploader.upload_video_cover,
                 cover_path,
                 vid=result.vid,
                 video_path=path,
                 client_key=client_key,
+                upload_time=result_upload_time,
                 video_size=file_size,
                 duration_ms=duration_ms,
                 desc=content,

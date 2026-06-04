@@ -1947,6 +1947,10 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
     assert captured["cover_path"] == cover_path
     assert captured["upload_kwargs"]["publish_content"] == "hello"
     assert captured["upload_kwargs"]["play_time"] == 2345
+    assert captured["upload_kwargs"]["upload_time"] == captured["cover_kwargs"]["upload_time"]
+    assert captured["upload_kwargs"]["publish_time"] == captured["upload_kwargs"]["upload_time"]
+    assert captured["upload_kwargs"]["client_key"] == captured["cover_kwargs"]["client_key"]
+    assert captured["upload_kwargs"]["client_key"] == f"3112333596_{captured['upload_kwargs']['upload_time']}"
     assert captured["cover_kwargs"]["vid"] == "vid-1"
     assert captured["cover_kwargs"]["video_path"] == video_path
     assert captured["cover_kwargs"]["video_size"] == 5
@@ -3561,6 +3565,29 @@ def test_onebot_video_upload_probe_accepts_generic_onebot_login_misc_a2_material
     assert "get_login_misc_data:key=a2" in probe.attempted_actions
 
 
+def test_onebot_video_upload_probe_accepts_targeted_login_misc_even_with_clientkey_metadata() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-with-clientkey-metadata"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "get_login_misc_data" and params == {"key": "a2"}:
+                return {
+                    "result": 0,
+                    "value": raw_a2.hex(),
+                    "clientKey": "web-clientkey-bookkeeping",
+                    "keyIndex": "19",
+                }
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:get_login_misc_data"
+
+
 def test_onebot_video_upload_probe_does_not_accept_login_misc_clientkey_as_a2() -> None:
     from qzone_bridge.onebot_upload import probe_video_upload_credentials
 
@@ -3633,6 +3660,22 @@ def test_onebot_call_action_supports_nested_api() -> None:
 
     assert result == {"ok": True}
     assert calls == [("get_msg", {"id": "123456"})]
+
+
+def test_onebot_call_action_supports_protocol_client_positional_params() -> None:
+    from qzone_bridge.onebot_cookie import call_onebot_action
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Bot:
+        async def call_action(self, action: str, params: dict[str, object]):
+            calls.append((action, dict(params)))
+            return {"ok": True, "params": params}
+
+    result = asyncio.run(call_onebot_action(_Bot(), "get_msg", message_id=123456))
+
+    assert result == {"ok": True, "params": {"message_id": 123456}}
+    assert calls == [("get_msg", {"message_id": 123456})]
 
 
 def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
