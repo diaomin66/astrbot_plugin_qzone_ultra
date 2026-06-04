@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060402
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060403
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -719,7 +719,7 @@ from qzone_bridge.news import (
     normalize_news_scopes,
 )
 from qzone_bridge.onebot_cookie import fetch_cookie_text
-from qzone_bridge.onebot_upload import fetch_video_upload_credentials
+from qzone_bridge.onebot_upload import probe_video_upload_credentials
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
@@ -949,6 +949,7 @@ class QzoneStablePlugin(Star):
         self._onebot_client: Any | None = None
         self._cookie_lock: asyncio.Lock | None = None
         self._video_upload_lock: asyncio.Lock | None = None
+        self._last_video_upload_probe: dict[str, Any] = {}
         self.controller = QzoneDaemonController(
             plugin_root=self.root,
             data_dir=self.data_dir,
@@ -4315,7 +4316,9 @@ class QzoneStablePlugin(Star):
             if bot is None:
                 return status or None
 
-            credentials = await fetch_video_upload_credentials(bot, source=source)
+            probe = await probe_video_upload_credentials(bot, source=source)
+            self._last_video_upload_probe = probe.public_detail()
+            credentials = probe.credentials
             if credentials is None:
                 return status or None
 
@@ -5327,11 +5330,26 @@ class QzoneStablePlugin(Star):
         try:
             payload = await self._auto_bind_video_upload_credentials(event, force=True, source="aiocqhttp")
             if not self._status_has_video_upload_credentials(payload):
+                probe = getattr(self, "_last_video_upload_probe", {}) or {}
+                attempted = len(probe.get("attempted_actions") or [])
+                returned = ", ".join((probe.get("returned_actions") or [])[:5])
+                web_only = ", ".join((probe.get("web_credential_actions") or [])[:5])
+                suffix_parts = []
+                if attempted:
+                    suffix_parts.append(f"已尝试 {attempted} 个 OneBot action/参数组合")
+                if returned:
+                    suffix_parts.append(f"有返回的 action：{returned}")
+                if web_only:
+                    suffix_parts.append(f"其中仅返回 Cookie/CSRF 的 action：{web_only}")
+                suffix = "；" + "；".join(suffix_parts) if suffix_parts else ""
                 yield self._command_result(
                     event,
                     "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
-                    "这只影响旧 Tencent upload 后备。若 /qzone status 显示 video_upload ready，"
-                    "daemon 会优先使用已绑定 Cookie/p_skey 的 H5 原生视频直发。",
+                    "标准 OneBot get_credentials/get_cookies 通常只能提供 Qzone Cookie/CSRF，"
+                    "不足以驱动稳定的 video_qzone 移动上传发布。"
+                    "请让协议端（NapCat/LLBot/其他 OneBot 实现均可）暴露返回 vLoginData/A2 的扩展 action，"
+                    "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
+                    f"{suffix}",
                 )
                 return
             payload = await self._status_with_recovery()

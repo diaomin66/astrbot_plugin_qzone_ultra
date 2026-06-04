@@ -216,6 +216,7 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(
         daemon_mod,
         "QzoneTencentVideoUploader",
@@ -288,6 +289,7 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
     captured: dict[str, object] = {}
 
@@ -340,15 +342,17 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     assert captured["publish_content"] == ""
 
 
-def test_daemon_h5_video_publish_accepts_publish_result_feedinfo_verification(
+def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
     from qzone_bridge.media import PostMedia
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
 
     class _Client:
         timeout = 1.5
@@ -374,7 +378,7 @@ def test_daemon_h5_video_publish_accepts_publish_result_feedinfo_verification(
     service._set_success = lambda defer_save=True: None
 
     async def fake_wait_for_native_video_feed(**_kwargs):
-        raise AssertionError("publish_result feedinfo already verifies the sVid")
+        return None
 
     service._wait_for_native_video_feed = fake_wait_for_native_video_feed
 
@@ -382,9 +386,7 @@ def test_daemon_h5_video_publish_accepts_publish_result_feedinfo_verification(
     video_path.write_bytes(b"chunk")
     video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
 
-    payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
-    assert payload["status"] == "published_native_video"
-    assert payload["vid"] == "vid-h5-feedinfo"
-    assert payload["fid"] == "fid-feedinfo"
-    assert payload["raw"]["verified_feed"]["verification_source"] == "publish_result_feedinfo"
+    assert "richval" in str(error.value)

@@ -315,20 +315,25 @@ class QzoneDaemonService:
         state = getattr(self, "state", None)
         return qzone_h5_video_upload_available(getattr(state, "session", None))
 
+    @staticmethod
+    def _experimental_h5_video_publish_enabled() -> bool:
+        value = str(os.environ.get("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH") or "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
     def _video_upload_summary(self) -> dict[str, Any]:
         summary = self.state.video_upload.summary()
         h5_ready = self._h5_video_upload_configured()
+        stable_ready = bool(summary.get("configured"))
         summary["web_cookie_configured"] = h5_ready
-        if h5_ready:
-            summary["configured"] = True
-            summary.setdefault("source", "")
-            if not summary["source"]:
-                summary["source"] = "qzone_h5_cookie"
+        summary["h5_upload_available"] = h5_ready
+        summary["h5_publish_supported"] = self._experimental_h5_video_publish_enabled()
+        summary["configured"] = stable_ready
+        if stable_ready:
+            summary["method"] = "tencent_upload"
+        elif h5_ready:
+            summary["method"] = "h5_slice_upload_only"
             if not summary.get("updated_at"):
                 summary["updated_at"] = self.state.session.updated_at
-            summary["method"] = "h5_slice_upload" if not summary.get("login_data_b64_length") else "h5_slice_upload,tencent_upload"
-        elif summary.get("configured"):
-            summary["method"] = "tencent_upload"
         else:
             summary["method"] = ""
         return summary
@@ -881,23 +886,25 @@ class QzoneDaemonService:
         for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
             if delay > 0:
                 await asyncio.sleep(delay)
-            try:
-                page = await self.list_feeds(
-                    hostuin=int(self.state.session.uin or 0),
-                    limit=10,
-                    scope="self",
-                    record_recent=False,
-                )
-            except (QzoneRequestError, QzoneParseError) as exc:
-                last_error = exc
-                log.debug("qzone native video feed verification fetch failed: %s", exc)
-                continue
-            for item in page.get("items") or []:
-                if not isinstance(item, dict):
+            for scope in ("self", "active", "profile"):
+                try:
+                    page = await self.list_feeds(
+                        hostuin=int(self.state.session.uin or 0),
+                        limit=20,
+                        scope=scope,
+                        record_recent=False,
+                    )
+                except (QzoneRequestError, QzoneParseError) as exc:
+                    last_error = exc
+                    log.debug("qzone native video feed verification fetch failed scope=%s: %s", scope, exc)
                     continue
-                raw = item.get("raw")
-                if _raw_contains_text(item, vid) or _raw_contains_text(raw, vid):
-                    return item
+                for item in page.get("items") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    raw = item.get("raw")
+                    if _raw_contains_text(item, vid) or _raw_contains_text(raw, vid):
+                        item.setdefault("verification_source", f"{scope}_feed")
+                        return item
         if last_error is not None:
             log.warning("qzone native video feed verification ended with fetch errors: %s", last_error)
         return None
@@ -923,7 +930,11 @@ class QzoneDaemonService:
         file_size = _file_size(path)
         client_key = f"{getattr(getattr(self, 'state', None), 'session', SessionState()).uin}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
 
-        if self._h5_video_upload_configured():
+        if (
+            self._h5_video_upload_configured()
+            and not self._video_upload_credentials_configured()
+            and self._experimental_h5_video_publish_enabled()
+        ):
             try:
                 result = await self.client.upload_h5_video(
                     path,
@@ -945,18 +956,11 @@ class QzoneDaemonService:
                     "Qzone H5 原生视频后台上传失败",
                     detail={"type": type(exc).__name__, "message": str(exc)},
                 ) from exc
-            verified_feed: dict[str, Any] | None = None
-            if _raw_contains_text(publish_result, result.vid):
-                verified_feed = {
-                    "fid": str(publish_result.get("tid") or publish_result.get("fid") or ""),
-                    "raw": publish_result,
-                    "verification_source": "publish_result_feedinfo",
-                }
-            else:
-                verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
+            verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
             if verified_feed is None:
                 raise QzoneRequestError(
-                    "QQ 空间 H5 原生视频后台发布已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",
+                    "QQ 空间 H5 视频上传/发布接口只返回了 sVid 或 richval 回显，但未在最近动态中验证到同一视频；"
+                    "H5 路径不是稳定的视频发布接口，已拒绝宣称发布成功",
                     detail={"vid": result.vid, "client_key": client_key, "publish_result": publish_result},
                 )
             return {
@@ -980,13 +984,16 @@ class QzoneDaemonService:
 
         if not self._video_upload_credentials_configured():
             raise QzoneParseError(
-                "daemon 原生视频后台直发缺少可用 Qzone Web p_skey Cookie 或 QQ upload 登录材料，"
-                "已阻止视频封面替代发布；请先使用 /qzone bind 绑定可用 Cookie，"
-                "或使用 /qzone videoauth 绑定 QQ upload A2/vLoginData 材料",
+                "daemon 原生视频后台直发缺少 QQ upload A2/vLoginData 二进制登录材料；"
+                "已阻止视频封面替代发布，也不会打开 QQ/QQNT 客户端。"
+                "实测 Qzone H5 sliceUpload 只能稳定上传视频资源，Web publish_v6 会回显 richval 但不保证生成可见视频动态；"
+                "请让 OneBot 协议端提供可用的视频上传扩展 action，或使用 /qzone videoauth 手动绑定 QQ upload A2/vLoginData 材料",
                 detail={
                     "name": video.name or path.name,
                     "video_upload_configured": False,
-                    "web_cookie_configured": False,
+                    "web_cookie_configured": self._h5_video_upload_configured(),
+                    "required": "QQ upload A2/vLoginData",
+                    "stable_method": "tencent_upload",
                 },
             )
         try:

@@ -3287,10 +3287,16 @@ def test_plugin_auto_binds_onebot_video_upload_credentials(
                 "source": self.source,
             }
 
-    async def fake_fetch(client, *, source="aiocqhttp"):
+    class _Probe:
+        credentials = _Credentials()
+
+        def public_detail(self):
+            return {"credentials_found": True, "attempted_actions": ["get_qzone_video_upload_credentials"]}
+
+    async def fake_probe(client, *, source="aiocqhttp"):
         captured["fetch_client"] = client
         captured["fetch_source"] = source
-        return _Credentials()
+        return _Probe()
 
     class _Controller:
         async def get_status(self, **kwargs):
@@ -3306,7 +3312,7 @@ def test_plugin_auto_binds_onebot_video_upload_credentials(
     plugin._onebot_client = bot
     plugin._context = None
     plugin._video_upload_lock = None
-    monkeypatch.setattr(main, "fetch_video_upload_credentials", fake_fetch)
+    monkeypatch.setattr(main, "probe_video_upload_credentials", fake_probe)
 
     payload = asyncio.run(plugin._auto_bind_video_upload_credentials(force=True, source="aiocqhttp"))
 
@@ -3336,6 +3342,27 @@ def test_onebot_video_upload_credentials_ignore_web_cookie_tokens() -> None:
     }
 
     assert extract_video_upload_credentials(payload) is None
+
+
+def test_onebot_video_upload_probe_reports_cookie_only_credentials() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == "get_credentials":
+                return {
+                    "data": {
+                        "cookies": "uin=o12345; skey=web-skey; p_skey=web-pskey;",
+                        "csrf_token": 123456,
+                    }
+                }
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "get_credentials" in probe.returned_actions
+    assert "get_credentials" in probe.web_credential_actions
 
 
 def test_onebot_video_upload_credentials_accept_binary_a2_material() -> None:
