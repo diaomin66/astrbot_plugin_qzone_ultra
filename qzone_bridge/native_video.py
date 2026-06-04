@@ -2,7 +2,8 @@
 
 This module intentionally does not build or open QQ/QQNT client protocol
 handoff URIs. Video publishing is handled by the local daemon Tencent upload
-path; unsupported inputs are left to the normal cover-image publish fallback.
+path; unsupported video inputs must be rejected instead of falling back to a
+cover-image publish that would falsely report video success.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from .media import (
 
 
 def native_video_candidate(post: PostPayload) -> PostMedia | None:
-    """Return a single daemon-native-publishable video or None for cover fallback."""
+    """Return the single daemon-native-publishable video, or None if invalid."""
 
     media = [*post.media, *post.attachments]
     videos = [item for item in media if _is_native_video_item(item)]

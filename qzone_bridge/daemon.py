@@ -1172,7 +1172,7 @@ class QzoneDaemonService:
         if _contains_video_media(normalized_media):
             raise QzoneParseError(
                 "daemon 原生视频后台直发仅支持单个本地视频，已阻止视频封面替代发布；"
-                "请只附带一个视频，或关闭 native_video_publish 后明确按封面图发布",
+                "请只附带一个视频，并确保已绑定 QQ upload A2/vLoginData",
                 detail={"media_count": len(normalized_media)},
             )
         normalized_media, _video_covers_changed = materialize_video_cover_list(

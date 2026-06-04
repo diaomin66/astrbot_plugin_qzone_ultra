@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 ## Cookie 绑定
 
-推荐在 OneBot v11 环境使用自动绑定。AstrBot 内置适配器名称仍叫 `aiocqhttp`，但插件逻辑按通用 OneBot 协议端处理，不限定某一个实现；LLOneBot、NapCat、Shamrock 等能接入 OneBot v11 反向 WebSocket 的实现都走同一套解析和兜底逻辑。
+推荐在 OneBot v11 环境使用自动绑定。AstrBot 内置适配器名称仍叫 `aiocqhttp`，但插件逻辑按通用 OneBot 协议端处理，不限定某一个实现；LLOneBot、LLBot、NapCat、Shamrock 等能接入 OneBot v11 反向 WebSocket 的实现都走同一套解析和兜底逻辑。
 
 ```text
 /qzone autobind
@@ -137,7 +137,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `auto_bind_cookie` | `true` | 登录态缺失时尝试从 OneBot 自动获取 Cookie |
 | `manage_group` | 空 | 投稿审核通知群；为空时尝试私发管理员 |
 | `pillowmd_style_dir` | 空 | 可选 pillowmd 样式目录 |
-| `native_video_publish` | `true` | 单个本地视频说说优先交给 daemon 原生视频后台直发；关闭后始终按视频封面图发布 |
+| `native_video_publish` | `true` | 单个本地视频说说优先交给 daemon 原生视频后台直发；关闭后会拒绝视频发布，避免误把封面/渲染图当作成功 |
 | `render_publish_result` | `true` | 发布成功后返回渲染图；看/读/评/赞说说也会复用同款卡片渲染 |
 | `render_feed_card_limit` | `5` | 看/读/评/赞说说时单次最多渲染的卡片数量；多条会合成一张左对齐长图 |
 | `llm.post_provider_id` | 空 | 写说说使用的 LLM provider；空表示当前会话默认 provider |
@@ -158,9 +158,9 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `news.once_per_day` | `true` | 定时任务每天最多成功发布一次新闻说说；手动选择发布不受该限制 |
 | `news.trust_env` | `true` | Google News RSS 请求使用系统代理；只影响新闻 RSS，不影响 QQ 空间 Cookie 请求 |
 
-`native_video_publish` 开启后，单个本地视频会优先走 daemon 原生视频后台路径：稳定路径是 QQ upload / `video_qzone` 移动上传协议，插件会通过 `/qzone videoauth`、`/qzone autovideoauth` 或进程环境变量 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 获取 vLoginData/A2 类二进制登录材料，再上传视频、上传封面并轮询最近动态验证同一 `sVid`。实测 Qzone H5 `sliceUpload/FileUploadVideo` 能稳定上传视频资源，但 Web `emotion_cgi_publish_v6` + `richval` 可能只回显提交内容而不生成可见视频动态；因此默认不再把 H5 Cookie/`p_skey` 当作稳定视频直发凭据。未验证到 feed 时会阻止发布并报错，不再回退为视频封面图，也不再唤起 QQ/QQNT 客户端确认窗口。关闭 `native_video_publish` 后才会明确按视频封面图发布。
+`native_video_publish` 开启后，单个本地视频会优先走 daemon 原生视频后台路径：稳定路径是 QQ upload / `video_qzone` 移动上传协议，插件会通过 `/qzone videoauth`、`/qzone autovideoauth` 或进程环境变量 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 获取 vLoginData/A2 类二进制登录材料，再上传视频、上传封面并轮询最近动态验证同一 `sVid`。实测 Qzone H5 `sliceUpload/FileUploadVideo` 能稳定上传视频资源，但 Web `emotion_cgi_publish_v6` + `richval` 可能只回显提交内容而不生成可见视频动态；因此默认不再把 H5 Cookie/`p_skey` 当作稳定视频直发凭据。未验证到 feed 时会阻止发布并报错，不再回退为视频封面图，也不再唤起 QQ/QQNT 客户端确认窗口。关闭 `native_video_publish` 后会直接拒绝包含视频的发布请求，必须重新开启并绑定 QQ upload vLoginData/A2 后才能发布真视频。
 
-`/qzone autovideoauth` 面向 OneBot 协议端能力探测，不绑定单一实现：会优先尝试通用扩展 action（例如 `get_qzone_video_upload_credentials`、`get_video_upload_credentials`、`get_login_misc_data key=a2/vLoginData` 等，也兼容 `_get_*` 这类下划线扩展命名），也会兼容 LLOneBot 的 `llonebot_debug` 透传 `nodeIKernelLoginService/getLoginMiscData`。调用层支持 `call_action`、`call_api`、`request`、`call` 以及 `params/data/payload` 包装，NapCat / LLOneBot / Shamrock 等 OneBot 实现只要暴露返回 vLoginData/A2 二进制材料的 action 都可被绑定；仅返回 Cookie/CSRF 或 `clientkey/keyIndex` 会被诊断为 Web 登录材料并拒绝当作 A2，避免把不可见视频或 H5 richval 回显误报为发布成功。
+`/qzone autovideoauth` 面向 OneBot 协议端能力探测，不绑定单一实现：会优先尝试通用扩展 action（例如 `get_qzone_video_upload_credentials`、`get_video_upload_credentials`、`get_login_misc_data key=a2/vLoginData` 等，也兼容 `_get_*` 这类下划线扩展命名），也会兼容 LLOneBot 的 `llonebot_debug` 透传 `nodeIKernelLoginService/getLoginMiscData`。调用层支持 `call_action`、`call_api`、`request`、`call` 以及 `params/data/payload` 包装，NapCat / LLOneBot / LLBot / Shamrock 等 OneBot 实现只要暴露返回 vLoginData/A2 二进制材料的 action 都可被绑定；仅返回 Cookie/CSRF 或 `clientkey/keyIndex` 会被诊断为 Web 登录材料并拒绝当作 A2，避免把不可见视频或 H5 richval 回显误报为发布成功。
   - OneBot protocol compatibility: probing is protocol-first, not NapCat-only. It supports `call_action`/`call_api`/`request`/`call`/`send_api`/`send_action`/`request_api`/`api_call` (and camelCase aliases), nested `api`/`client`/`bot` wrappers, and single OneBot envelopes like `{"action":"...","params":{...}}`; NapCat/LLOneBot/LLBot-specific probes are only optional fallbacks.
 
 完整配置见 `_conf_schema.json`。Cron 表达式格式为 `分 时 日 月 周`，例如 `30 8 * * *` 表示每天 8:30。

@@ -1822,7 +1822,7 @@ def test_daemon_publish_post_blocks_video_cover_fallback_without_upload_credenti
         )
 
     assert "QQ upload" in str(error.value)
-    assert "video" in str(error.value).lower()
+    assert "A2/vLoginData" in str(error.value)
 
 
 def test_daemon_publish_post_blocks_unsupported_video_mix_cover_fallback(
@@ -1856,8 +1856,8 @@ def test_daemon_publish_post_blocks_unsupported_video_mix_cover_fallback(
     with pytest.raises(QzoneParseError) as error:
         asyncio.run(service.publish_post(content="hello", media=[item.to_dict() for item in media], content_sanitized=True))
 
-    assert "native_video_publish" in str(error.value)
-    assert "video" in str(error.value).lower()
+    assert "A2/vLoginData" in str(error.value)
+    assert "QQ upload" in str(error.value)
 
 
 def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
@@ -4040,11 +4040,12 @@ def test_capture_onebot_client_from_context_supports_llbot_alias(monkeypatch: py
     assert "llbot" in seen
 
 
-def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
+def test_plugin_publish_blocks_cover_payload_when_native_video_disabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     main = _import_main_with_stubs(monkeypatch)
+    from qzone_bridge.errors import QzoneParseError
 
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"fake video bytes")
@@ -4060,21 +4061,15 @@ def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
             )
         ],
     )
-    cover = main.PostPayload(
-        content="hello",
-        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
-    )
     captured: dict[str, object] = {}
 
     async def fake_prepare(post):
-        assert post is original
-        captured["prepared"] = captured.get("prepared", 0) + 1
-        return cover
+        raise AssertionError("video publish must not render a cover when native video publishing is disabled")
 
     class _Controller:
         async def publish_post(self, **kwargs):
             captured["publish_kwargs"] = kwargs
-            return {"fid": "fid-cover", "message": "ok", "photo_count": 1}
+            raise AssertionError("video publish must not fall back to image/cover publishing")
 
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(native_video_publish=False)
@@ -4082,17 +4077,12 @@ def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
     plugin.controller = _Controller()
     plugin._prepare_publish_payload = fake_prepare
 
-    render_post, payload = asyncio.run(plugin._publish_post_payload(original))
+    with pytest.raises(QzoneParseError) as error:
+        asyncio.run(plugin._publish_post_payload(original))
 
-    assert render_post is cover
-    assert payload["fid"] == "fid-cover"
-    assert captured["prepared"] == 1
-    assert captured["publish_kwargs"] == {
-        "content": "hello",
-        "sync_weibo": False,
-        "media": [cover.media[0].to_dict()],
-        "content_sanitized": True,
-    }
+    assert "native_video_publish" in str(error.value)
+    assert "A2/vLoginData" in str(error.value)
+    assert captured == {}
 
 
 def test_publish_renderer_draws_video_play_overlay() -> None:

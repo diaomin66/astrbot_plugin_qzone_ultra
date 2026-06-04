@@ -685,7 +685,13 @@ from qzone_bridge.auto_comment import (
 )
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
-from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
+from qzone_bridge.errors import (
+    DaemonUnavailableError,
+    QzoneBridgeError,
+    QzoneCookieAcquireError,
+    QzoneNeedsRebind,
+    QzoneParseError,
+)
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.local_media import resolve_trusted_local_media_path
 from qzone_bridge.media import (
@@ -3407,7 +3413,13 @@ class QzoneStablePlugin(Star):
     ) -> tuple[PostPayload, dict[str, Any]]:
         post = await self._prepare_video_sources(post)
         render_post: PostPayload | None = None
-        if getattr(self.settings, "native_video_publish", True) and _post_contains_video_media(post):
+        if _post_contains_video_media(post):
+            if not getattr(self.settings, "native_video_publish", True):
+                raise QzoneParseError(
+                    "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
+                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone autovideoauth 或 /qzone videoauth "
+                    "绑定 QQ upload A2/vLoginData 后再发布。"
+                )
             render_post = await self._prepare_publish_payload(post)
             await self._maybe_bind_video_upload_credentials(event)
             payload = await self.controller.publish_post(
@@ -5432,7 +5444,7 @@ class QzoneStablePlugin(Star):
                     "请让当前 OneBot 协议端暴露返回 vLoginData/A2 的扩展 action，"
                     "例如 get_qzone_video_upload_credentials / get_video_upload_credentials，"
                     "或 get_login_misc_data(key=a2/vLoginData)；"
-                    "NapCat、LLOneBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可。"
+                    "NapCat、LLOneBot、LLBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可。"
                     "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
                     f"{suffix}",
                 )
