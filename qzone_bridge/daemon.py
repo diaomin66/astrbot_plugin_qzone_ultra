@@ -69,6 +69,7 @@ from .utils import now_iso, from_iso
 log = get_logger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0)
+NATIVE_VIDEO_VERIFY_DETAIL_LIMIT = 5
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
 PUBLIC_HEALTH_METHODS = {"GET", "HEAD"}
@@ -883,6 +884,7 @@ class QzoneDaemonService:
         if not vid:
             return None
         last_error: Exception | None = None
+        checked_detail_keys: set[tuple[int, str, int]] = set()
         for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -905,6 +907,38 @@ class QzoneDaemonService:
                     if _raw_contains_text(item, vid) or _raw_contains_text(raw, vid):
                         item.setdefault("verification_source", f"{scope}_feed")
                         return item
+                for item in (page.get("items") or [])[:NATIVE_VIDEO_VERIFY_DETAIL_LIMIT]:
+                    if not isinstance(item, dict):
+                        continue
+                    fid = str(item.get("fid") or item.get("tid") or item.get("key") or "").strip()
+                    if not fid:
+                        continue
+                    try:
+                        hostuin = int(item.get("hostuin") or item.get("uin") or self.state.session.uin or 0)
+                        appid = int(item.get("appid") or 311)
+                    except (TypeError, ValueError):
+                        continue
+                    detail_key = (hostuin, fid, appid)
+                    if detail_key in checked_detail_keys:
+                        continue
+                    checked_detail_keys.add(detail_key)
+                    try:
+                        detail = await self.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+                    except (QzoneRequestError, QzoneParseError) as exc:
+                        last_error = exc
+                        log.debug(
+                            "qzone native video detail verification fetch failed scope=%s fid=%s: %s",
+                            scope,
+                            fid,
+                            exc,
+                        )
+                        continue
+                    if _raw_contains_text(detail, vid):
+                        entry = detail.get("entry") if isinstance(detail, dict) else None
+                        verified = dict(entry) if isinstance(entry, dict) else dict(item)
+                        verified.setdefault("raw", detail.get("raw") if isinstance(detail, dict) else detail)
+                        verified.setdefault("verification_source", f"{scope}_detail")
+                        return verified
         if last_error is not None:
             log.warning("qzone native video feed verification ended with fetch errors: %s", last_error)
         return None

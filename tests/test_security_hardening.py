@@ -2021,6 +2021,51 @@ def test_daemon_native_video_upload_must_verify_feed_before_success(
     assert error.value.detail["vid"] == "vid-1"
 
 
+def test_daemon_native_video_verification_checks_feed_detail_for_vid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0,))
+    calls: dict[str, object] = {"details": []}
+
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+
+    async def fake_list_feeds(**kwargs):
+        calls["list_kwargs"] = kwargs
+        return {
+            "items": [
+                {
+                    "fid": "fid-no-inline-vid",
+                    "hostuin": 3112333596,
+                    "appid": 311,
+                    "summary": "内含视频和图片",
+                    "raw": {"summary": "内含视频和图片"},
+                }
+            ]
+        }
+
+    async def fake_detail_feed(**kwargs):
+        calls["details"].append(kwargs)
+        return {
+            "entry": {"fid": kwargs["fid"], "summary": "detail"},
+            "raw": {"video_id": "1074_target_vid", "is_video": 1},
+        }
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    verified = asyncio.run(service._wait_for_native_video_feed(vid="1074_target_vid"))
+
+    assert verified is not None
+    assert verified["fid"] == "fid-no-inline-vid"
+    assert verified["verification_source"] == "self_detail"
+    assert calls["details"] == [{"hostuin": 3112333596, "fid": "fid-no-inline-vid", "appid": 311}]
+
+
 def test_native_video_module_removes_client_handoff_helpers() -> None:
     from qzone_bridge import native_video
 
@@ -3266,6 +3311,69 @@ def test_plugin_publish_sends_native_video_to_daemon_without_client_handoff(
     }
 
 
+def test_plugin_publish_routes_mixed_video_media_to_daemon_instead_of_cover_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    video_source = tmp_path / "clip.mp4"
+    image_source = tmp_path / "photo.jpg"
+    video_source.write_bytes(b"fake video bytes")
+    image_source.write_bytes(b"fake image bytes")
+    video = main.PostMedia(
+        kind="video",
+        source=str(video_source),
+        name="clip.mp4",
+        mime_type="video/mp4",
+        trusted_local=True,
+    )
+    image = main.PostMedia(
+        kind="image",
+        source=str(image_source),
+        name="photo.jpg",
+        mime_type="image/jpeg",
+        trusted_local=True,
+    )
+    original = main.PostPayload(content="hello", media=[video, image])
+    rendered_cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "rendered.jpg"), raw_type="video", trusted_local=True)],
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_prepare(post):
+        assert post is original
+        return rendered_cover
+
+    async def fake_bind(event=None):
+        captured["bind_event"] = event
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {"ok": False, "message": "unsupported mix rejected by daemon"}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    plugin._maybe_bind_video_upload_credentials = fake_bind
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original, event="evt"))
+
+    assert render_post is rendered_cover
+    assert payload["message"] == "unsupported mix rejected by daemon"
+    assert captured["bind_event"] == "evt"
+    assert captured["publish_kwargs"] == {
+        "content": "hello",
+        "sync_weibo": False,
+        "media": [video.to_dict(), image.to_dict()],
+        "content_sanitized": True,
+    }
+
+
 def test_plugin_auto_binds_onebot_video_upload_credentials(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3363,6 +3471,43 @@ def test_onebot_video_upload_probe_reports_cookie_only_credentials() -> None:
     assert probe.credentials is None
     assert "get_credentials" in probe.returned_actions
     assert "get_credentials" in probe.web_credential_actions
+
+
+def test_onebot_video_upload_probe_reports_clientkey_only_without_binding() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "get_clientkey":
+                return {"data": {"clientkey": "web-jump-client-key", "keyIndex": "19"}}
+            if action == "llonebot_debug" and params.get("method") == "forceFetchClientKey":
+                return {"clientKey": "web-jump-client-key", "keyIndex": "19"}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "get_clientkey" in probe.returned_actions
+    assert "get_clientkey" in probe.client_key_actions
+    assert "llonebot_debug" in probe.client_key_actions
+
+
+def test_onebot_video_upload_probe_accepts_llonebot_debug_raw_a2_material() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-login-data"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "llonebot_debug" and params.get("method") == "getA2Bytes":
+                return {"type": "Buffer", "data": list(raw_a2)}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:llonebot_debug"
 
 
 def test_onebot_video_upload_credentials_accept_binary_a2_material() -> None:

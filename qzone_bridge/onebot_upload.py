@@ -33,6 +33,19 @@ VIDEO_UPLOAD_CREDENTIAL_ACTIONS = (
     "get_cookies",
     "get_csrf_token",
 )
+CLIENT_KEY_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("get_clientkey", {}),
+    ("get_client_key", {}),
+    ("get_ntqq_clientkey", {}),
+    ("get_ntqq_client_key", {}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Bytes", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "forceFetchClientKey", "args": []}),
+    (
+        "llonebot_debug",
+        {"apiClass": "pmhq", "method": "invoke", "args": ["nodeIKernelTicketService/forceFetchClientKey", [""]]},
+    ),
+)
 LOGIN_DATA_KEYS = {
     "login_data",
     "logindata",
@@ -84,6 +97,33 @@ WEB_CREDENTIAL_KEYS = {
     "pskey",
     "qzonetoken",
 }
+CLIENT_KEY_KEYS = {
+    "clientkey",
+    "client_key",
+    "clientKey",
+    "keyindex",
+    "keyIndex",
+}
+RAW_LOGIN_DATA_METHOD_HINTS = {"geta2", "geta2bytes", "getqquploaddata", "getqzoneuploaddata"}
+RAW_LOGIN_DATA_ACTION_HINTS = {
+    "getqzonevideouploadcredentials",
+    "getvideouploadcredentials",
+    "getqzonevideouploadauth",
+    "getvideouploadauth",
+    "getqzoneuploadcredentials",
+    "getuploadcredentials",
+    "getqzoneuploadauth",
+    "getuploadauth",
+    "getqquploadcredentials",
+    "getqquploadlogindata",
+    "getqquploadauth",
+    "getuploadlogindata",
+    "getqzoneuploadlogindata",
+    "getntqqlogindata",
+    "getlogindata",
+}
+RAW_LOGIN_DATA_WRAPPER_KEYS = WRAPPER_KEYS + ("value", "ticket", "buffer")
+MIN_RAW_LOGIN_DATA_BYTES = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +152,7 @@ class OneBotVideoUploadProbe:
     attempted_actions: tuple[str, ...] = ()
     returned_actions: tuple[str, ...] = ()
     web_credential_actions: tuple[str, ...] = ()
+    client_key_actions: tuple[str, ...] = ()
     error_count: int = 0
 
     def public_detail(self) -> dict[str, Any]:
@@ -120,6 +161,7 @@ class OneBotVideoUploadProbe:
             "attempted_actions": list(self.attempted_actions),
             "returned_actions": list(self.returned_actions),
             "web_credential_actions": list(self.web_credential_actions),
+            "client_key_actions": list(self.client_key_actions),
             "error_count": self.error_count,
         }
 
@@ -144,6 +186,7 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
     attempted: list[str] = []
     returned: list[str] = []
     web_only: list[str] = []
+    client_key_only: list[str] = []
     error_count = 0
     for action in _unique(VIDEO_UPLOAD_CREDENTIAL_ACTIONS):
         for params in _video_upload_action_param_variants():
@@ -157,22 +200,57 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
                 error_count += 1
                 continue
             returned.append(action)
-            credentials = extract_video_upload_credentials(payload, source=f"{source}:{action}")
+            source_name = f"{source}:{action}"
+            credentials = extract_video_upload_credentials(payload, source=source_name)
+            if credentials is None and _action_may_return_raw_login_data(action, params):
+                credentials = _extract_raw_login_data_payload(payload, source=source_name)
             if credentials is not None:
                 return OneBotVideoUploadProbe(
                     credentials=credentials,
                     attempted_actions=tuple(_unique(attempted)),
                     returned_actions=tuple(_unique(returned)),
                     web_credential_actions=tuple(_unique(web_only)),
+                    client_key_actions=tuple(_unique(client_key_only)),
                     error_count=error_count,
                 )
             if _payload_has_web_credentials(payload):
                 web_only.append(action)
+            if _payload_has_client_key(payload):
+                client_key_only.append(action)
+    for action, params in CLIENT_KEY_ACTION_ATTEMPTS:
+        attempted.append(_action_label(action, params))
+        try:
+            payload = await asyncio.wait_for(
+                call_onebot_action(bot, action, **params),
+                timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            error_count += 1
+            continue
+        returned.append(action)
+        source_name = f"{source}:{action}"
+        credentials = extract_video_upload_credentials(payload, source=source_name)
+        if credentials is None and _action_may_return_raw_login_data(action, params):
+            credentials = _extract_raw_login_data_payload(payload, source=source_name)
+        if credentials is not None:
+            return OneBotVideoUploadProbe(
+                credentials=credentials,
+                attempted_actions=tuple(_unique(attempted)),
+                returned_actions=tuple(_unique(returned)),
+                web_credential_actions=tuple(_unique(web_only)),
+                client_key_actions=tuple(_unique(client_key_only)),
+                error_count=error_count,
+            )
+        if _payload_has_web_credentials(payload):
+            web_only.append(action)
+        if _payload_has_client_key(payload):
+            client_key_only.append(action)
     return OneBotVideoUploadProbe(
         credentials=None,
         attempted_actions=tuple(_unique(attempted)),
         returned_actions=tuple(_unique(returned)),
         web_credential_actions=tuple(_unique(web_only)),
+        client_key_actions=tuple(_unique(client_key_only)),
         error_count=error_count,
     )
 
@@ -325,6 +403,131 @@ def _payload_has_web_credentials(payload: Any, *, _depth: int = 0, _seen: set[in
         for value in payload.values()
         if isinstance(value, (dict, list, tuple, str))
     )
+
+
+def _payload_has_client_key(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return False
+    if isinstance(payload, bytes):
+        return False
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if "clientkey=" in lowered or "client_key=" in lowered or '"clientkey"' in lowered or '"client_key"' in lowered:
+            return True
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _payload_has_client_key(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return False
+        return False
+    if isinstance(payload, (list, tuple)):
+        return any(_payload_has_client_key(item, _depth=_depth + 1, _seen=_seen) for item in payload)
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+    normalized_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    for key, value in payload.items():
+        if _normalize_key(key) in normalized_keys and value not in (None, "", [], {}):
+            return True
+    return any(
+        _payload_has_client_key(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _action_may_return_raw_login_data(action: str, params: dict[str, Any] | None = None) -> bool:
+    normalized_action = _normalize_key(action)
+    if normalized_action in RAW_LOGIN_DATA_ACTION_HINTS:
+        return True
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if method in RAW_LOGIN_DATA_METHOD_HINTS:
+        return True
+    args = params.get("args")
+    if isinstance(args, (list, tuple)):
+        return any(_normalize_key(item) in RAW_LOGIN_DATA_METHOD_HINTS for item in args if isinstance(item, str))
+    return False
+
+
+def _extract_raw_login_data_payload(payload: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadCredentials | None:
+    encoded = _find_raw_login_data(payload)
+    if not encoded:
+        return None
+    return OneBotVideoUploadCredentials(login_data_b64=encoded, source=source)
+
+
+def _find_raw_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 8:
+        return ""
+    if isinstance(payload, (bytes, bytearray)):
+        return _raw_scalar_to_b64(payload)
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return ""
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _find_raw_login_data(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return ""
+        return _raw_scalar_to_b64(text)
+    if isinstance(payload, (list, tuple)):
+        if all(isinstance(item, int) for item in payload):
+            return _raw_scalar_to_b64(payload)
+        for item in payload:
+            found = _find_raw_login_data(item, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return ""
+    _seen.add(obj_id)
+
+    normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    for key in RAW_LOGIN_DATA_WRAPPER_KEYS:
+        if key in payload and _normalize_key(key) not in normalized_client_keys:
+            found = _find_raw_login_data(payload.get(key), _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in normalized_client_keys or normalized in {_normalize_key(item) for item in WEB_CREDENTIAL_KEYS}:
+            continue
+        if normalized in {_normalize_key(item) for item in LOGIN_DATA_KEYS}:
+            found = _raw_scalar_to_b64(value)
+            if found:
+                return found
+        if isinstance(value, (dict, list, tuple)):
+            found = _find_raw_login_data(value, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+    return ""
+
+
+def _raw_scalar_to_b64(value: Any) -> str:
+    encoded = _value_to_b64(value)
+    if not encoded:
+        return ""
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    return encoded if len(decoded) >= MIN_RAW_LOGIN_DATA_BYTES else ""
 
 
 def _value_to_b64(value: Any) -> str:

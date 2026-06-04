@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060403
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060404
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -708,7 +708,6 @@ from qzone_bridge.media import (
     source_name,
 )
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.native_video import native_video_candidate
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
     NewsItem,
@@ -789,6 +788,10 @@ selection_from_tool_args = _selection.selection_from_tool_args
 QzoneComment = _social.QzoneComment
 QzonePost = _social.QzonePost
 post_from_entry = _social.post_from_entry
+
+
+def _post_contains_video_media(post: PostPayload) -> bool:
+    return any(is_video_media(item) for item in [*post.media, *post.attachments])
 
 
 def _clean_nickname_fallback(value: Any, *, hostuin: int = 0) -> str:
@@ -3363,7 +3366,7 @@ class QzoneStablePlugin(Star):
     ) -> tuple[PostPayload, dict[str, Any]]:
         post = await self._prepare_video_sources(post)
         render_post: PostPayload | None = None
-        if getattr(self.settings, "native_video_publish", True) and native_video_candidate(post) is not None:
+        if getattr(self.settings, "native_video_publish", True) and _post_contains_video_media(post):
             render_post = await self._prepare_publish_payload(post)
             await self._maybe_bind_video_upload_credentials(event)
             payload = await self.controller.publish_post(
@@ -5334,6 +5337,7 @@ class QzoneStablePlugin(Star):
                 attempted = len(probe.get("attempted_actions") or [])
                 returned = ", ".join((probe.get("returned_actions") or [])[:5])
                 web_only = ", ".join((probe.get("web_credential_actions") or [])[:5])
+                client_key_only = ", ".join((probe.get("client_key_actions") or [])[:5])
                 suffix_parts = []
                 if attempted:
                     suffix_parts.append(f"已尝试 {attempted} 个 OneBot action/参数组合")
@@ -5341,11 +5345,15 @@ class QzoneStablePlugin(Star):
                     suffix_parts.append(f"有返回的 action：{returned}")
                 if web_only:
                     suffix_parts.append(f"其中仅返回 Cookie/CSRF 的 action：{web_only}")
+                if client_key_only:
+                    suffix_parts.append(f"其中仅返回 clientkey/keyIndex（Web 跳转登录材料，不是 A2）的 action：{client_key_only}")
                 suffix = "；" + "；".join(suffix_parts) if suffix_parts else ""
                 yield self._command_result(
                     event,
                     "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
                     "标准 OneBot get_credentials/get_cookies 通常只能提供 Qzone Cookie/CSRF，"
+                    "NapCat get_clientkey / LLBot forceFetchClientKey 返回的是 Web 跳转登录 clientkey，"
+                    "不能直接作为 QQ upload A2/vLoginData。"
                     "不足以驱动稳定的 video_qzone 移动上传发布。"
                     "请让协议端（NapCat/LLBot/其他 OneBot 实现均可）暴露返回 vLoginData/A2 的扩展 action，"
                     "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
