@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060505
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060506
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -3418,7 +3418,7 @@ class QzoneStablePlugin(Star):
                 raise QzoneParseError(
                     "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
                     "已阻止本次发布。请开启 native_video_publish，并通过 /qzone autovideoauth 或 /qzone videoauth "
-                    "绑定 QQ upload A2/vLoginData 后再发布。"
+                    "启用 Web Cookie H5 video+cover 直发或绑定 QQ upload A2/vLoginData 后再发布。"
                 )
             render_post = await self._prepare_publish_payload(post)
             await self._maybe_bind_video_upload_credentials(event)
@@ -5434,22 +5434,36 @@ class QzoneStablePlugin(Star):
                 if client_key_only:
                     suffix_parts.append(f"其中仅返回 clientkey/keyIndex（Web 跳转登录材料，不是 A2）的 action：{client_key_only}")
                 suffix = "；" + "；".join(suffix_parts) if suffix_parts else ""
+                try:
+                    status_payload = await self._status_with_recovery()
+                except QzoneBridgeError:
+                    status_payload = payload if isinstance(payload, dict) else {}
+                video_upload = status_payload.get("video_upload") if isinstance(status_payload, dict) else {}
+                if not isinstance(video_upload, dict):
+                    video_upload = {}
+                h5_ready = bool(
+                    video_upload.get("h5_publish_supported")
+                    or video_upload.get("h5_upload_available")
+                    or video_upload.get("web_cookie_configured")
+                )
+                if h5_ready:
+                    yield self._command_result(
+                        event,
+                        "OneBot 未返回 QQ upload A2/vLoginData；已改用当前 Qzone Web Cookie 的 H5 video+cover daemon 后台直发路径。"
+                        "该路径不会打开 QQ/QQNT 客户端，会先上传 video_qzone 视频，再上传 pic_qzone 视频封面，最后轮询最近动态验证同一 sVid；"
+                        "未验证到 feed 会报错，不会把封面图误报为视频发布成功。"
+                        f"{suffix}\n{format_status(status_payload)}",
+                    )
+                    return
                 yield self._command_result(
                     event,
-                    "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
-                    "标准 OneBot get_credentials/get_cookies 通常只能提供 Qzone Cookie/CSRF，"
-                    "get_clientkey / forceFetchClientKey 一类接口返回的是 Web 跳转登录 clientkey，"
-                    "不能直接作为 QQ upload A2/vLoginData。"
-                    "不足以驱动稳定的 video_qzone 移动上传发布。"
-                    "请让当前 OneBot 协议端暴露返回 vLoginData/A2 的扩展 action，"
-                    "例如 get_qzone_video_upload_credentials / get_video_upload_credentials，"
-                    "或 get_login_misc_data(key=a2/vLoginData)；"
-                    "NapCat、LLOneBot、LLBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可，"
-                    "字段支持 a2/a2_hex/a2_b64、vLoginData/vLoginDataHex/vLoginDataB64、Buffer/数字数组或原始二进制字符串。"
-                    "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
+                    "OneBot 未返回 QQ upload A2/vLoginData，且当前 daemon 也没有可用 Qzone Web Cookie/p_skey，"
+                    "因此不能启用 daemon 原生视频后台直发。请先使用 /qzone autobind 绑定 Cookie；"
+                    "如果协议端支持 A2/vLoginData，也可以继续使用 /qzone videoauth 手动绑定。"
                     f"{suffix}",
                 )
                 return
+
             payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
             logger.warning("qzone autovideoauth failed: %s", exc)

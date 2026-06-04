@@ -47,11 +47,17 @@ def format_status(status: dict) -> str:
         source = video_upload.get("source") or "-"
         updated_at = video_upload.get("updated_at") or "-"
         method = video_upload.get("method") or "-"
-        lines.append(f"- video_upload: {'ready' if video_upload.get('configured') else 'missing'}")
+        upload_ready = bool(video_upload.get("configured") or video_upload.get("h5_publish_supported"))
+        lines.append(f"- video_upload: {'ready' if upload_ready else 'missing'}")
         if video_upload.get("configured"):
             lines.append(f"- video_upload_source: {source}")
+        if video_upload.get("configured") or video_upload.get("h5_publish_supported") or video_upload.get("h5_upload_available"):
             lines.append(f"- video_upload_method: {method}")
             lines.append(f"- video_upload_updated: {updated_at}")
+            if "h5_upload_available" in video_upload:
+                lines.append(f"- h5_video_upload: {bool(video_upload.get('h5_upload_available'))}")
+            if "h5_publish_supported" in video_upload:
+                lines.append(f"- h5_video_publish: {bool(video_upload.get('h5_publish_supported'))}")
     if status.get("daemon_port"):
         lines.append(f"- endpoint: 127.0.0.1:{status['daemon_port']}")
     if status.get("daemon_pid"):

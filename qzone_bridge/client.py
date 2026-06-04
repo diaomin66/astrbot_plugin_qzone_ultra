@@ -17,18 +17,26 @@ import httpx
 from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .astrbot_logging import get_logger
 from .h5_video import (
+    QzoneH5VideoCoverUploadResult,
     QzoneH5VideoUploadResult,
+    build_h5_video_cover_control_payload,
     build_h5_video_control_payload,
     build_qzone_video_publish_payload,
+    encode_h5_video_cover_slice_multipart,
     encode_h5_video_slice_multipart,
     extract_h5_control_session,
+    extract_h5_video_cover_photo_id,
     extract_h5_video_vid,
+    h5_video_cover_control_url,
+    h5_video_cover_slice_url,
     h5_video_control_url,
     h5_video_format,
     h5_video_gtk,
     h5_video_slice_url,
     h5_video_token_data,
+    md5_file,
     qzone_h5_video_upload_available,
+    resolve_h5_cover_image_size,
     sha1_file,
     QZONE_H5_UPLOAD_ORIGIN,
 )
@@ -959,6 +967,7 @@ class QzoneClient:
         title: str = "",
         desc: str = "",
         play_time: int = 0,
+        upload_time: int | None = None,
         extend_info: dict[str, str] | None = None,
     ) -> QzoneH5VideoUploadResult:
         path = Path(video_path)
@@ -983,6 +992,7 @@ class QzoneClient:
             title=title or path.name,
             desc=desc,
             play_time=play_time,
+            upload_time=upload_time,
             video_format=h5_video_format(path),
             extend_info=extend_info,
         )
@@ -1083,6 +1093,153 @@ class QzoneClient:
             uploaded_bytes=offset,
             session=session,
             slice_size=slice_size,
+            control_response=control_response,
+            upload_responses=upload_responses,
+        )
+
+    async def upload_h5_video_cover(
+        self,
+        cover_path: str | Path,
+        *,
+        vid: str,
+        video_path: str | Path | None = None,
+        client_key: str = "",
+        video_size: int = 0,
+        duration_ms: int = 0,
+        desc: str = "",
+        upload_time: int | None = None,
+        width: int = 0,
+        height: int = 0,
+        extra_map_ext: dict[str, str] | None = None,
+        extra_params: dict[str, str] | None = None,
+    ) -> QzoneH5VideoCoverUploadResult:
+        path = Path(cover_path)
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        file_size = path.stat().st_size
+        if file_size <= 0:
+            raise QzoneParseError("视频封面文件为空，无法使用 Qzone H5 原生视频封面上传", detail={"path": str(path)})
+        vid = str(vid or "").strip()
+        if not vid:
+            raise QzoneParseError("Qzone H5 视频封面上传缺少 sVid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法使用 Qzone H5 原生视频封面上传")
+        if not qzone_h5_video_upload_available(self.session):
+            raise QzoneNeedsRebind("Cookie 缺少 p_skey，无法使用 Qzone H5 原生视频封面上传")
+
+        p_skey = h5_video_token_data(self.session)
+        h5_gtk = h5_video_gtk(self.session.cookies)
+        checksum = await asyncio.to_thread(md5_file, path)
+        width, height = await asyncio.to_thread(resolve_h5_cover_image_size, path, width, height)
+        control_payload = build_h5_video_cover_control_payload(
+            uin=self.login_uin,
+            p_skey=p_skey,
+            checksum=checksum,
+            file_size=file_size,
+            vid=vid,
+            client_key=client_key,
+            video_size=video_size,
+            duration_ms=duration_ms,
+            desc=desc,
+            cover_path=path,
+            width=width,
+            height=height,
+            upload_time=upload_time,
+            extra_map_ext=extra_map_ext,
+            extra_params=extra_params,
+        )
+        control_response = await self._request_json(
+            "POST",
+            h5_video_cover_control_url(checksum),
+            params={"g_tk": h5_gtk},
+            json_body=control_payload,
+            referer=QZONE_H5_UPLOAD_ORIGIN,
+            origin=QZONE_H5_UPLOAD_ORIGIN,
+            hostuin=self.login_uin,
+            attach_token=False,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        )
+        session, slice_size = extract_h5_control_session(control_response)
+        if not session:
+            raise QzoneRequestError("Qzone H5 视频封面上传控制响应缺少 session", detail=control_response)
+
+        upload_responses: list[dict[str, Any]] = []
+        photo_id = ""
+        offset = 0
+        seq = 1
+        with path.open("rb") as handle:
+            while offset < file_size:
+                chunk = handle.read(min(slice_size, file_size - offset))
+                if not chunk:
+                    break
+                end = offset + len(chunk)
+                payload: dict[str, Any] | None = None
+                response: httpx.Response | None = None
+                for index, data_content_type in enumerate(("application/octet-stream", None)):
+                    body, content_type = encode_h5_video_cover_slice_multipart(
+                        uin=self.login_uin,
+                        session=session,
+                        seq=seq,
+                        offset=offset,
+                        end=end,
+                        slice_size=slice_size,
+                        chunk=chunk,
+                        data_content_type=data_content_type,
+                    )
+                    response = await self._client.request(
+                        "POST",
+                        h5_video_cover_slice_url(),
+                        params={
+                            "seq": seq,
+                            "retry": index,
+                            "offset": offset,
+                            "end": end,
+                            "total": file_size,
+                            "type": "form",
+                            "g_tk": h5_gtk,
+                        },
+                        content=body,
+                        headers=self._headers(
+                            referer=QZONE_H5_UPLOAD_ORIGIN,
+                            origin=QZONE_H5_UPLOAD_ORIGIN,
+                            extra={"Content-Type": content_type},
+                        ),
+                        timeout=max(float(self.timeout or 0.0), H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS),
+                    )
+                    self._persist_cookie_response(response)
+                    if response.status_code >= 400:
+                        raise QzoneRequestError(
+                            f"Qzone H5 视频封面分片上传 HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            detail=self._response_detail(response),
+                        )
+                    parsed_payload = self._parse_response_payload(response.text.strip(), response)
+                    unwrapped_payload = unwrap_payload(parsed_payload)
+                    ret_code = self._payload_ret_code(parsed_payload)
+                    if ret_code == 0:
+                        ret_code = self._payload_ret_code(unwrapped_payload)
+                    if ret_code == -115 and data_content_type is not None:
+                        log.debug("qzone h5 cover slice rejected octet-stream blob; retrying without blob content-type")
+                        continue
+                    self._raise_payload_error(parsed_payload, response)
+                    self._raise_payload_error(unwrapped_payload, response)
+                    payload = unwrapped_payload if isinstance(unwrapped_payload, dict) else {"data": unwrapped_payload}
+                    break
+                assert response is not None
+                assert payload is not None
+                if not isinstance(payload, dict):
+                    payload = {"data": payload}
+                upload_responses.append(payload)
+                photo_id = extract_h5_video_cover_photo_id(payload) or photo_id
+                offset = end
+                seq += 1
+
+        return QzoneH5VideoCoverUploadResult(
+            checksum=checksum,
+            uploaded_bytes=offset,
+            session=session,
+            slice_size=slice_size,
+            photo_id=photo_id,
             control_response=control_response,
             upload_responses=upload_responses,
         )

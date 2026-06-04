@@ -317,23 +317,18 @@ class QzoneDaemonService:
         state = getattr(self, "state", None)
         return qzone_h5_video_upload_available(getattr(state, "session", None))
 
-    @staticmethod
-    def _experimental_h5_video_publish_enabled() -> bool:
-        value = str(os.environ.get("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH") or "").strip().lower()
-        return value in {"1", "true", "yes", "on"}
-
     def _video_upload_summary(self) -> dict[str, Any]:
         summary = self.state.video_upload.summary()
         h5_ready = self._h5_video_upload_configured()
         stable_ready = bool(summary.get("configured"))
         summary["web_cookie_configured"] = h5_ready
         summary["h5_upload_available"] = h5_ready
-        summary["h5_publish_supported"] = self._experimental_h5_video_publish_enabled()
+        summary["h5_publish_supported"] = h5_ready
         summary["configured"] = stable_ready
         if stable_ready:
             summary["method"] = "tencent_upload"
         elif h5_ready:
-            summary["method"] = "h5_slice_upload_only"
+            summary["method"] = "h5_video_cover_publish"
             if not summary.get("updated_at"):
                 summary["updated_at"] = self.state.session.updated_at
         else:
@@ -984,17 +979,32 @@ class QzoneDaemonService:
         upload_uin = getattr(getattr(self, "state", None), "session", SessionState()).uin
         client_key = f"{upload_uin}_{upload_time}"
 
-        if (
-            self._h5_video_upload_configured()
-            and not self._video_upload_credentials_configured()
-            and self._experimental_h5_video_publish_enabled()
-        ):
+        if self._h5_video_upload_configured() and not self._video_upload_credentials_configured():
             try:
+                cover = video_cover_media(video, self.store.root / "video_covers")
+                cover_path = _trusted_daemon_image_path(cover)
+                if cover_path is None:
+                    raise QzoneParseError(
+                        "daemon H5 视频后台直发无法生成可读取的视频封面，已停止发布",
+                        detail={"name": video.name or path.name},
+                    )
                 result = await self.client.upload_h5_video(
                     path,
                     title=video.name or path.name,
                     desc=content,
                     play_time=duration_ms,
+                    upload_time=upload_time,
+                    extend_info={"clientkey": client_key},
+                )
+                cover_result = await self.client.upload_h5_video_cover(
+                    cover_path,
+                    vid=result.vid,
+                    video_path=path,
+                    client_key=client_key,
+                    upload_time=upload_time,
+                    video_size=file_size,
+                    duration_ms=duration_ms,
+                    desc=content,
                 )
                 publish_result = await self.client.publish_video_mood(
                     content,
@@ -1013,9 +1023,14 @@ class QzoneDaemonService:
             verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
             if verified_feed is None:
                 raise QzoneRequestError(
-                    "QQ 空间 H5 视频上传/发布接口只返回了 sVid 或 richval 回显，但未在最近动态中验证到同一视频；"
-                    "H5 路径不是稳定的视频发布接口，已拒绝宣称发布成功",
-                    detail={"vid": result.vid, "client_key": client_key, "publish_result": publish_result},
+                    "QQ 空间 H5 视频上传/封面上传/发布接口已返回 sVid，但未在最近动态中验证到同一视频；"
+                    "已拒绝宣称发布成功",
+                    detail={
+                        "vid": result.vid,
+                        "client_key": client_key,
+                        "cover_upload": cover_result.to_dict(),
+                        "publish_result": publish_result,
+                    },
                 )
             return {
                 "fid": str(verified_feed.get("fid") or publish_result.get("tid") or publish_result.get("fid") or ""),
@@ -1025,12 +1040,14 @@ class QzoneDaemonService:
                 "status": "published_native_video",
                 "operation_status": "verified_feed_video",
                 "media_count": len(media),
-                "photo_count": 0,
+                "photo_count": 1,
                 "raw": {
-                    "method": "h5_slice_upload",
+                    "method": "h5_video_cover_publish",
                     "upload_result": result.to_dict(),
+                    "cover_upload_result": cover_result.to_dict(),
                     "publish_result": publish_result,
                     "video": video.to_dict(),
+                    "cover": cover.to_dict(),
                     "client_key": client_key,
                     "verified_feed": verified_feed,
                 },
@@ -1038,18 +1055,18 @@ class QzoneDaemonService:
 
         if not self._video_upload_credentials_configured():
             raise QzoneParseError(
-                "daemon 原生视频后台直发缺少 QQ upload A2/vLoginData 二进制登录材料；"
-                "已阻止视频封面替代发布，也不会打开 QQ/QQNT 客户端。"
-                "实测 Qzone H5 sliceUpload 只能稳定上传视频资源，Web publish_v6 会回显 richval 但不保证生成可见视频动态；"
-                "请让 OneBot 协议端提供可用的视频上传扩展 action，或使用 /qzone videoauth 手动绑定 QQ upload A2/vLoginData 材料",
+                "daemon 原生视频后台直发缺少可用登录材料：当前既没有 Web Cookie/p_skey 可走 H5 video+cover 直发，"
+                "也没有 QQ upload A2/vLoginData 可走 Tencent upload；已阻止视频封面替代发布，也不会打开 QQ/QQNT 客户端。"
+                "请先使用 /qzone autobind 绑定 Qzone Cookie，或使用 /qzone videoauth 绑定 QQ upload A2/vLoginData。",
                 detail={
                     "name": video.name or path.name,
                     "video_upload_configured": False,
                     "web_cookie_configured": self._h5_video_upload_configured(),
-                    "required": "QQ upload A2/vLoginData",
-                    "stable_method": "tencent_upload",
+                    "required": "Web Cookie/p_skey or QQ upload A2/vLoginData",
+                    "stable_method": "h5_video_cover_publish",
                 },
             )
+
         try:
             credentials = self._video_upload_credentials()
         except QzoneNativeVideoCredentialError as exc:

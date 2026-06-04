@@ -45,6 +45,55 @@ def test_h5_video_control_payload_uses_qzone_cookie_token() -> None:
     assert control["biz_req"]["extend_info"]["qz_video_format"] == "mp4"
 
 
+def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> None:
+    from qzone_bridge.h5_video import build_h5_video_cover_control_payload
+
+    payload = build_h5_video_cover_control_payload(
+        uin=3112333596,
+        p_skey="ps-key",
+        checksum="b" * 32,
+        file_size=4567,
+        vid="vid-h5",
+        client_key="3112333596_1780399990",
+        video_size=123456,
+        duration_ms=2345,
+        desc="hello",
+        cover_path="cover.jpg",
+        width=320,
+        height=180,
+        upload_time=1780399990,
+    )
+
+    control = payload["control_req"][0]
+    biz_req = control["biz_req"]
+    params = biz_req["stExtendInfo"]["mapParams"]
+    external = biz_req["stExternalMapExt"]
+    assert control["appid"] == "pic_qzone"
+    assert control["cmd"] == "FileUpload"
+    assert control["token"] == {"type": 4, "data": "ps-key", "appid": 5}
+    assert control["checksum"] == "b" * 32
+    assert control["check_type"] == 0
+    assert control["file_len"] == 4567
+    assert biz_req["sPicDesc"] == "hello"
+    assert biz_req["iAlbumTypeID"] == 7
+    assert biz_req["iUploadType"] == 2
+    assert biz_req["iBatchID"] == 1780399990
+    assert biz_req["iUploadTime"] == 1780399990
+    assert biz_req["iPicWidth"] == 320
+    assert biz_req["iPicHight"] == 180
+    assert biz_req["iDistinctUse"] == 0x37DD
+    assert biz_req["mapExt"]["mobile_fakefeeds_clientkey"] == "3112333596_1780399990"
+    assert params["vid"] == "vid-h5"
+    assert params["clientkey"] == "3112333596_1780399990"
+    assert params["raw_width"] == "320"
+    assert params["raw_height"] == "180"
+    assert params["raw_size"] == "4567"
+    assert external["is_client_upload_cover"] == "1"
+    assert external["is_pic_video_mix_feeds"] == "1"
+    assert external["mix_videoSize"] == "123456"
+    assert external["mix_time"] == "2345"
+
+
 def test_h5_video_slice_multipart_marks_blob_as_octet_stream_by_default() -> None:
     from qzone_bridge.h5_video import encode_h5_video_slice_multipart
 
@@ -182,6 +231,74 @@ def test_qzone_client_h5_video_upload_retries_without_blob_content_type_on_115(t
     assert slice_calls[1]["params"]["retry"] == 1
 
 
+def test_qzone_client_h5_video_cover_upload_posts_pic_qzone_control_and_slices(tmp_path: Path) -> None:
+    from PIL import Image
+
+    calls: list[dict[str, object]] = []
+
+    class _HTTP:
+        async def request(self, method: str, url: str, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            if "FileBatchControl" in url:
+                control = kwargs["json"]["control_req"][0]
+                biz_req = control["biz_req"]
+                assert control["appid"] == "pic_qzone"
+                assert control["cmd"] == "FileUpload"
+                assert control["token"]["data"] == "ps-key"
+                assert biz_req["stExtendInfo"]["mapParams"]["vid"] == "vid-h5"
+                assert biz_req["stExtendInfo"]["mapParams"]["clientkey"] == "3112333596_1780399990"
+                assert biz_req["stExternalMapExt"]["is_client_upload_cover"] == "1"
+                assert biz_req["stExternalMapExt"]["is_pic_video_mix_feeds"] == "1"
+                assert biz_req["stExternalMapExt"]["mix_videoSize"] == "123456"
+                assert biz_req["stExternalMapExt"]["mix_time"] == "2345"
+                assert biz_req["iPicWidth"] == 4
+                assert biz_req["iPicHight"] == 2
+                return _response(method, url, {"ret": 0, "data": {"session": "cover-sess", "slice_size": 4096}})
+            if url == "https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUpload":
+                content = kwargs["content"]
+                text = content.decode("latin1")
+                assert "pic_qzone" in text
+                assert 'name="cmd"' in text
+                assert "FileUpload" in text
+                assert 'name="biz_req.iUploadType"' in text
+                assert kwargs["headers"]["Origin"] == "https://h5.qzone.qq.com"
+                return _response(method, url, {"ret": 0, "data": {"lloc": "cover-photo"}})
+            raise AssertionError(url)
+
+    client = QzoneClient(
+        SessionState(
+            uin=3112333596,
+            cookies={"uin": "o3112333596", "p_skey": "ps-key", "skey": "s-key", "bkn": "12345"},
+        )
+    )
+    client._client = _HTTP()
+    cover = tmp_path / "cover.jpg"
+    Image.new("RGB", (4, 2), color=(255, 0, 0)).save(cover, format="JPEG")
+
+    result = asyncio.run(
+        client.upload_h5_video_cover(
+            cover,
+            vid="vid-h5",
+            client_key="3112333596_1780399990",
+            upload_time=1780399990,
+            video_size=123456,
+            duration_ms=2345,
+            desc="hello",
+        )
+    )
+
+    assert result.photo_id == "cover-photo"
+    assert result.uploaded_bytes == cover.stat().st_size
+    assert result.session == "cover-sess"
+    control_calls = [call for call in calls if "FileBatchControl" in str(call["url"])]
+    slice_calls = [call for call in calls if call["url"] == "https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUpload"]
+    assert len(control_calls) == 1
+    assert len(slice_calls) == 1
+    assert control_calls[0]["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
+    assert slice_calls[0]["timeout"] == H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS
+    assert all(call["params"]["g_tk"] == 12345 for call in calls)
+
+
 def test_qzone_client_publish_video_mood_uses_web_richval() -> None:
     captured: dict[str, object] = {}
 
@@ -216,7 +333,6 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
-    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(
         daemon_mod,
         "QzoneTencentVideoUploader",
@@ -246,6 +362,24 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
                 },
             )
 
+        async def upload_h5_video_cover(self, path, **kwargs):
+            captured["h5_cover_path"] = path
+            captured["h5_cover_kwargs"] = kwargs
+            return types.SimpleNamespace(
+                checksum="md5",
+                uploaded_bytes=3,
+                session="cover-sess",
+                slice_size=3,
+                photo_id="cover-photo",
+                to_dict=lambda: {
+                    "checksum": "md5",
+                    "uploaded_bytes": 3,
+                    "session": "cover-sess",
+                    "slice_size": 3,
+                    "photo_id": "cover-photo",
+                },
+            )
+
         async def publish_video_mood(self, content, **kwargs):
             captured["publish_content"] = content
             captured["publish_kwargs"] = kwargs
@@ -265,6 +399,13 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
 
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
     video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
 
     payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
@@ -272,9 +413,17 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     assert payload["native_video"] is True
     assert payload["status"] == "published_native_video"
     assert payload["vid"] == "vid-h5"
-    assert payload["raw"]["method"] == "h5_slice_upload"
+    assert payload["raw"]["method"] == "h5_video_cover_publish"
     assert captured["h5_upload_path"] == video_path
     assert captured["h5_upload_kwargs"]["play_time"] == 2345
+    assert captured["h5_upload_kwargs"]["upload_time"]
+    assert captured["h5_upload_kwargs"]["extend_info"]["clientkey"]
+    assert captured["h5_cover_path"] == cover_path
+    assert captured["h5_cover_kwargs"]["vid"] == "vid-h5"
+    assert captured["h5_cover_kwargs"]["video_path"] == video_path
+    assert captured["h5_cover_kwargs"]["video_size"] == 5
+    assert captured["h5_cover_kwargs"]["duration_ms"] == 2345
+    assert captured["h5_cover_kwargs"]["client_key"] == captured["h5_upload_kwargs"]["extend_info"]["clientkey"]
     assert captured["publish_content"] == "hello"
     assert captured["publish_kwargs"] == {"vid": "vid-h5", "sync_weibo": False}
 
@@ -289,7 +438,6 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
-    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
     captured: dict[str, object] = {}
 
@@ -303,6 +451,11 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
                 vid="vid-h5-noext",
                 to_dict=lambda: {"vid": "vid-h5-noext"},
             )
+
+        async def upload_h5_video_cover(self, path, **kwargs):
+            captured["h5_cover_path"] = path
+            captured["h5_cover_kwargs"] = kwargs
+            return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
 
         async def publish_video_mood(self, content, **kwargs):
             captured["publish_content"] = content
@@ -323,6 +476,13 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
 
     video_path = tmp_path / "videoseg_no_extension"
     video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
     video = PostMedia(
         kind="video",
         source=str(video_path),
@@ -338,6 +498,7 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     assert payload["status"] == "published_native_video"
     assert payload["vid"] == "vid-h5-noext"
     assert captured["h5_upload_path"] == video_path
+    assert captured["h5_cover_path"] == cover_path
     assert captured["h5_upload_kwargs"]["play_time"] == 2345
     assert captured["publish_content"] == ""
 
@@ -346,13 +507,13 @@ def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from qzone_bridge import daemon as daemon_mod
     from qzone_bridge.daemon import QzoneDaemonService
     from qzone_bridge.errors import QzoneRequestError
     from qzone_bridge.media import PostMedia
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
-    monkeypatch.setenv("QZONE_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
 
     class _Client:
         timeout = 1.5
@@ -362,6 +523,9 @@ def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
                 vid="vid-h5-feedinfo",
                 to_dict=lambda: {"vid": "vid-h5-feedinfo"},
             )
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
 
         async def publish_video_mood(self, *_args, **_kwargs):
             return {
@@ -384,9 +548,16 @@ def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
 
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
     video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
 
     with pytest.raises(QzoneRequestError) as error:
         asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
-    assert "richval" in str(error.value)
+    assert "sVid" in str(error.value)
