@@ -14,6 +14,7 @@
 - 修复：Linux CI 上 `.3gp` 被 `mimetypes` 识别为 `audio/3gpp` 时仍归一化为 QQ 空间视频媒体。
 - 变更：完全移除运行时 QQ/QQNT 客户端视频发布 handoff；单个本地视频只交给 daemon 后台发布链路处理，缺少 QQ upload 登录材料时阻止发布并提示绑定。
 - 新增：`/qzone videoauth` 与 `/qzone autovideoauth` 可把 QQ upload 二进制登录材料写入 daemon 状态，发布前也会尝试从 OneBot 自动获取并绑定。
+- 修复：`/qzone autovideoauth` 改为面向通用 OneBot 协议端探测视频上传材料，新增 `get_login_misc_data key=a2/vLoginData` 等通用扩展 action，并兼容 LLOneBot `llonebot_debug -> nodeIKernelLoginService/getLoginMiscData`；NapCat/LLOneBot/其他 OneBot 实现返回的 Cookie/CSRF 或 `clientkey/keyIndex` 仍会被拒绝当作 A2。
 - 测试：新增客户端 handoff 移除、daemon 原始视频接收、OneBot 上传材料自动绑定回归用例。
 
 ## v0.6.8 - 2026-06-01

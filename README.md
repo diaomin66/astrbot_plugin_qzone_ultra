@@ -160,6 +160,8 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 
 `native_video_publish` 开启后，单个本地视频会优先走 daemon 原生视频后台路径：稳定路径是 QQ upload / `video_qzone` 移动上传协议，插件会通过 `/qzone videoauth`、`/qzone autovideoauth` 或进程环境变量 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64` 获取 vLoginData/A2 类二进制登录材料，再上传视频、上传封面并轮询最近动态验证同一 `sVid`。实测 Qzone H5 `sliceUpload/FileUploadVideo` 能稳定上传视频资源，但 Web `emotion_cgi_publish_v6` + `richval` 可能只回显提交内容而不生成可见视频动态；因此默认不再把 H5 Cookie/`p_skey` 当作稳定视频直发凭据。未验证到 feed 时会阻止发布并报错，不再回退为视频封面图，也不再唤起 QQ/QQNT 客户端确认窗口。关闭 `native_video_publish` 后才会明确按视频封面图发布。
 
+`/qzone autovideoauth` 面向 OneBot 协议端能力探测，不绑定单一实现：会优先尝试通用扩展 action（例如 `get_qzone_video_upload_credentials`、`get_video_upload_credentials`、`get_login_misc_data key=a2/vLoginData` 等），也会兼容 LLOneBot 的 `llonebot_debug` 透传 `nodeIKernelLoginService/getLoginMiscData`。NapCat / LLOneBot / Shamrock 等 OneBot 实现只要暴露返回 vLoginData/A2 二进制材料的 action 都可被绑定；仅返回 Cookie/CSRF 或 `clientkey/keyIndex` 会被诊断为 Web 登录材料并拒绝当作 A2，避免把不可见视频或 H5 richval 回显误报为发布成功。
+
 完整配置见 `_conf_schema.json`。Cron 表达式格式为 `分 时 日 月 周`，例如 `30 8 * * *` 表示每天 8:30。
 
 ## 数据目录

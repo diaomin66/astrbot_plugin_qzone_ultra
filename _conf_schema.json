@@ -15,7 +15,7 @@
     "description": "优先使用 daemon 原生视频后台直发",
     "type": "bool",
     "default": true,
-    "hint": "开启后，单个本地视频说说会优先交给本地 daemon 通过 QQ upload/video_qzone 移动上传协议后台直发；需要 OneBot 协议端扩展 action 或 /qzone videoauth 提供 vLoginData/A2 二进制登录材料。实测 Qzone H5 sliceUpload 只能稳定上传资源，Web publish_v6 可能只回显 richval 而不生成可见视频动态，因此默认不再把 H5 Cookie/p_skey 当作稳定直发凭据。未验证到 feed 时阻止发布，不再把视频帧当图片发出，也不再打开 QQ/QQNT 客户端。关闭后才按视频封面图发布。"
+    "hint": "开启后，单个本地视频说说会优先交给本地 daemon 通过 QQ upload/video_qzone 移动上传协议后台直发；需要 OneBot 协议端通用扩展 action（如 get_qzone_video_upload_credentials、get_video_upload_credentials、get_login_misc_data key=a2/vLoginData）或 /qzone videoauth 提供 vLoginData/A2 二进制登录材料。NapCat/LLOneBot/Shamrock 等实现只要按 OneBot action 返回该材料即可。实测 Qzone H5 sliceUpload 只能稳定上传资源，Web publish_v6 可能只回显 richval 而不生成可见视频动态，因此默认不再把 H5 Cookie/p_skey 当作稳定直发凭据。未验证到 feed 时阻止发布，不再把视频帧当图片发出，也不再打开 QQ/QQNT 客户端。关闭后才按视频封面图发布。"
   },
   "llm": {
     "description": "大模型配置",

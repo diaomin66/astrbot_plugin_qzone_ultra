@@ -5352,10 +5352,13 @@ class QzoneStablePlugin(Star):
                     event,
                     "OneBot 没有返回 QQ upload 视频上传登录材料（vLoginData/A2 类二进制材料）；"
                     "标准 OneBot get_credentials/get_cookies 通常只能提供 Qzone Cookie/CSRF，"
-                    "NapCat get_clientkey / LLBot forceFetchClientKey 返回的是 Web 跳转登录 clientkey，"
+                    "get_clientkey / forceFetchClientKey 一类接口返回的是 Web 跳转登录 clientkey，"
                     "不能直接作为 QQ upload A2/vLoginData。"
                     "不足以驱动稳定的 video_qzone 移动上传发布。"
-                    "请让协议端（NapCat/LLBot/其他 OneBot 实现均可）暴露返回 vLoginData/A2 的扩展 action，"
+                    "请让当前 OneBot 协议端暴露返回 vLoginData/A2 的扩展 action，"
+                    "例如 get_qzone_video_upload_credentials / get_video_upload_credentials，"
+                    "或 get_login_misc_data(key=a2/vLoginData)；"
+                    "NapCat、LLOneBot、Shamrock 等实现只要按 OneBot action 返回该二进制材料即可。"
                     "或使用 /qzone videoauth 手动绑定；daemon 不会打开 QQ/QQNT 客户端，也不会把 H5 richval 回显当作发布成功。"
                     f"{suffix}",
                 )

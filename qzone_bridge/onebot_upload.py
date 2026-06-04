@@ -29,17 +29,62 @@ VIDEO_UPLOAD_CREDENTIAL_ACTIONS = (
     "get_qzone_upload_login_data",
     "get_ntqq_login_data",
     "get_login_data",
+    "get_login_info",
     "get_credentials",
     "get_cookies",
     "get_csrf_token",
 )
-CLIENT_KEY_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
+LOGIN_MISC_DATA_KEYS = (
+    "a2",
+    "A2",
+    "vLoginData",
+    "v_login_data",
+    "loginData",
+    "login_data",
+    "uploadLoginData",
+    "qzoneUploadLoginData",
+)
+ONEBOT_LOGIN_MISC_ACTIONS = (
+    "get_login_misc_data",
+    "get_ntqq_login_misc_data",
+    "get_qq_login_misc_data",
+    "get_qzone_login_misc_data",
+)
+LOGIN_MISC_ACTION_PARAM_VARIANTS: tuple[dict[str, str], ...] = tuple(
+    params
+    for key in LOGIN_MISC_DATA_KEYS
+    for params in (
+        {"key": key},
+        {"name": key},
+        {"field": key},
+    )
+)
+PROTOCOL_ENDPOINT_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
+    *(
+        (action, params)
+        for action in ONEBOT_LOGIN_MISC_ACTIONS
+        for params in LOGIN_MISC_ACTION_PARAM_VARIANTS
+    ),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Bytes", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQQUploadData", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQzoneUploadData", "args": []}),
+    ("llonebot_debug", {"apiClass": "pmhq", "method": "call", "args": ["getSelfInfo", []]}),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "invoke",
+                "args": ["nodeIKernelLoginService/getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
     ("get_clientkey", {}),
     ("get_client_key", {}),
     ("get_ntqq_clientkey", {}),
     ("get_ntqq_client_key", {}),
-    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2", "args": []}),
-    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Bytes", "args": []}),
     ("llonebot_debug", {"apiClass": "ntUserApi", "method": "forceFetchClientKey", "args": []}),
     (
         "llonebot_debug",
@@ -104,7 +149,14 @@ CLIENT_KEY_KEYS = {
     "keyindex",
     "keyIndex",
 }
-RAW_LOGIN_DATA_METHOD_HINTS = {"geta2", "geta2bytes", "getqquploaddata", "getqzoneuploaddata"}
+RAW_LOGIN_DATA_METHOD_HINTS = {
+    "geta2",
+    "geta2bytes",
+    "getqquploaddata",
+    "getqzoneuploaddata",
+    "getloginmiscdata",
+    "nodeikernelloginservicegetloginmiscdata",
+}
 RAW_LOGIN_DATA_ACTION_HINTS = {
     "getqzonevideouploadcredentials",
     "getvideouploadcredentials",
@@ -121,6 +173,13 @@ RAW_LOGIN_DATA_ACTION_HINTS = {
     "getqzoneuploadlogindata",
     "getntqqlogindata",
     "getlogindata",
+    "getloginmiscdata",
+    "getntqqloginmiscdata",
+    "getqqloginmiscdata",
+    "getqzoneloginmiscdata",
+    "getqquploada2",
+    "getqzoneuploada2",
+    "getvideouploada2",
 }
 RAW_LOGIN_DATA_WRAPPER_KEYS = WRAPPER_KEYS + ("value", "ticket", "buffer")
 MIN_RAW_LOGIN_DATA_BYTES = 8
@@ -217,7 +276,7 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "aiocqhttp")
                 web_only.append(action)
             if _payload_has_client_key(payload):
                 client_key_only.append(action)
-    for action, params in CLIENT_KEY_ACTION_ATTEMPTS:
+    for action, params in PROTOCOL_ENDPOINT_ACTION_ATTEMPTS:
         attempted.append(_action_label(action, params))
         try:
             payload = await asyncio.wait_for(
@@ -271,8 +330,19 @@ def _video_upload_action_param_variants() -> tuple[dict[str, Any], ...]:
 def _action_label(action: str, params: dict[str, Any]) -> str:
     if not params:
         return action
-    key, value = next(iter(params.items()))
-    return f"{action}:{key}={value}"
+    parts = [f"{key}={_safe_label_value(value)}" for key, value in sorted(params.items())]
+    return f"{action}:{','.join(parts)}"
+
+
+def _safe_label_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{key}:{_safe_label_value(val)}" for key, val in sorted(value.items())) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_safe_label_value(item) for item in value) + "]"
+    text = str(value or "")
+    if len(text) > 80:
+        return text[:77] + "..."
+    return text
 
 
 def _unique(values: tuple[str, ...] | list[str]) -> list[str]:
@@ -336,22 +406,30 @@ def _find_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None =
         return None
     _seen.add(obj_id)
 
+    normalized_login_data_keys = {_normalize_key(item) for item in LOGIN_DATA_KEYS}
+    normalized_login_key_keys = {_normalize_key(item) for item in LOGIN_KEY_KEYS}
+    normalized_token_type_keys = {_normalize_key(item) for item in TOKEN_TYPE_KEYS}
+    normalized_token_appid_keys = {_normalize_key(item) for item in TOKEN_APPID_KEYS}
+    normalized_token_wt_appid_keys = {_normalize_key(item) for item in TOKEN_WT_APPID_KEYS}
+    normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    normalized_web_keys = {_normalize_key(key) for key in WEB_CREDENTIAL_KEYS}
+
     result: dict[str, Any] = {}
     for key, value in payload.items():
         normalized = _normalize_key(key)
-        if normalized in {_normalize_key(item) for item in LOGIN_DATA_KEYS}:
+        if normalized in normalized_login_data_keys:
             encoded = _value_to_b64(value)
             if encoded:
                 result["login_data_b64"] = encoded
-        elif normalized in {_normalize_key(item) for item in LOGIN_KEY_KEYS}:
+        elif normalized in normalized_login_key_keys:
             encoded = _value_to_b64(value)
             if encoded:
                 result["login_key_b64"] = encoded
-        elif normalized in {_normalize_key(item) for item in TOKEN_TYPE_KEYS}:
+        elif normalized in normalized_token_type_keys:
             result["token_type"] = value
-        elif normalized in {_normalize_key(item) for item in TOKEN_APPID_KEYS}:
+        elif normalized in normalized_token_appid_keys:
             result["token_appid"] = value
-        elif normalized in {_normalize_key(item) for item in TOKEN_WT_APPID_KEYS}:
+        elif normalized in normalized_token_wt_appid_keys:
             result["token_wt_appid"] = value
     if result.get("login_data_b64"):
         return result
@@ -361,7 +439,9 @@ def _find_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None =
             found = _find_credentials(payload.get(key), _depth=_depth + 1, _seen=_seen)
             if found:
                 return found
-    for value in payload.values():
+    for key, value in payload.items():
+        if _normalize_key(key) in normalized_client_keys or _normalize_key(key) in normalized_web_keys:
+            continue
         if isinstance(value, (dict, list, tuple, str, bytes)):
             found = _find_credentials(value, _depth=_depth + 1, _seen=_seen)
             if found:
@@ -459,6 +539,8 @@ def _action_may_return_raw_login_data(action: str, params: dict[str, Any] | None
 
 
 def _extract_raw_login_data_payload(payload: Any, *, source: str = "aiocqhttp") -> OneBotVideoUploadCredentials | None:
+    if _payload_has_client_key(payload):
+        return None
     encoded = _find_raw_login_data(payload)
     if not encoded:
         return None
