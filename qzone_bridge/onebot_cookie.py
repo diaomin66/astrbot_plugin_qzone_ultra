@@ -11,7 +11,37 @@ from .parser import cookie_header, normalize_cookie_fields, normalize_uin, parse
 
 COOKIE_ACTIONS = ("get_cookies", "get_credentials")
 LOGIN_INFO_ACTIONS = ("get_login_info",)
-ONEBOT_ACTION_CALLER_ATTRS = ("call_action", "call_api", "request", "call")
+ONEBOT_ACTION_CALLER_ATTRS = (
+    "call_action",
+    "call_api",
+    "request",
+    "call",
+    "send_api",
+    "send_action",
+    "request_api",
+    "api_call",
+    "callAction",
+    "callApi",
+    "sendAction",
+    "sendApi",
+    "requestAction",
+    "requestApi",
+)
+ONEBOT_ACTION_OWNER_ATTRS = (
+    "api",
+    "client",
+    "bot",
+    "onebot",
+    "cqhttp",
+    "api_client",
+    "adapter",
+    "platform",
+    "protocol",
+    "connection",
+    "websocket",
+    "ws",
+    "http",
+)
 COOKIE_DOMAIN_FALLBACKS = ("user.qzone.qq.com", "qzone.qq.com", "h5.qzone.qq.com", "mobile.qzone.qq.com")
 COOKIE_VALUE_KEYS = (
     "cookies",
@@ -333,14 +363,7 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
             return await result
         return result
 
-    callers: list[Any] = []
-    for owner in (bot, getattr(bot, "api", None)):
-        if owner is None:
-            continue
-        for attr in ONEBOT_ACTION_CALLER_ATTRS:
-            caller = getattr(owner, attr, None)
-            if callable(caller):
-                callers.append(caller)
+    callers = list(iter_onebot_action_callers(bot))
     if not callers:
         raise AttributeError("OneBot client does not expose a supported action caller")
 
@@ -359,11 +382,49 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
     raise AttributeError("OneBot client does not expose a supported action caller")
 
 
+def iter_onebot_action_callers(bot: Any) -> tuple[Any, ...]:
+    """Return callable API dispatchers from common OneBot protocol-client wrappers."""
+
+    callers: list[Any] = []
+    seen_owners: set[int] = set()
+    seen_callers: set[int] = set()
+    owners: list[Any] = [bot]
+    index = 0
+    while index < len(owners):
+        owner = owners[index]
+        index += 1
+        if owner is None:
+            continue
+        owner_id = id(owner)
+        if owner_id in seen_owners:
+            continue
+        seen_owners.add(owner_id)
+        for attr in ONEBOT_ACTION_CALLER_ATTRS:
+            try:
+                caller = getattr(owner, attr, None)
+            except Exception:
+                caller = None
+            if callable(caller):
+                caller_id = id(caller)
+                if caller_id not in seen_callers:
+                    seen_callers.add(caller_id)
+                    callers.append(caller)
+        for attr in ONEBOT_ACTION_OWNER_ATTRS:
+            try:
+                nested = getattr(owner, attr, None)
+            except Exception:
+                nested = None
+            if nested is not None and id(nested) not in seen_owners:
+                owners.append(nested)
+    return tuple(callers)
+
+
 def _invoke_onebot_action_callable(call_action: Any, action: str, params: dict[str, Any]) -> Any:
     """Invoke OneBot client callables across common protocol-end wrappers."""
 
     attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     if action:
+        envelope_params = dict(params)
         attempts.extend(
             [
                 ((action,), dict(params)),
@@ -371,6 +432,11 @@ def _invoke_onebot_action_callable(call_action: Any, action: str, params: dict[s
                 ((action, params), {}),
                 ((action,), {"params": params}),
                 ((), {"action": action, "params": params}),
+                (({"action": action, "params": envelope_params},), {}),
+                (({"action": action, "data": envelope_params},), {}),
+                (({"action": action, "payload": envelope_params},), {}),
+                (({"api": action, "params": envelope_params},), {}),
+                (({"api": action, "data": envelope_params},), {}),
                 ((action,), {"data": params}),
                 ((), {"action": action, "data": params}),
                 ((action,), {"payload": params}),

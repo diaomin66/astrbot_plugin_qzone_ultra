@@ -3965,6 +3965,81 @@ def test_onebot_call_action_supports_generic_request_data_wrapper() -> None:
     assert calls == [("get_msg", {"message_id": 123456})]
 
 
+def test_onebot_call_action_supports_single_envelope_protocol_clients() -> None:
+    from qzone_bridge.onebot_cookie import call_onebot_action
+
+    calls: list[dict[str, object]] = []
+
+    class _Bot:
+        async def request(self, payload: dict[str, object]):
+            calls.append(payload)
+            return {"ok": True, "payload": payload}
+
+    result = asyncio.run(call_onebot_action(_Bot(), "get_msg", message_id=123456))
+
+    assert result == {"ok": True, "payload": {"action": "get_msg", "params": {"message_id": 123456}}}
+    assert calls == [{"action": "get_msg", "params": {"message_id": 123456}}]
+
+
+def test_onebot_call_action_supports_send_api_alias() -> None:
+    from qzone_bridge.onebot_cookie import call_onebot_action
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Bot:
+        async def send_api(self, action: str, params: dict[str, object]):
+            calls.append((action, dict(params)))
+            return {"ok": True, "params": params}
+
+    result = asyncio.run(call_onebot_action(_Bot(), "get_msg", message_id=123456))
+
+    assert result == {"ok": True, "params": {"message_id": 123456}}
+    assert calls == [("get_msg", {"message_id": 123456})]
+
+
+def test_onebot_video_upload_probe_accepts_generic_envelope_extension_action() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"generic-envelope-a2"
+    calls: list[dict[str, object]] = []
+
+    class _Bot:
+        async def request(self, payload: dict[str, object]):
+            calls.append(payload)
+            if payload == {"action": "get_qzone_video_upload_credentials", "params": {"domain": "qzone.qq.com"}}:
+                return {"data": {"login_data_b64": base64.b64encode(raw_a2).decode("ascii")}}
+            raise RuntimeError("unsupported action")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="onebot"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "onebot:get_qzone_video_upload_credentials"
+    assert calls[0] == {"action": "get_qzone_video_upload_credentials", "params": {"domain": "qzone.qq.com"}}
+
+
+def test_capture_onebot_client_from_context_supports_llbot_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    bot = types.SimpleNamespace(call_api=lambda action, params=None: None)
+    seen: list[str] = []
+
+    class _Context:
+        def get_platform(self, platform_type: str):
+            seen.append(platform_type)
+            if platform_type == "llbot":
+                return types.SimpleNamespace(bot=bot)
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._context = _Context()
+    plugin._onebot_client = None
+
+    assert plugin._capture_onebot_client_from_context() is bot
+    assert plugin._onebot_client is bot
+    assert "llbot" in seen
+
+
 def test_plugin_publish_uses_cover_payload_when_native_video_disabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

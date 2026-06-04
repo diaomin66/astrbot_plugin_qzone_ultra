@@ -717,7 +717,7 @@ from qzone_bridge.news import (
     merge_news_items,
     normalize_news_scopes,
 )
-from qzone_bridge.onebot_cookie import fetch_cookie_text
+from qzone_bridge.onebot_cookie import ONEBOT_ACTION_CALLER_ATTRS, fetch_cookie_text, iter_onebot_action_callers
 from qzone_bridge.onebot_upload import probe_video_upload_credentials
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
@@ -1818,19 +1818,12 @@ class QzoneStablePlugin(Star):
 
     @staticmethod
     def _iter_onebot_action_callers(bot: Any) -> list[Any]:
-        callers: list[Any] = []
-        for owner in (bot, getattr(bot, "api", None)):
-            if owner is None:
-                continue
-            for attr in ("call_action", "call_api", "request", "call"):
-                caller = getattr(owner, attr, None)
-                if callable(caller):
-                    callers.append(caller)
-        return callers
+        return list(iter_onebot_action_callers(bot))
 
     async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
         attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         if action:
+            envelope_kwargs = dict(kwargs)
             attempts.extend(
                 [
                     ((action,), dict(kwargs)),
@@ -1838,6 +1831,11 @@ class QzoneStablePlugin(Star):
                     ((action, kwargs), {}),
                     ((action,), {"params": kwargs}),
                     ((), {"action": action, "params": kwargs}),
+                    (({"action": action, "params": envelope_kwargs},), {}),
+                    (({"action": action, "data": envelope_kwargs},), {}),
+                    (({"action": action, "payload": envelope_kwargs},), {}),
+                    (({"api": action, "params": envelope_kwargs},), {}),
+                    (({"api": action, "data": envelope_kwargs},), {}),
                     ((action,), {"data": kwargs}),
                     ((), {"action": action, "data": kwargs}),
                     ((action,), {"payload": kwargs}),
@@ -4182,20 +4180,17 @@ class QzoneStablePlugin(Star):
         if candidate is None:
             return False
         for action in (
-            "call_action",
-            "call_api",
+            *ONEBOT_ACTION_CALLER_ATTRS,
             "get_msg",
             "send_group_msg",
             "send_private_msg",
             "get_group_file_url",
             "get_private_file_url",
-            "request",
-            "call",
         ):
             if callable(getattr(candidate, action, None)):
                 return True
         api = getattr(candidate, "api", None)
-        return any(callable(getattr(api, action, None)) for action in ("call_action", "call_api", "request", "call"))
+        return any(callable(getattr(api, action, None)) for action in ONEBOT_ACTION_CALLER_ATTRS)
 
     @classmethod
     def _extract_onebot_client(cls, owner: Any) -> Any | None:
@@ -4235,6 +4230,7 @@ class QzoneStablePlugin(Star):
                 "go-cqhttp",
                 "gocqhttp",
                 "napcat",
+                "llbot",
                 "llonebot",
                 "lagrange",
                 "shamrock",
@@ -4256,12 +4252,14 @@ class QzoneStablePlugin(Star):
                             platform_name == "aiocqhttp"
                             or "onebot" in platform_name
                             or "napcat" in platform_name
+                            or "llbot" in platform_name
                             or "llonebot" in platform_name
                             or "lagrange" in platform_name
                             or "shamrock" in platform_name
                             or platform_type == "aiocqhttp"
                             or "onebot" in platform_type
                             or "napcat" in platform_type
+                            or "llbot" in platform_type
                             or "llonebot" in platform_type
                             or "lagrange" in platform_type
                             or "shamrock" in platform_type

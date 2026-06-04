@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: support generic OneBot protocol dispatchers for video auth probing, including `send_api`/`send_action`/`request_api`/`api_call`, nested protocol client wrappers, single `{"action": "...", "params": {...}}` envelopes, and the `llbot` platform alias.
 - fix: generalize OneBot video auth probing beyond aiocqhttp/NapCat by defaulting the source to `onebot`, trying leading-underscore extension actions, and supporting `request`/`call` wrappers with `params`/`data`/`payload`.
 
 ## 未发布
