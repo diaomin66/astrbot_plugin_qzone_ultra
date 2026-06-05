@@ -3587,6 +3587,117 @@ def test_plugin_video_upload_auto_bind_defaults_to_onebot_source(
     assert captured["bind_kwargs"]["source"] == "onebot:_get_login_misc_data"
 
 
+def test_autovideoauth_binds_cookie_when_a2_missing_but_h5_cookie_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    bot = object()
+    captured: dict[str, object] = {"status_calls": 0, "cookie_bound": False}
+
+    ready_status = {
+        "daemon_state": "ready",
+        "login_uin": 12345,
+        "cookie_count": 4,
+        "needs_rebind": False,
+        "video_upload": {
+            "configured": False,
+            "method": "h5_video_cover_publish",
+            "h5_upload_available": True,
+            "h5_publish_supported": True,
+            "web_cookie_configured": True,
+        },
+    }
+
+    class _Probe:
+        credentials = None
+
+        def public_detail(self):
+            return {
+                "credentials_found": False,
+                "attempted_actions": ["get_credentials", "get_cookies"],
+                "returned_actions": ["get_credentials", "get_cookies"],
+                "web_credential_actions": ["get_credentials", "get_cookies"],
+                "client_key_actions": [],
+            }
+
+    async def fake_probe(client, *, source="onebot"):
+        captured["probe_client"] = client
+        captured["probe_source"] = source
+        return _Probe()
+
+    async def fake_fetch_cookie_text(client, *, domain):
+        captured["cookie_client"] = client
+        captured["cookie_domain"] = domain
+        return "uin=o12345; p_uin=o12345; p_skey=ps-key; skey=s-key"
+
+    class _Controller:
+        async def get_status(self, **kwargs):
+            captured["status_calls"] += 1
+            captured["last_status_kwargs"] = kwargs
+            if not captured["cookie_bound"]:
+                return {
+                    "daemon_state": "needs_rebind",
+                    "cookie_count": 0,
+                    "needs_rebind": True,
+                    "video_upload": {"configured": False},
+                }
+            return dict(ready_status)
+
+        async def bind_cookie_local(self, cookie_text, *, uin=0, source="manual"):
+            captured["bound_cookie_text"] = cookie_text
+            captured["bound_uin"] = uin
+            captured["bound_source"] = source
+            captured["cookie_bound"] = True
+            return dict(ready_status)
+
+    class _Event:
+        def is_admin(self):
+            return True
+
+        def plain_result(self, text):
+            return text
+
+        def stop_event(self):
+            captured["stopped"] = True
+
+    event = _Event()
+    event.bot = bot
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        admin_uins=set(),
+        auto_bind_cookie=False,
+        cookie_domain="user.qzone.qq.com",
+    )
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._context = None
+    plugin._cookie_lock = None
+    plugin._video_upload_lock = None
+    plugin._schedule_publish_render_asset_preload = lambda *args, **kwargs: None
+
+    async def fake_status_with_recovery():
+        return await plugin.controller.get_status()
+
+    plugin._status_with_recovery = fake_status_with_recovery
+    monkeypatch.setattr(main, "probe_video_upload_credentials", fake_probe)
+    monkeypatch.setattr(main, "fetch_cookie_text", fake_fetch_cookie_text)
+
+    async def collect_results():
+        return [item async for item in plugin.qzone_autovideoauth(event)]
+
+    results = asyncio.run(collect_results())
+
+    assert len(results) == 1
+    assert "已改用当前 Qzone Web Cookie 的 H5 video+cover daemon 后台直发路径" in results[0]
+    assert "video_upload_method: h5_video_cover_publish" in results[0]
+    assert "不能启用 daemon 原生视频后台直发" not in results[0]
+    assert captured["cookie_client"] is bot
+    assert captured["probe_client"] is bot
+    assert captured["bound_uin"] == 12345
+    assert captured["bound_source"] == "onebot"
+
+
 def test_onebot_video_upload_credentials_ignore_web_cookie_tokens() -> None:
     from qzone_bridge.onebot_upload import extract_video_upload_credentials
 

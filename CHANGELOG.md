@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: make `/qzone autovideoauth` bind Qzone Web Cookie/p_skey when OneBot only returns Cookie/CSRF, so the daemon H5 video+cover path becomes ready without requiring QQ upload A2/vLoginData.
 - fix: accept more OneBot protocol-end A2/vLoginData shapes, including hex/base64 alias fields, targeted NTQQ raw binary strings, and LLOneBot `llonebot_debug` PMHQ `httpSend` login-misc forwarding.
 - fix: block video posts when `native_video_publish` is disabled so video attachments can no longer be reported as successful cover/rendered-image publishes.
 - fix: support generic OneBot protocol dispatchers for video auth probing, including `send_api`/`send_action`/`request_api`/`api_call`, nested protocol client wrappers, single `{"action": "...", "params": {...}}` envelopes, and the `llbot` platform alias.

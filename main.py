@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060506
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060507
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -4379,6 +4379,26 @@ class QzoneStablePlugin(Star):
         self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
         return payload
 
+    async def _ensure_cookie_ready_for_video_auth(self, event: AstrMessageEvent | None = None) -> dict[str, Any] | None:
+        """Ensure Web Cookie/p_skey is ready when video auth falls back to H5 publishing.
+
+        `/qzone autovideoauth` is an explicit admin action to make daemon video
+        publishing usable. Even when `auto_bind_cookie` is disabled for passive
+        startup, this command should bind Qzone Cookie from OneBot if the daemon
+        has no usable Web session; otherwise OneBot endpoints that only expose
+        Cookie/CSRF would be reported as unusable despite being sufficient for
+        the H5 video+cover daemon path.
+        """
+
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError:
+            status = {}
+        if status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            self._schedule_publish_render_asset_preload("video auth cookie ready", event=event, status=status)
+            return status
+        return await self._ensure_cookie_ready(event, force=True, source="onebot")
+
     @staticmethod
     def _status_has_video_upload_credentials(status: dict[str, Any] | None) -> bool:
         if not isinstance(status, dict):
@@ -5416,7 +5436,12 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
             return
+        cookie_bind_error: QzoneBridgeError | None = None
         try:
+            try:
+                await self._ensure_cookie_ready_for_video_auth(event)
+            except QzoneBridgeError as exc:
+                cookie_bind_error = exc
             payload = await self._auto_bind_video_upload_credentials(event, force=True, source="onebot")
             if not self._status_has_video_upload_credentials(payload):
                 probe = getattr(self, "_last_video_upload_probe", {}) or {}
@@ -5433,6 +5458,8 @@ class QzoneStablePlugin(Star):
                     suffix_parts.append(f"其中仅返回 Cookie/CSRF 的 action：{web_only}")
                 if client_key_only:
                     suffix_parts.append(f"其中仅返回 clientkey/keyIndex（Web 跳转登录材料，不是 A2）的 action：{client_key_only}")
+                if cookie_bind_error is not None:
+                    suffix_parts.append(f"Cookie 自动绑定失败：{self._error_text(cookie_bind_error)}")
                 suffix = "；" + "；".join(suffix_parts) if suffix_parts else ""
                 try:
                     status_payload = await self._status_with_recovery()
