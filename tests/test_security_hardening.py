@@ -2240,6 +2240,43 @@ def test_daemon_native_video_verification_uses_publishmood_tid_first(
     assert calls["listed"] is False
 
 
+def test_daemon_verify_native_video_feed_requires_public_svid() -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**kwargs):
+        assert kwargs == {"vid": "vid-onebot", "fid": "fid-onebot"}
+        return {
+            "fid": "fid-onebot",
+            "hostuin": 3112333596,
+            "appid": 311,
+            "raw": {"html": "qzvideo/vid-onebot"},
+        }
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    payload = asyncio.run(
+        service.verify_native_video_feed(
+            vid="vid-onebot",
+            fid="fid-onebot",
+            method="onebot_protocol_video_publish",
+        )
+    )
+
+    assert payload["native_video"] is True
+    assert payload["status"] == "published_native_video"
+    assert payload["operation_status"] == "verified_feed_video"
+    assert payload["raw"]["method"] == "onebot_protocol_video_publish"
+
+    with pytest.raises(QzoneParseError):
+        asyncio.run(service.verify_native_video_feed(vid=""))
+
+
 def test_daemon_bridge_response_wraps_unhandled_errors_as_json() -> None:
     from qzone_bridge import daemon as daemon_mod
 
@@ -4051,6 +4088,141 @@ def test_plugin_publish_sends_native_video_to_daemon_without_client_handoff(
     }
 
 
+def test_onebot_native_video_publish_action_uses_public_visibility_contract(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+    captured: dict[str, object] = {}
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            captured["action"] = action
+            captured["params"] = params
+            return {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "fid": "fid-onebot"}}
+
+    result = asyncio.run(
+        publish_qzone_video_via_onebot(
+            _Bot(),
+            video_path=video,
+            content="hello",
+            sync_weibo=True,
+            source="test",
+        )
+    )
+
+    assert result is not None
+    assert result.vid == "vid-onebot"
+    assert result.fid == "fid-onebot"
+    assert result.action == "publish_qzone_video_mood"
+    params = captured["params"]
+    assert params["video_path"] == str(video)
+    assert params["content"] == "hello"
+    assert params["sync_weibo"] is True
+    assert params["who"] == 1
+    assert params["ugc_right"] == 1
+    assert params["visibility"] == "public"
+
+
+def test_onebot_native_video_publish_rejects_success_without_svid(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+
+    class _Bot:
+        async def call_action(self, *_args, **_params):
+            return {"status": "ok", "retcode": 0, "data": {"fid": "fid-without-vid"}}
+
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+    assert "sVid" in str(error.value)
+    assert error.value.detail["required"] == "sVid"
+
+
+def test_plugin_publish_uses_onebot_protocol_native_video_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    original = main.PostPayload(
+        content="hello",
+        media=[
+            main.PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+    cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
+    )
+    captured: dict[str, object] = {}
+    bot = object()
+
+    async def fake_prepare(post):
+        assert post is original
+        return cover
+
+    async def fake_onebot_publish(client, **kwargs):
+        captured["onebot_client"] = client
+        captured["onebot_kwargs"] = kwargs
+        return types.SimpleNamespace(
+            vid="vid-onebot",
+            fid="fid-onebot",
+            to_dict=lambda: {"action": "publish_qzone_video_mood", "vid": "vid-onebot", "fid": "fid-onebot"},
+        )
+
+    class _Controller:
+        async def verify_native_video_feed(self, **kwargs):
+            captured["verify_kwargs"] = kwargs
+            return {
+                "native_video": True,
+                "status": "published_native_video",
+                "vid": "vid-onebot",
+                "fid": "fid-onebot",
+                "raw": {"verified_feed": {"appid": 311, "raw": {"html": "qzvideo/vid-onebot"}}},
+            }
+
+        async def publish_post(self, **_kwargs):
+            raise AssertionError("daemon upload publish should not run after OneBot protocol-end publish")
+
+    async def fake_bind(_event=None):
+        raise AssertionError("A2 bind should not run when protocol-end native publish succeeds")
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    plugin._maybe_bind_video_upload_credentials = fake_bind
+    plugin._capture_onebot_client = lambda event=None: bot
+    monkeypatch.setattr(main, "publish_qzone_video_via_onebot", fake_onebot_publish)
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original, event=types.SimpleNamespace()))
+
+    assert render_post is cover
+    assert payload["vid"] == "vid-onebot"
+    assert payload["fid"] == "fid-onebot"
+    assert captured["onebot_client"] is bot
+    assert captured["onebot_kwargs"]["video_path"] == source
+    assert captured["onebot_kwargs"]["content"] == "hello"
+    assert captured["verify_kwargs"] == {
+        "vid": "vid-onebot",
+        "fid": "fid-onebot",
+        "method": "onebot_protocol_video_publish",
+    }
+    assert payload["raw"]["method"] == "onebot_protocol_video_publish"
+
+
 def test_plugin_publish_routes_mixed_video_media_to_daemon_instead_of_cover_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4233,7 +4405,7 @@ def test_plugin_video_upload_auto_bind_defaults_to_onebot_source(
     assert captured["bind_kwargs"]["source"] == "onebot:_get_login_misc_data"
 
 
-def test_autovideoauth_binds_cookie_when_a2_missing_but_h5_cookie_available(
+def test_autovideoauth_requires_a2_even_when_h5_cookie_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     main = _import_main_with_stubs(monkeypatch)
@@ -4247,14 +4419,15 @@ def test_autovideoauth_binds_cookie_when_a2_missing_but_h5_cookie_available(
         "needs_rebind": False,
         "video_upload": {
             "configured": False,
-            "method": "h5_video_cover_publish",
-            "ready": True,
+            "method": "",
+            "ready": False,
             "verification_required": True,
             "qq_upload_configured": False,
             "h5_upload_available": True,
-            "h5_publish_supported": True,
+            "h5_publish_supported": False,
             "h5_publish_verification_required": True,
             "web_cookie_configured": True,
+            "requires": "qq_upload_a2_vlogin_data",
         },
     }
 
@@ -4267,11 +4440,11 @@ def test_autovideoauth_binds_cookie_when_a2_missing_but_h5_cookie_available(
                 "attempted_actions": ["get_credentials", "get_cookies"],
                 "returned_actions": ["get_credentials", "get_cookies"],
                 "web_credential_actions": ["get_credentials", "get_cookies"],
-                "client_key_actions": [],
+                "client_key_actions": ["get_clientkey"],
+                "empty_login_data_actions": ["llonebot_debug:apiClass=pmhq,args=[loginService.getLoginMiscData,[a2]],method=call"],
             }
 
     async def fake_probe(client, *, source="onebot"):
-        raise AssertionError("A2 probe should be skipped when Web Cookie H5 video publishing is already ready")
         captured["probe_client"] = client
         captured["probe_source"] = source
         return _Probe()
@@ -4340,26 +4513,19 @@ def test_autovideoauth_binds_cookie_when_a2_missing_but_h5_cookie_available(
     results = asyncio.run(collect_results())
 
     assert len(results) == 1
-    assert results[0].startswith("视频发布授权已就绪")
-    assert "QQ upload A2/vLoginData 未绑定仅表示 Tencent upload 后备链路不可用" in results[0]
-    assert "不影响当前视频发布" in results[0]
-    assert "H5 video+cover 后台直发路径已就绪" in results[0]
-    assert "appid=311 且同一 sVid" in results[0]
+    assert "OneBot 未返回 QQ upload A2/vLoginData" in results[0]
+    assert "不能启用可保证全部人可见" in results[0]
+    assert "默认不会用于发布" in results[0]
     assert "clientkey/keyIndex" in results[0]
-    assert "OneBot 未返回 QQ upload A2/vLoginData" not in results[0]
-    assert "video_upload_method: h5_video_cover_publish" in results[0]
-    assert "video_upload: ready" in results[0]
-    assert "qq_upload_configured: False" in results[0]
-    assert "web_cookie_configured: True" in results[0]
-    assert "video_upload_verification_required: True" in results[0]
-    assert "不能启用 daemon 原生视频后台直发" not in results[0]
+    assert "目标 A2/vLoginData action 有返回但未给出二进制材料" in results[0]
     assert captured["cookie_client"] is bot
-    assert "probe_client" not in captured
+    assert captured["probe_client"] is bot
+    assert captured["probe_source"] == "onebot"
     assert captured["bound_uin"] == 12345
     assert captured["bound_source"] == "onebot"
 
 
-def test_status_renderer_reports_cookie_h5_path_as_ready() -> None:
+def test_status_renderer_reports_cookie_h5_path_as_missing_without_experimental_publish() -> None:
     from qzone_bridge.render import format_status
 
     rendered = format_status(
@@ -4372,21 +4538,22 @@ def test_status_renderer_reports_cookie_h5_path_as_ready() -> None:
                 "qq_upload_configured": False,
                 "web_cookie_configured": True,
                 "h5_upload_available": True,
-                "h5_publish_supported": True,
-                "h5_publish_verification_required": True,
-                "ready": True,
-                "verification_required": True,
-                "method": "h5_video_cover_publish",
+                "h5_publish_supported": False,
+                "h5_publish_experimental": False,
+                "h5_publish_verification_required": False,
+                "ready": False,
+                "verification_required": False,
+                "method": "",
+                "requires": "qq_upload_a2_vlogin_data",
             },
         }
     )
 
-    assert "- video_upload: ready" in rendered
+    assert "- video_upload: missing" in rendered
     assert "- qq_upload_configured: False" in rendered
     assert "- web_cookie_configured: True" in rendered
-    assert "- video_upload_verification_required: True" in rendered
-    assert "h5_experimental" not in rendered
-    assert "appid=311 + same sVid" in rendered
+    assert "- video_upload_verification_required: False" in rendered
+    assert "- video_upload_method:" not in rendered
 
 
 def test_onebot_video_upload_credentials_ignore_web_cookie_tokens() -> None:
@@ -4649,6 +4816,95 @@ def test_onebot_video_upload_probe_accepts_embedded_ntqq_login_misc_service() ->
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source.startswith("test:embedded:")
     assert any("getLoginService().getLoginMiscData:key=a2" in item for item in probe.returned_actions)
+
+
+def test_onebot_video_upload_probe_accepts_embedded_napcat_wrapper_login_service() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-napcat-wrapper-service"
+
+    class _LoginService:
+        async def getLoginMiscData(self, key: str):
+            if key == "a2":
+                return {"result": 0, "value": raw_a2.hex()}
+            raise RuntimeError("unsupported key")
+
+    class _LoginServiceWrapper:
+        def get(self):
+            return _LoginService()
+
+    class _Wrapper:
+        NodeIKernelLoginService = _LoginServiceWrapper()
+
+    class _NapCatCore:
+        wrapper = _Wrapper()
+
+    class _Bot:
+        napcat = _NapCatCore()
+
+        async def call_action(self, *_args, **_params):
+            raise RuntimeError("default NapCat OneBot actions do not expose A2")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source.startswith("test:embedded:bot.napcat.wrapper.NodeIKernelLoginService")
+
+
+def test_onebot_video_upload_probe_records_llbot_empty_login_misc_response() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "call"
+                and params.get("args") == ["loginService.getLoginMiscData", ["a2"]]
+            ):
+                return {
+                    "type": "call",
+                    "data": {
+                        "result": {
+                            "result": -1,
+                            "errMsg": "GetMiscData Fail, DbActionId::result = nullptr",
+                            "value": "",
+                        }
+                    },
+                }
+            if action == "get_clientkey":
+                return {"data": {"clientkey": "web-jump-client-key", "keyIndex": "19"}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "llonebot_debug:apiClass=pmhq,args=[loginService.getLoginMiscData,[a2]],method=call" in (
+        probe.empty_login_data_actions
+    )
+    assert "get_clientkey" in probe.client_key_actions
+
+
+def test_onebot_video_upload_probe_rejects_default_napcat_web_credentials_and_clientkey() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == "get_credentials":
+                return {"data": {"cookies": "uin=o12345; p_skey=ps-key;", "token": 123456}}
+            if action == "get_cookies":
+                return {"data": {"cookies": "uin=o12345; p_skey=ps-key;", "bkn": "123456"}}
+            if action == "get_clientkey":
+                return {"data": {"clientkey": "web-jump-client-key", "keyIndex": "19"}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "get_credentials" in probe.web_credential_actions
+    assert "get_cookies" in probe.web_credential_actions
+    assert "get_clientkey" in probe.client_key_actions
 
 
 def test_onebot_video_upload_probe_accepts_targeted_login_misc_even_with_clientkey_metadata() -> None:

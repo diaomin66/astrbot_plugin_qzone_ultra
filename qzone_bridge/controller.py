@@ -963,6 +963,21 @@ class QzoneDaemonController:
             retry_on_timeout=False,
         )
 
+    async def verify_native_video_feed(
+        self,
+        *,
+        vid: str,
+        fid: str = "",
+        method: str = "onebot_protocol_video_publish",
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/native-video/verify",
+            json_body={"vid": vid, "fid": fid, "method": method},
+            timeout=DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS,
+            retry_on_timeout=False,
+        )
+
     async def comment_post(
         self,
         *,

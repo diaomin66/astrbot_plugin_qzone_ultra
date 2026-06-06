@@ -95,14 +95,16 @@ ONEBOT_LOGIN_MISC_ACTIONS = _with_onebot_extension_aliases(
     "get_qzone_upload_login_misc_data",
     "get_qzone_video_login_misc_data",
 )
+LOGIN_MISC_PRIMARY_KEYS = ("a2", "vLoginData", "A2", "v_login_data")
 LOGIN_MISC_ACTION_PARAM_VARIANTS: tuple[dict[str, str], ...] = tuple(
-    params
-    for key in LOGIN_MISC_DATA_KEYS
-    for params in (
-        {"key": key},
-        {"name": key},
-        {"field": key},
-    )
+    [
+        *({"key": key} for key in LOGIN_MISC_DATA_KEYS),
+        *(
+            {field: key}
+            for key in LOGIN_MISC_PRIMARY_KEYS
+            for field in ("name", "field")
+        ),
+    ]
 )
 PROTOCOL_ENDPOINT_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
     *(
@@ -389,6 +391,7 @@ class OneBotVideoUploadProbe:
     returned_actions: tuple[str, ...] = ()
     web_credential_actions: tuple[str, ...] = ()
     client_key_actions: tuple[str, ...] = ()
+    empty_login_data_actions: tuple[str, ...] = ()
     error_count: int = 0
 
     def public_detail(self) -> dict[str, Any]:
@@ -398,6 +401,7 @@ class OneBotVideoUploadProbe:
             "returned_actions": list(self.returned_actions),
             "web_credential_actions": list(self.web_credential_actions),
             "client_key_actions": list(self.client_key_actions),
+            "empty_login_data_actions": list(self.empty_login_data_actions),
             "error_count": self.error_count,
         }
 
@@ -423,9 +427,10 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
     returned: list[str] = []
     web_only: list[str] = []
     client_key_only: list[str] = []
+    empty_login_data: list[str] = []
     error_count = 0
     for action in _unique(VIDEO_UPLOAD_CREDENTIAL_ACTIONS):
-        for params in _video_upload_action_param_variants():
+        for params in _video_upload_action_param_variants(action):
             attempted.append(_action_label(action, params))
             try:
                 payload = await asyncio.wait_for(
@@ -451,8 +456,10 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
                     returned_actions=tuple(_unique(returned)),
                     web_credential_actions=tuple(_unique(web_only)),
                     client_key_actions=tuple(_unique(client_key_only)),
+                    empty_login_data_actions=tuple(_unique(empty_login_data)),
                     error_count=error_count,
                 )
+            _record_empty_login_data_response(empty_login_data, action, params, payload)
             if _payload_has_web_credentials(payload):
                 web_only.append(action)
             if _payload_has_client_key(payload):
@@ -483,8 +490,10 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
                 returned_actions=tuple(_unique(returned)),
                 web_credential_actions=tuple(_unique(web_only)),
                 client_key_actions=tuple(_unique(client_key_only)),
+                empty_login_data_actions=tuple(_unique(empty_login_data)),
                 error_count=error_count,
             )
+        _record_empty_login_data_response(empty_login_data, action, params, payload)
         if _payload_has_web_credentials(payload):
             web_only.append(action)
         if _payload_has_client_key(payload):
@@ -496,6 +505,7 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
         returned=returned,
         web_only=web_only,
         client_key_only=client_key_only,
+        empty_login_data=empty_login_data,
         error_count=error_count,
     )
     if embedded_credentials is not None:
@@ -505,6 +515,7 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
             returned_actions=tuple(_unique(returned)),
             web_credential_actions=tuple(_unique(web_only)),
             client_key_actions=tuple(_unique(client_key_only)),
+            empty_login_data_actions=tuple(_unique(empty_login_data)),
             error_count=error_count,
         )
     for action, params in IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS:
@@ -533,8 +544,10 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
                 returned_actions=tuple(_unique(returned)),
                 web_credential_actions=tuple(_unique(web_only)),
                 client_key_actions=tuple(_unique(client_key_only)),
+                empty_login_data_actions=tuple(_unique(empty_login_data)),
                 error_count=error_count,
             )
+        _record_empty_login_data_response(empty_login_data, action, params, payload)
         if _payload_has_web_credentials(payload):
             web_only.append(action)
         if _payload_has_client_key(payload):
@@ -545,24 +558,38 @@ async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") ->
         returned_actions=tuple(_unique(returned)),
         web_credential_actions=tuple(_unique(web_only)),
         client_key_actions=tuple(_unique(client_key_only)),
+        empty_login_data_actions=tuple(_unique(empty_login_data)),
         error_count=error_count,
     )
 
 
-def _video_upload_action_param_variants() -> tuple[dict[str, Any], ...]:
-    return (
+def _video_upload_action_param_variants(action: str) -> tuple[dict[str, Any], ...]:
+    normalized = _normalize_key(action)
+    domain_variants: tuple[dict[str, Any], ...] = (
         {"domain": "qzone.qq.com"},
         {"domain": "user.qzone.qq.com"},
         {"domain": "h5.qzone.qq.com"},
-        {"appid": "video_qzone"},
-        {"app_id": "video_qzone"},
-        {"service": "video_qzone"},
-        {"business": "video_qzone"},
-        {"business_type": "video_qzone"},
-        {"cmd": "video_qzone"},
-        {"type": "video_qzone"},
         {},
     )
+    business_variants: tuple[dict[str, Any], ...] = (
+        {"appid": "video_qzone"},
+        {"business": "video_qzone"},
+    )
+    if normalized in {"getcookies", "getcredentials", "getcsrftoken"}:
+        return domain_variants
+    if (
+        "credentials" in normalized
+        or "auth" in normalized
+        or "credential" in normalized
+    ):
+        return (*domain_variants, *business_variants)
+    if (
+        "a2" in normalized
+        or "vlogindata" in normalized
+        or "logindata" in normalized
+    ):
+        return ({}, {"domain": "qzone.qq.com"}, *business_variants)
+    return (*domain_variants, *business_variants)
 
 
 async def _probe_embedded_ntqq_login_misc(
@@ -573,6 +600,7 @@ async def _probe_embedded_ntqq_login_misc(
     returned: list[str],
     web_only: list[str],
     client_key_only: list[str],
+    empty_login_data: list[str],
     error_count: int,
 ) -> tuple[OneBotVideoUploadCredentials | None, int]:
     """Try native NTQQ service handles when an AstrBot adapter exposes them.
@@ -600,6 +628,8 @@ async def _probe_embedded_ntqq_login_misc(
                 credentials = _extract_raw_login_data_payload(payload, source=source_name, trusted_raw=True)
             if credentials is not None:
                 return credentials, error_count
+            if _payload_has_empty_login_data(payload):
+                empty_login_data.append(label)
             if _payload_has_web_credentials(payload):
                 web_only.append(label)
             if _payload_has_client_key(payload):
@@ -682,7 +712,24 @@ def _embedded_owner_candidates(bot: Any) -> list[tuple[str, Any]]:
         candidates.append((label, value))
 
     add("bot", bot)
-    for attr in ("api", "client", "bot", "onebot", "cqhttp", "api_client", "core", "context", "ctx", "session"):
+    for attr in (
+        "api",
+        "client",
+        "bot",
+        "onebot",
+        "cqhttp",
+        "api_client",
+        "adapter",
+        "core",
+        "context",
+        "ctx",
+        "session",
+        "wrapper",
+        "runtime",
+        "nt",
+        "ntqq",
+        "napcat",
+    ):
         value = _safe_getattr(bot, attr)
         add(f"bot.{attr}", value)
     return candidates
@@ -947,6 +994,81 @@ def _payload_has_client_key(payload: Any, *, _depth: int = 0, _seen: set[int] | 
             return True
     return any(
         _payload_has_client_key(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _record_empty_login_data_response(
+    empty_login_data: list[str],
+    action: str,
+    params: dict[str, Any] | None,
+    payload: Any,
+) -> None:
+    if _action_targets_login_data(action, params) and _payload_has_empty_login_data(payload):
+        empty_login_data.append(_action_label(action, params or {}))
+
+
+def _payload_has_empty_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return payload in (None, "", [], {})
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "not available",
+                "not a function",
+                "no method",
+                "unsupported",
+                "error",
+                "failed",
+                "timeout",
+                "没有方法",
+                "不支持",
+                "失败",
+            )
+        )
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload) == 0
+    if isinstance(payload, (list, tuple)):
+        return len(payload) == 0 or all(
+            _payload_has_empty_login_data(item, _depth=_depth + 1, _seen=_seen)
+            for item in payload
+        )
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+
+    normalized_login_data_keys = {_normalize_key(item) for item in LOGIN_DATA_KEYS}
+    normalized_status_keys = {"result", "retcode", "code", "status"}
+    has_empty_value = False
+    has_error_status = False
+    has_error_text = False
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in normalized_login_data_keys or normalized in {"value", "ticket", "buffer"}:
+            if value in (None, "", [], {}):
+                has_empty_value = True
+        if normalized in normalized_status_keys:
+            if isinstance(value, int) and value not in (0, 200):
+                has_error_status = True
+            elif isinstance(value, str) and value.lower() not in {"", "ok", "success", "0", "200"}:
+                has_error_status = True
+        if normalized in {"errmsg", "message", "msg", "error"} and value not in (None, "", [], {}):
+            has_error_text = True
+    if has_empty_value and (has_error_status or has_error_text or "value" in payload):
+        return True
+    return any(
+        _payload_has_empty_login_data(value, _depth=_depth + 1, _seen=_seen)
         for value in payload.values()
         if isinstance(value, (dict, list, tuple, str))
     )

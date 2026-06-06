@@ -49,7 +49,12 @@ def format_status(status: dict) -> str:
         method = video_upload.get("method") or "-"
         qq_upload_ready = bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
         web_cookie_ready = bool(video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
-        ready = bool(video_upload.get("ready") or qq_upload_ready or web_cookie_ready)
+        h5_publish_ready = bool(
+            video_upload.get("ready")
+            and video_upload.get("h5_publish_supported")
+            and video_upload.get("h5_publish_experimental")
+        )
+        ready = bool(qq_upload_ready or h5_publish_ready)
         verification_required = bool(
             video_upload.get("verification_required") or video_upload.get("h5_publish_verification_required")
         )
@@ -70,6 +75,8 @@ def format_status(status: dict) -> str:
                 lines.append(f"- h5_video_upload: {bool(video_upload.get('h5_upload_available'))}")
             if "h5_publish_supported" in video_upload:
                 lines.append(f"- h5_video_publish: {bool(video_upload.get('h5_publish_supported'))}")
+            if "h5_publish_experimental" in video_upload:
+                lines.append(f"- h5_video_publish_experimental: {bool(video_upload.get('h5_publish_experimental'))}")
             if verification_required:
                 lines.append("- h5_video_publish_note: requires appid=311 + same sVid feed/detail verification")
     if status.get("daemon_port"):

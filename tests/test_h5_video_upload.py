@@ -356,6 +356,7 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
     captured: dict[str, object] = {}
 
@@ -451,6 +452,55 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     assert captured["verify_kwargs"] == {"vid": "vid-h5", "fid": "fid-video"}
 
 
+def test_daemon_publish_post_rejects_h5_cookie_video_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneParseError
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", raising=False)
+
+    class _Client:
+        async def upload_h5_video(self, *_args, **_kwargs):
+            raise AssertionError("default public-video path must not create H5 private side effects")
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            raise AssertionError("default public-video path must not upload H5 covers")
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            raise AssertionError("default public-video path must not call publish_v6")
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("missing QQ upload credentials should fail before uploader construction")
+
+    monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    with pytest.raises(QzoneParseError) as error:
+        asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert "A2/vLoginData" in str(error.value)
+    assert error.value.detail["web_cookie_configured"] is True
+    assert error.value.detail["h5_publish_supported"] is False
+    assert error.value.detail["stable_method"] == "tencent_upload"
+
+
 def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -461,6 +511,7 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
     captured: dict[str, object] = {}
 
@@ -537,6 +588,169 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     assert captured["publish_vid"] == "vid-h5-noext"
 
 
+def test_daemon_h5_video_publish_continues_after_invalid_link_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
+    captured: dict[str, object] = {}
+
+    class _Client:
+        timeout = 1.5
+
+        async def upload_h5_video(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                vid="vid-h5-invalid-link-side-effect",
+                to_dict=lambda: {"vid": "vid-h5-invalid-link-side-effect"},
+            )
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            raise QzoneRequestError(
+                "您输入的链接不是有效链接",
+                status_code=200,
+                detail={"code": -3000, "msg": "您输入的链接不是有效链接"},
+            )
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
+
+    monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**kwargs):
+        captured["verify_kwargs"] = kwargs
+        return {
+            "fid": "fid-from-feed-side-effect",
+            "hostuin": 3112333596,
+            "appid": 311,
+            "raw": {"vid": "vid-h5-invalid-link-side-effect"},
+        }
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert payload["native_video"] is True
+    assert payload["vid"] == "vid-h5-invalid-link-side-effect"
+    assert payload["fid"] == "fid-from-feed-side-effect"
+    assert captured["verify_kwargs"] == {"vid": "vid-h5-invalid-link-side-effect", "fid": ""}
+    assert payload["raw"]["publish_error"]["recoverable"] is True
+    assert payload["raw"]["publish_error"]["classification"] == "invalid_link_from_web_richval_publish"
+
+
+def test_daemon_h5_video_publish_reports_private_visibility_after_invalid_link(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
+
+    class _Client:
+        timeout = 1.5
+
+        async def upload_h5_video(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                vid="vid-h5-private-after-invalid-link",
+                to_dict=lambda: {"vid": "vid-h5-private-after-invalid-link"},
+            )
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            raise QzoneRequestError(
+                "您输入的链接不是有效链接",
+                status_code=200,
+                detail={"code": -3000, "msg": "您输入的链接不是有效链接"},
+            )
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
+
+    monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**_kwargs):
+        service._last_native_video_verification_diagnostics = {
+            "vid_present": True,
+            "publish_tid": "",
+            "publish_tid_present": False,
+            "result": "private_visibility",
+            "private_visibility_hits": [
+                {
+                    "public": False,
+                    "private": True,
+                    "non_public": True,
+                    "visibility_markers": [{"kind": "private_access_denied"}],
+                    "private_markers": [{"kind": "private_access_denied"}],
+                }
+            ],
+        }
+        return None
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert "全部人可见" in str(error.value)
+    assert "有效链接" not in str(error.value)
+    assert error.value.detail["verification"]["result"] == "private_visibility"
+    assert error.value.detail["publish_error"]["classification"] == "invalid_link_from_web_richval_publish"
+
+
 def test_daemon_h5_video_publish_polls_feed_even_when_publish_response_has_feedinfo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -547,6 +761,7 @@ def test_daemon_h5_video_publish_polls_feed_even_when_publish_response_has_feedi
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
     captured: dict[str, object] = {}
 
     class _Client:
@@ -634,6 +849,7 @@ def test_daemon_h5_video_publish_rejects_mismatched_publish_feedinfo(
 
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
 
     class _Client:
         timeout = 1.5
@@ -811,6 +1027,76 @@ def test_daemon_video_verification_rejects_private_mood_video(
     assert diagnostics["result"] == "private_visibility"
     assert diagnostics["private_visibility_hits"]
     assert diagnostics["private_visibility_hits"][0]["private"] is True
+
+
+def test_daemon_video_verification_treats_detail_access_denied_as_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+
+    async def fake_detail_feed(**_kwargs):
+        raise QzoneRequestError("没有访问操作权限", status_code=200, detail={"message": "没有访问操作权限"})
+
+    async def fake_list_feeds(**_kwargs):
+        return {"items": []}
+
+    service.detail_feed = fake_detail_feed
+    service.list_feeds = fake_list_feeds
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-private-by-detail", fid="fid-private"))
+
+    assert result is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "private_visibility"
+    assert diagnostics["private_visibility_hits"]
+    visibility = diagnostics["private_visibility_hits"][0]
+    assert visibility["private"] is True
+    assert visibility["visibility_markers"][0]["kind"] == "private_access_denied"
+    assert visibility["visibility_markers"][0]["fid"] == "fid-private"
+
+
+def test_daemon_video_verification_stops_after_private_publish_tid_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0, 99.0, 99.0))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+    calls: dict[str, int] = {"detail": 0, "list": 0, "sleep": 0}
+
+    async def fake_sleep(_delay):
+        calls["sleep"] += 1
+        raise AssertionError("private publish tid detail should stop before long verification sleeps")
+
+    async def fake_detail_feed(**_kwargs):
+        calls["detail"] += 1
+        raise QzoneRequestError("没有访问操作权限", status_code=200, detail={"message": "没有访问操作权限"})
+
+    async def fake_list_feeds(**_kwargs):
+        calls["list"] += 1
+        return {"items": []}
+
+    monkeypatch.setattr(daemon_mod.asyncio, "sleep", fake_sleep)
+    service.detail_feed = fake_detail_feed
+    service.list_feeds = fake_list_feeds
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-private-by-detail", fid="fid-private"))
+
+    assert result is None
+    assert calls == {"detail": 1, "list": 3, "sleep": 0}
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "private_visibility"
+    assert diagnostics["early_stop_reason"] == "publish_tid_detail_access_denied"
+    assert diagnostics["direct_detail"]["private_access_denied_count"] == 1
 
 
 def test_daemon_video_verification_rejects_friend_visible_mood_video(

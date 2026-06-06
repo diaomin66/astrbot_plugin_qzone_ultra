@@ -4,12 +4,26 @@
 
 ## 2026-06-04 原生视频直发逆向
 
+### H5 视频实际产生动态但返回“链接无效”且非公开
+
+- 症状：真实 AstrBot 命令流里 daemon 返回 `publish_video_mood` 阶段“您输入的链接不是有效链接”，但 QQ 空间里实际出现了视频动态，且可见范围是“仅自己可见”。
+- 根因：`emotion_cgi_publish_v6` 对本地上传 `sVid`/richval 不是可靠的最终发布接口；它可能报链接无效，而 `video_qzone`/`pic_qzone` 上传侧仍产生动态副作用。旧代码把这个中间错误直接上抛，遮蔽了真正需要处理的权限结果。
+- 修复：H5 路径中视频上传和封面上传仍是硬失败；`publish_video_mood` 抛 `QzoneRequestError` 时只记录为 `publish_error` 并继续按 `sVid` 做 feed/detail 验证。详情接口返回“主人设置保密”“没有访问操作权限”等访问受限错误时，验证器归因成 `private_visibility`，最终报“不是全部人可见”，不再报“链接无效”。
+- 回归用例：`publish_video_mood` 抛“链接无效”但 feed 验证成功时应返回成功并保留 recoverable 诊断；同样中间错误叠加私密诊断时，顶层错误必须说明未达到全部人可见；直接详情 `fid` 返回无权限时必须进入 `private_visibility`，且精确 `tid/fid` 已确认无访问权限时必须先扫一轮最近动态再快速停止，避免跑完整长轮询。
+
 ### H5 `sliceUpload` + Web `publish_v6` 会产生假成功
 
 - 症状：daemon 返回 `published_native_video` 且渲染图里有视频卡片，但 QQ 空间最近动态和详情里看不到新视频。
 - 根因：H5 `FileUploadVideo` 能返回 `sVid`，但后续 `emotion_cgi_publish_v6` 的 `richtype=3/subrichtype=7/richval` 响应可能只是回显提交的 `vid/richval`，不代表生成了可见视频动态；旧 Web 官方本地视频流程实际是先通过 `qzupvideo` 或移动 `video_qzone` 上传拿到可发布视频，再作为视频附件发布。
-- 修复：daemon 不再把 `publish_v6` 响应里的 `feedinfo/richval/vid` 当作验证来源；只有 feed/profile/active 轮询看到同一 `sVid` 且 `appid=311` 才允许返回成功。已绑定 Qzone Web Cookie/`p_skey` 时，H5 video+cover 后台直发可作为 ready 路径；vLoginData/A2 类二进制材料只作为 QQ upload / Tencent upload 后备。
-- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时应显示 `video_upload: ready`，不允许退回视频封面图或打开 QQ/QQNT 客户端。
+- 修复：daemon 不再把 `publish_v6` 响应里的 `feedinfo/richval/vid` 当作验证来源；只有 feed/profile/active 轮询看到同一 `sVid` 且 `appid=311` 才允许返回成功。已绑定 Qzone Web Cookie/`p_skey` 只能证明 H5 上传接口可访问；默认稳定公开视频路径必须有 QQ upload A2/vLoginData，H5 发布只允许显式实验开关下诊断。
+- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时应显示 `video_upload: missing` 并要求 A2/vLoginData，不允许退回视频封面图或打开 QQ/QQNT 客户端。
+
+### OneBot protocol-end native video publish must still be verified
+
+- Symptom: NapCat/LLBot can reliably provide Qzone Web Cookie/clientKey, but QQ upload A2/vLoginData may be empty or not exposed through default OneBot actions.
+- Root cause: the more stable boundary is to let the protocol end use its own NTQQ session internally, then return a publish result to the plugin. The plugin must not treat the protocol response alone as final proof.
+- Fix: the plugin now tries OneBot extension actions such as `publish_qzone_video_mood`, `publish_qzone_video_shuoshuo`, `qzone_publish_video`, and `upload_qzone_video` for a single trusted local video. The request carries `who=1`, `ugc_right=1`, and public visibility fields. After the protocol end returns `sVid`, the daemon verifies `appid=311`, the same `sVid`, and public visibility through `/native-video/verify`.
+- Regression cases: success without `sVid` is unsafe and fails; private/friend-only markers fail; daemon verification failure fails; the plugin must not try another publish action after an unsafe success and must not fall back to a cover image.
 
 ## 2026-05-27 实施阶段
 
