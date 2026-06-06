@@ -693,7 +693,14 @@ class QzoneDaemonController:
         try:
             payload = response.json()
         except Exception as exc:
-            raise DaemonUnavailableError("daemon 返回的 JSON 无法解析", detail={"text": response.text[:500]}) from exc
+            raise DaemonUnavailableError(
+                "daemon 返回的 JSON 无法解析",
+                detail={
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type", ""),
+                    "body_preview": response.text[:500],
+                },
+            ) from exc
         if not payload.get("ok", False):
             error = payload.get("error") or {}
             code = str(error.get("code") or "DAEMON_ERROR")

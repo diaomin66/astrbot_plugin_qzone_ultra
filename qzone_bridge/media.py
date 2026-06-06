@@ -1121,6 +1121,103 @@ def _media_dedupe_key(item: PostMedia) -> tuple[str, str]:
     return (item.kind, item.source)
 
 
+def _video_identity_tokens(item: PostMedia) -> set[str]:
+    tokens: set[str] = set()
+    for value in (item.name, source_name(item.source)):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        name = source_name(text) or text
+        lowered = unquote(name).strip().lower()
+        if not lowered:
+            continue
+        suffix = Path(lowered).suffix.lower()
+        if suffix in QZONE_VIDEO_SUFFIXES:
+            tokens.add(f"name:{lowered}")
+            stem = Path(lowered).stem.strip()
+            if len(stem) >= 4:
+                tokens.add(f"stem:{stem}")
+        elif len(lowered) >= 8:
+            tokens.add(f"id:{lowered}")
+    return tokens
+
+
+def _trusted_existing_video_path_key(item: PostMedia) -> str:
+    if not item.trusted_local:
+        return ""
+    name = item.name or source_name(item.source)
+    path = resolve_trusted_local_media_path(item.source, name=name, suffixes=QZONE_VIDEO_SUFFIXES)
+    if path is None and is_video_media(item):
+        path = resolve_trusted_local_media_path(item.source, name=name, suffixes=None)
+    if path is None:
+        return ""
+    with contextlib.suppress(OSError):
+        path = path.resolve()
+    return str(path).casefold()
+
+
+def _keep_only_video_index(media: list[PostMedia], video_items: list[tuple[int, PostMedia]], keep_index: int) -> list[PostMedia]:
+    video_indexes = {index for index, _ in video_items}
+    result: list[PostMedia] = []
+    for index, item in enumerate(media):
+        if index in video_indexes:
+            if index == keep_index:
+                result.append(item)
+            continue
+        result.append(item)
+    return result
+
+
+def _collapse_duplicate_video_candidates(media: list[PostMedia]) -> list[PostMedia]:
+    video_items = [
+        (index, item)
+        for index, item in enumerate(media)
+        if item.kind == "video" or is_video_media(item)
+    ]
+    if len(video_items) <= 1:
+        return media
+
+    existing_entries = [
+        (index, item, key)
+        for index, item in video_items
+        for key in (_trusted_existing_video_path_key(item),)
+        if key
+    ]
+    existing_path_keys = {key for _, _, key in existing_entries}
+    if len(existing_entries) == 1 and len(existing_path_keys) == 1:
+        keep_index = existing_entries[0][0]
+        alternates = [(index, item) for index, item in video_items if index != keep_index]
+        if alternates and all(item.trusted_local and not _trusted_existing_video_path_key(item) for _, item in alternates):
+            return _keep_only_video_index(media, video_items, keep_index)
+
+    token_sets = [_video_identity_tokens(item) for _, item in video_items]
+    if any(not tokens for tokens in token_sets):
+        return media
+    common_tokens = set.intersection(*token_sets)
+    strong_tokens = {
+        token
+        for token in common_tokens
+        if token.startswith("name:") or (token.startswith("stem:") and len(token.removeprefix("stem:")) >= 8)
+    }
+    if not strong_tokens:
+        return media
+
+    if len(existing_path_keys) > 1:
+        return media
+
+    def preference(entry: tuple[int, PostMedia]) -> tuple[int, int, int, int, int]:
+        index, item = entry
+        source = normalize_source(item.source)
+        existing = 1 if _trusted_existing_video_path_key(item) else 0
+        local = 1 if item.trusted_local and _is_local_source(source) else 0
+        embedded = 1 if _is_base64_source(source) else 0
+        remote = 1 if _is_url(source) else 0
+        return (existing, local, embedded, -remote, -index)
+
+    keep_index, _keep_item = max(video_items, key=preference)
+    return _keep_only_video_index(media, video_items, keep_index)
+
+
 def collapse_single_video_cover_companion_media(items: Iterable[PostMedia]) -> list[PostMedia]:
     media: list[PostMedia] = []
     seen: set[tuple[str, str]] = set()
@@ -1130,6 +1227,7 @@ def collapse_single_video_cover_companion_media(items: Iterable[PostMedia]) -> l
             continue
         seen.add(key)
         media.append(item)
+    media = _collapse_duplicate_video_candidates(media)
     videos = [item for item in media if item.kind == "video" or is_video_media(item)]
     images = [item for item in media if is_supported_image(item)]
     if len(videos) == 1 and len(images) == 1 and len(media) == 2:
@@ -1191,7 +1289,7 @@ def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
         prefix = prefix.strip().lstrip("/\uff0f").strip()
         if not prefix:
             continue
-        command_marker = r"(?:[" + re.escape(COMMAND_PREFIX_CHARS) + r"]+\s*)?"
+        command_marker = r"(?:[" + re.escape(COMMAND_PREFIX_CHARS + COMMAND_SEPARATOR_CHARS) + r"]+\s*)?"
         pattern = r"^" + command_marker + r"\s*" + r"\s+".join(re.escape(part) for part in prefix.split())
         match = re.match(pattern, stripped, re.I)
         if match:

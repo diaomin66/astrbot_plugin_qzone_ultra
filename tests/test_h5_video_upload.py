@@ -42,9 +42,12 @@ def test_h5_video_control_payload_uses_qzone_cookie_token() -> None:
     assert control["biz_req"]["sTitle"] == "clip.mp4"
     assert control["biz_req"]["sDesc"] == "hello"
     assert control["biz_req"]["iPlayTime"] == 1000
+    assert control["biz_req"]["iNeedFeeds"] == 0
     assert control["biz_req"]["iIsNew"] == 111
     assert control["biz_req"]["extend_info"]["video_type"] == "3"
     assert control["biz_req"]["extend_info"]["qz_video_format"] == "mp4"
+    assert control["biz_req"]["extend_info"]["ugc_right"] == "1"
+    assert control["biz_req"]["extend_info"]["who"] == "1"
 
 
 def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> None:
@@ -77,6 +80,7 @@ def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> 
     assert control["check_type"] == 0
     assert control["file_len"] == 4567
     assert control["asy_upload"] == 0
+    assert biz_req["iNeedFeeds"] == 1
     assert biz_req["sPicDesc"] == "hello"
     assert biz_req["iAlbumTypeID"] == 7
     assert biz_req["iUploadType"] == 2
@@ -91,8 +95,12 @@ def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> 
     assert params["raw_width"] == "320"
     assert params["raw_height"] == "180"
     assert params["raw_size"] == "4567"
+    assert params["ugc_right"] == "1"
+    assert params["who"] == "1"
     assert external["is_client_upload_cover"] == "1"
     assert external["is_pic_video_mix_feeds"] == "1"
+    assert external["ugc_right"] == "1"
+    assert external["who"] == "1"
     assert external["mix_videoSize"] == "123456"
     assert external["mix_time"] == "2345"
 
@@ -252,8 +260,13 @@ def test_qzone_client_h5_video_cover_upload_posts_pic_qzone_control_and_slices(t
                 assert biz_req["stExtendInfo"]["mapParams"]["clientkey"] == "3112333596_1780399990"
                 assert biz_req["stExternalMapExt"]["is_client_upload_cover"] == "1"
                 assert biz_req["stExternalMapExt"]["is_pic_video_mix_feeds"] == "1"
+                assert biz_req["stExternalMapExt"]["ugc_right"] == "1"
+                assert biz_req["stExternalMapExt"]["who"] == "1"
                 assert biz_req["stExternalMapExt"]["mix_videoSize"] == "123456"
                 assert biz_req["stExternalMapExt"]["mix_time"] == "2345"
+                assert biz_req["stExtendInfo"]["mapParams"]["ugc_right"] == "1"
+                assert biz_req["stExtendInfo"]["mapParams"]["who"] == "1"
+                assert biz_req["iNeedFeeds"] == 1
                 assert biz_req["iPicWidth"] == 4
                 assert biz_req["iPicHight"] == 2
                 return _response(method, url, {"ret": 0, "data": {"session": "cover-sess", "slice_size": 4096}})
@@ -317,9 +330,16 @@ def test_qzone_client_publish_video_mood_uses_web_richval() -> None:
 
     assert payload["tid"] == "fid-1"
     data = captured["data"]
+    assert data["who"] == "1"
+    assert data["ugc_right"] == 1
+    assert data["pic_template"] == ""
+    assert data["special_url"] == ""
+    assert data["to_tweet"] == 0
     assert data["richtype"] == "3"
     assert data["subrichtype"] == "6"
     assert data["issyncweibo"] == 1
+    assert "who=5" in data["richval"]
+    assert data["richval"].count("who=") == 1
     assert "rich_flag=4" in data["richval"]
     assert "vid=vid-h5" in data["richval"]
     assert "qzvideo%2Fvid-h5" in data["richval"]
@@ -342,31 +362,23 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     class _Client:
         timeout = 1.5
 
-    class _Uploader:
-        def __init__(self, **kwargs):
-            captured["uploader_init"] = kwargs
-
-        def upload_video(self, path, **kwargs):
-            captured["socket_upload_path"] = path
-            captured["socket_upload_kwargs"] = kwargs
+        async def upload_h5_video(self, path, **kwargs):
+            captured["h5_upload_path"] = path
+            captured["h5_upload_kwargs"] = kwargs
             return types.SimpleNamespace(
                 vid="vid-h5",
                 uploaded_bytes=5,
                 session="sess",
-                upload_time=123456,
-                client_key=kwargs.get("client_key") or "",
-                publish_response=types.SimpleNamespace(tid="fid-video"),
                 to_dict=lambda: {
                     "vid": "vid-h5",
                     "uploaded_bytes": 5,
                     "session": "sess",
-                    "upload_time": 123456,
                 },
             )
 
-        def upload_video_cover(self, path, **kwargs):
-            captured["socket_cover_path"] = path
-            captured["socket_cover_kwargs"] = kwargs
+        async def upload_h5_video_cover(self, path, **kwargs):
+            captured["h5_cover_path"] = path
+            captured["h5_cover_kwargs"] = kwargs
             return types.SimpleNamespace(
                 uploaded_bytes=3,
                 session="cover-sess",
@@ -375,6 +387,16 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
                     "session": "cover-sess",
                 },
             )
+
+        async def publish_video_mood(self, content, *, vid, sync_weibo=False):
+            captured["publish_content"] = content
+            captured["publish_vid"] = vid
+            captured["publish_sync_weibo"] = sync_weibo
+            return {"code": 0, "tid": "fid-video", "msg": "ok"}
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
 
     monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
 
@@ -385,7 +407,8 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     service._ensure_session_ready = lambda: None
     service._set_success = lambda defer_save=True: None
 
-    async def fake_wait_for_native_video_feed(**_kwargs):
+    async def fake_wait_for_native_video_feed(**kwargs):
+        captured["verify_kwargs"] = kwargs
         return {"fid": "fid-video", "raw": {"vid": "vid-h5"}}
 
     service._wait_for_native_video_feed = fake_wait_for_native_video_feed
@@ -406,25 +429,26 @@ def test_daemon_publish_post_uses_h5_cookie_upload_without_a2(
     assert payload["native_video"] is True
     assert payload["status"] == "published_native_video"
     assert payload["vid"] == "vid-h5"
-    assert payload["raw"]["method"] == "tencent_upload_web_cookie"
-    assert captured["socket_upload_path"] == video_path
-    assert captured["socket_upload_kwargs"]["play_time"] == 2345
-    assert captured["socket_upload_kwargs"]["upload_time"]
-    assert captured["socket_upload_kwargs"]["client_key"]
-    assert captured["socket_upload_kwargs"]["is_new"] == 111
-    assert captured["socket_upload_kwargs"]["video_format"] == "mp4"
-    assert captured["socket_upload_kwargs"]["control_asy_upload"] == 0
-    assert captured["socket_cover_path"] == cover_path
-    assert captured["socket_cover_kwargs"]["vid"] == "vid-h5"
-    assert captured["socket_cover_kwargs"]["video_path"] == video_path
-    assert captured["socket_cover_kwargs"]["video_size"] == 5
-    assert captured["socket_cover_kwargs"]["duration_ms"] == 2345
-    assert captured["socket_cover_kwargs"]["client_key"] == captured["socket_upload_kwargs"]["client_key"]
-    assert captured["socket_cover_kwargs"]["upload_type"] == 2
-    assert captured["socket_cover_kwargs"]["need_feeds"] == 1
-    assert captured["socket_cover_kwargs"]["control_asy_upload"] == 0
-    assert captured["uploader_init"]["token_type"] == daemon_mod.QZONE_H5_VIDEO_TOKEN_TYPE
-    assert captured["uploader_init"]["token_appid"] == daemon_mod.QZONE_H5_VIDEO_TOKEN_APPID
+    assert payload["raw"]["method"] == "h5_video_cover_publish"
+    assert payload["raw"]["publish_result"]["tid"] == "fid-video"
+    assert captured["h5_upload_path"] == video_path
+    assert captured["h5_upload_kwargs"]["title"] == "clip.mp4"
+    assert captured["h5_upload_kwargs"]["desc"] == ""
+    assert captured["h5_upload_kwargs"]["play_time"] == 2345
+    assert captured["h5_upload_kwargs"]["upload_time"]
+    assert captured["h5_cover_path"] == cover_path
+    assert captured["h5_cover_kwargs"]["vid"] == "vid-h5"
+    assert captured["h5_cover_kwargs"]["video_path"] == video_path
+    assert captured["h5_cover_kwargs"]["video_size"] == 5
+    assert captured["h5_cover_kwargs"]["duration_ms"] == 2345
+    assert captured["h5_cover_kwargs"]["desc"] == ""
+    assert captured["h5_cover_kwargs"]["client_key"] == f"3112333596_{captured['h5_upload_kwargs']['upload_time']}"
+    assert captured["h5_cover_kwargs"]["upload_time"] == captured["h5_upload_kwargs"]["upload_time"]
+    assert captured["h5_cover_kwargs"]["need_feeds"] == 1
+    assert captured["publish_content"] == "hello"
+    assert captured["publish_vid"] == "vid-h5"
+    assert captured["publish_sync_weibo"] is False
+    assert captured["verify_kwargs"] == {"vid": "vid-h5", "fid": "fid-video"}
 
 
 def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
@@ -443,24 +467,28 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     class _Client:
         timeout = 1.5
 
-    class _Uploader:
-        def __init__(self, **_kwargs):
-            pass
-
-        def upload_video(self, path, **kwargs):
-            captured["socket_upload_path"] = path
-            captured["socket_upload_kwargs"] = kwargs
+        async def upload_h5_video(self, path, **kwargs):
+            captured["h5_upload_path"] = path
+            captured["h5_upload_kwargs"] = kwargs
             return types.SimpleNamespace(
                 vid="vid-h5-noext",
-                upload_time=123456,
-                publish_response=types.SimpleNamespace(tid="fid-video"),
-                to_dict=lambda: {"vid": "vid-h5-noext", "upload_time": 123456},
+                to_dict=lambda: {"vid": "vid-h5-noext"},
             )
 
-        def upload_video_cover(self, path, **kwargs):
-            captured["socket_cover_path"] = path
-            captured["socket_cover_kwargs"] = kwargs
+        async def upload_h5_video_cover(self, path, **kwargs):
+            captured["h5_cover_path"] = path
+            captured["h5_cover_kwargs"] = kwargs
             return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
+
+        async def publish_video_mood(self, content, *, vid, sync_weibo=False):
+            captured["publish_content"] = content
+            captured["publish_vid"] = vid
+            captured["publish_sync_weibo"] = sync_weibo
+            return {"code": 0, "tid": "fid-video"}
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
 
     monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
 
@@ -499,13 +527,103 @@ def test_daemon_h5_video_publish_accepts_trusted_no_extension_video(
     assert payload["native_video"] is True
     assert payload["status"] == "published_native_video"
     assert payload["vid"] == "vid-h5-noext"
-    assert captured["socket_upload_path"] == video_path
-    assert captured["socket_cover_path"] == cover_path
-    assert captured["socket_upload_kwargs"]["play_time"] == 2345
-    assert captured["socket_upload_kwargs"]["video_format"] == "mp4"
+    assert captured["h5_upload_path"] == video_path
+    assert captured["h5_cover_path"] == cover_path
+    assert captured["h5_upload_kwargs"]["play_time"] == 2345
+    assert captured["h5_upload_kwargs"]["title"] == "clip"
+    assert captured["h5_cover_kwargs"]["vid"] == "vid-h5-noext"
+    assert captured["h5_cover_kwargs"]["need_feeds"] == 1
+    assert captured["publish_content"] == ""
+    assert captured["publish_vid"] == "vid-h5-noext"
 
 
-def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
+def test_daemon_h5_video_publish_polls_feed_even_when_publish_response_has_feedinfo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+    captured: dict[str, object] = {}
+
+    class _Client:
+        timeout = 1.5
+
+        async def upload_h5_video(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                vid="vid-h5-feedinfo",
+                to_dict=lambda: {"vid": "vid-h5-feedinfo"},
+            )
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            return {
+                "code": 0,
+                "subcode": 0,
+                "tid": "fid-feedinfo",
+                "feedinfo": (
+                    '<li id="fct_3112333596_311_0_1780718770_0_1">'
+                    '<div id="feed_3112333596_311_0_1780718770_0_1" data-key="fid-feedinfo">'
+                    '<div class="f-ct-video">'
+                    '<a data-videotype="mood" data-v_vidiourl="http://user.qzone.qq.com/3112333596/qzvideo/vid-h5-feedinfo">'
+                    '<img src="http://shp.qpic.cn/qqvideo/0/vid-h5-feedinfo/400" />'
+                    '</a></div></div></li>'
+                ),
+            }
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
+
+    monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**kwargs):
+        captured["verify_kwargs"] = kwargs
+        return {
+            "fid": "fid-feedinfo",
+            "hostuin": 3112333596,
+            "appid": 311,
+            "verification_source": "publishmood_rsp_detail",
+            "raw": {"vid": "vid-h5-feedinfo"},
+        }
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        daemon_mod,
+        "video_cover_media",
+        lambda *_args, **_kwargs: PostMedia(kind="image", source=str(cover_path), name="cover.jpg", trusted_local=True),
+    )
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert payload["native_video"] is True
+    assert payload["vid"] == "vid-h5-feedinfo"
+    assert payload["fid"] == "fid-feedinfo"
+    assert payload["raw"]["verified_feed"]["verification_source"] == "publishmood_rsp_detail"
+    assert payload["raw"]["publish_result"]["feedinfo_present"] is True
+    assert "feedinfo" not in payload["raw"]["publish_result"]
+    assert captured["verify_kwargs"] == {"vid": "vid-h5-feedinfo", "fid": "fid-feedinfo"}
+
+
+def test_daemon_h5_video_publish_rejects_mismatched_publish_feedinfo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -520,20 +638,25 @@ def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
     class _Client:
         timeout = 1.5
 
-    class _Uploader:
-        def __init__(self, **_kwargs):
-            pass
-
-        def upload_video(self, *_args, **_kwargs):
+        async def upload_h5_video(self, *_args, **_kwargs):
             return types.SimpleNamespace(
                 vid="vid-h5-feedinfo",
-                upload_time=123456,
-                publish_response=types.SimpleNamespace(tid="fid-feedinfo"),
                 to_dict=lambda: {"vid": "vid-h5-feedinfo"},
             )
 
-        def upload_video_cover(self, *_args, **_kwargs):
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
             return types.SimpleNamespace(to_dict=lambda: {"photo_id": "cover-photo"})
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            return {
+                "code": 0,
+                "tid": "fid-feedinfo",
+                "feedinfo": '<li id="fct_3112333596_4_0_1780718770_0_1">vid-h5-feedinfo</li>',
+            }
+
+    class _Uploader:
+        def __init__(self, **_kwargs):
+            raise AssertionError("web cookie video path must not use Tencent upload socket credentials")
 
     monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
 
@@ -564,6 +687,8 @@ def test_daemon_h5_video_publish_rejects_publish_result_feedinfo_echo(
         asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
     assert "sVid" in str(error.value)
+    assert error.value.detail["publish_result"]["feedinfo_present"] is True
+    assert "feedinfo" not in error.value.detail["publish_result"]
 
 
 def test_daemon_video_verification_rejects_active_album_upload_feed(
@@ -646,3 +771,86 @@ def test_daemon_video_verification_accepts_profile_mood_video(
     assert result is not None
     assert result["fid"] == "mood-feed"
     assert result["verification_source"] == "profile_feed"
+    assert result["visibility"]["public"] is True
+
+
+def test_daemon_video_verification_rejects_private_mood_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+
+    private_item = {
+        "hostuin": 487231935,
+        "fid": "private-mood-feed",
+        "appid": 311,
+        "summary": "real video mood",
+        "ugc_right": 64,
+        "raw": {"html": "qzvideo/vid-private-mood", "title": "仅自己可见"},
+    }
+
+    async def fake_list_feeds(*, scope, **_kwargs):
+        if scope == "profile":
+            return {"items": [dict(private_item)]}
+        return {"items": []}
+
+    async def fake_detail_feed(**_kwargs):
+        return {"entry": dict(private_item), "raw": dict(private_item["raw"])}
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-private-mood"))
+
+    assert result is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "private_visibility"
+    assert diagnostics["private_visibility_hits"]
+    assert diagnostics["private_visibility_hits"][0]["private"] is True
+
+
+def test_daemon_video_verification_rejects_friend_visible_mood_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+
+    friend_visible_item = {
+        "hostuin": 487231935,
+        "fid": "friend-visible-mood-feed",
+        "appid": 311,
+        "summary": "real video mood",
+        "ugc_right": 2,
+        "raw": {"html": "qzvideo/vid-friend-visible", "title": "好友可见"},
+    }
+
+    async def fake_list_feeds(*, scope, **_kwargs):
+        if scope == "profile":
+            return {"items": [dict(friend_visible_item)]}
+        return {"items": []}
+
+    async def fake_detail_feed(**_kwargs):
+        return {"entry": dict(friend_visible_item), "raw": dict(friend_visible_item["raw"])}
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-friend-visible"))
+
+    assert result is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "non_public_visibility"
+    assert diagnostics["non_public_visibility_hits"]
+    visibility = diagnostics["non_public_visibility_hits"][0]
+    assert visibility["public"] is False
+    assert visibility["private"] is False
+    assert visibility["non_public"] is True
+    assert visibility["visibility_markers"]

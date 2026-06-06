@@ -28,6 +28,9 @@ QZONE_H5_PIC_CONTROL_CMD = "FileUpload"
 QZONE_H5_VIDEO_CHECK_TYPE_SHA1 = 1
 QZONE_H5_PIC_CHECK_TYPE_MD5_COMPAT = 0
 QZONE_H5_DEFAULT_SLICE_SIZE = 256 * 1024
+QZONE_PUBLIC_UGC_RIGHT = 1
+QZONE_PUBLIC_WHO = "1"
+QZONE_VIDEO_RICHVAL_WHO = "5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +131,8 @@ def build_h5_video_control_payload(
     video_extend = {str(key): str(value) for key, value in dict(extend_info or {}).items()}
     video_extend.setdefault("video_type", "3")
     video_extend.setdefault("qz_video_format", str(video_format or "mp4").lstrip(".") or "mp4")
+    video_extend.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
+    video_extend.setdefault("who", QZONE_PUBLIC_WHO)
     return {
         "control_req": [
             {
@@ -152,6 +157,7 @@ def build_h5_video_control_payload(
                     "iFlag": 0,
                     "iUploadTime": upload_time,
                     "iPlayTime": max(0, int(play_time or 0)),
+                    "iNeedFeeds": 0,
                     "sCoverUrl": "",
                     "iIsNew": 111,
                     "iIsOriginalVideo": 0,
@@ -195,6 +201,7 @@ def build_h5_video_cover_control_payload(
     upload_time: int | None = None,
     batch_id: int | None = None,
     is_original_video: int = 0,
+    need_feeds: int = 1,
     extra_map_ext: dict[str, str] | None = None,
     extra_params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -209,9 +216,13 @@ def build_h5_video_cover_control_payload(
     params.setdefault("raw_height", str(int(height or 0)))
     params.setdefault("raw_size", str(int(file_size or 0)))
     params.setdefault("show_geo", "0")
+    params.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
+    params.setdefault("who", QZONE_PUBLIC_WHO)
     external_map_ext = {str(key): str(value) for key, value in dict(extra_map_ext or {}).items()}
     external_map_ext.setdefault("is_client_upload_cover", "1")
     external_map_ext.setdefault("is_pic_video_mix_feeds", "1")
+    external_map_ext.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
+    external_map_ext.setdefault("who", QZONE_PUBLIC_WHO)
     if int(video_size or 0) > 0:
         external_map_ext.setdefault("mix_videoSize", str(int(video_size)))
     external_map_ext.setdefault("mix_isOriginalVideo", str(int(is_original_video or 0)))
@@ -250,7 +261,7 @@ def build_h5_video_cover_control_payload(
                     "iPicHight": int(height or 0),
                     "iWaterType": 0,
                     "iDistinctUse": 0x37DD,
-                    "iNeedFeeds": 1,
+                    "iNeedFeeds": int(need_feeds or 0),
                     "iUploadTime": upload_time,
                     "mapExt": {"mobile_fakefeeds_clientkey": str(client_key or "")},
                     "stExtendInfo": {"mapParams": params},
@@ -472,7 +483,7 @@ def build_qzone_video_richval(*, uin: int | str, vid: str) -> str:
         [
             f"playurl={play_url}",
             f"detailurl={detail_url}",
-            "who=5",
+            f"who={QZONE_VIDEO_RICHVAL_WHO}",
             "rich_flag=4",
             f"vid={vid}",
         ]
@@ -489,19 +500,20 @@ def build_qzone_video_publish_payload(
     return {
         "syn_tweet_verson": "1",
         "paramstr": "1",
-        "who": "1",
+        "pic_template": "",
+        "special_url": "",
+        "who": QZONE_PUBLIC_WHO,
         "con": str(content or ""),
         "feedversion": "1",
         "ver": "1",
-        "ugc_right": 1,
+        "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
         "to_sign": 0,
+        "to_tweet": 0,
         "hostuin": int(uin or 0),
         "code_version": "1",
         "richtype": "3",
-        # Reversed from Qzone's `/models/mood/video:3.1`: URL videos keep
-        # the default subtype 7, but an uploaded local video calls
-        # `setSubType(6)` after a successful `sVid` upload.  This daemon path
-        # always publishes an uploaded `sVid`, so use the local-video subtype.
+        # Qzone's Web mood/video model uses subtype 6 after a local sVid upload.
+        # Subtype 7 is for URL-style rich videos and can produce a non-public echo.
         "subrichtype": "6",
         "richval": build_qzone_video_richval(uin=uin, vid=vid),
         "issyncweibo": int(bool(sync_weibo)),

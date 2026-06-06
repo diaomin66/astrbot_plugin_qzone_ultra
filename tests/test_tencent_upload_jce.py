@@ -198,6 +198,7 @@ def test_record_video_publish_business_data_encodes_mobile_uni_attribute() -> No
     assert field_value(publish_req, 6) is None
     assert field_value(publish_req, 9) == 1
     assert field_value(publish_req, 11) == "client-1"
+    assert field_value(field_value(publish_req, 13), 0) == 1
     assert field_value(publish_req, 19)["has_video"] == "1"
     assert field_value(publish_req, 19)["videoSize"] == "4096"
 
@@ -232,6 +233,8 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
 
     assert field_value(pic_req, 8) == 1780329600
     assert field_value(pic_req, 9) is not None
+    assert field_value(pic_req, 6) == 2
+    assert field_value(pic_req, 22) == 1
     assert field_value(pic_req, 23) == 1780329600
     assert field_value(pic_req, 24) == {
         "mobile_fakefeeds_clientkey": "3112333596_1780329600",
@@ -253,6 +256,7 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
     assert field_value(publish_req, 1) == "hello video"
     assert field_value(publish_req, 3) == 1
     assert field_value(publish_req, 11) == "3112333596_1780329600"
+    assert field_value(field_value(publish_req, 13), 0) == 1
     assert field_value(publish_req, 15) == 1780329600
     assert field_value(publish_req, 19)["has_video"] == "1"
 
@@ -681,6 +685,8 @@ def test_qzone_tencent_video_uploader_uploads_video_cover_with_pic_qzone(tmp_pat
     assert field_value(info_nodes, 11) == str(video)
     assert field_value(info_nodes, 12) == 2
     assert field_value(info_nodes, 13) == 1
+    assert field_value(info_nodes, 6) == 2
+    assert field_value(info_nodes, 22) == 1
     assert field_value(info_nodes, 23) == 1780329600
     assert field_value(info_nodes, 24) == {"mobile_fakefeeds_clientkey": "3112333596_1780329600"}
     assert field_value(info_nodes, 29) == 0

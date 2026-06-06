@@ -1110,6 +1110,7 @@ class QzoneClient:
         upload_time: int | None = None,
         width: int = 0,
         height: int = 0,
+        need_feeds: int = 1,
         extra_map_ext: dict[str, str] | None = None,
         extra_params: dict[str, str] | None = None,
     ) -> QzoneH5VideoCoverUploadResult:
@@ -1145,6 +1146,7 @@ class QzoneClient:
             width=width,
             height=height,
             upload_time=upload_time,
+            need_feeds=need_feeds,
             extra_map_ext=extra_map_ext,
             extra_params=extra_params,
         )
