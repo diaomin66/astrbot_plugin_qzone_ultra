@@ -8,8 +8,8 @@
 
 - 症状：daemon 返回 `published_native_video` 且渲染图里有视频卡片，但 QQ 空间最近动态和详情里看不到新视频。
 - 根因：H5 `FileUploadVideo` 能返回 `sVid`，但后续 `emotion_cgi_publish_v6` 的 `richtype=3/subrichtype=7/richval` 响应可能只是回显提交的 `vid/richval`，不代表生成了可见视频动态；旧 Web 官方本地视频流程实际是先通过 `qzupvideo` 或移动 `video_qzone` 上传拿到可发布视频，再作为视频附件发布。
-- 修复：daemon 不再把 `publish_v6` 响应里的 `feedinfo/richval/vid` 当作验证来源；只有 feed/profile/active 轮询看到同一 `sVid` 才允许返回成功。默认不再把 H5 Cookie/`p_skey` 标记为稳定视频直发凭据，稳定路径改为 QQ upload / `video_qzone` 移动上传协议，需要 vLoginData/A2 类二进制材料。
-- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待 feed 验证；没有 QQ upload 二进制材料时必须报清晰错误，不允许退回视频封面图或打开 QQ/QQNT 客户端。
+- 修复：daemon 不再把 `publish_v6` 响应里的 `feedinfo/richval/vid` 当作验证来源；只有 feed/profile/active 轮询看到同一 `sVid` 且 `appid=311` 才允许返回成功。已绑定 Qzone Web Cookie/`p_skey` 时，H5 video+cover 后台直发可作为 ready 路径；vLoginData/A2 类二进制材料只作为 QQ upload / Tencent upload 后备。
+- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时应显示 `video_upload: ready`，不允许退回视频封面图或打开 QQ/QQNT 客户端。
 
 ## 2026-05-27 实施阶段
 

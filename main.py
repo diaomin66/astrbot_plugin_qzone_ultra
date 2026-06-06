@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060507
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060601
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -530,6 +530,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     contract_attributes = {
         "qzone_bridge.media": (
             "base64_media_source",
+            "collapse_single_video_cover_companion_media",
             "collect_message_media",
             "collect_post_payload",
             "parse_cq_message",
@@ -702,6 +703,7 @@ from qzone_bridge.media import (
     PostPayload,
     QZONE_VIDEO_SUFFIXES,
     base64_media_source,
+    collapse_single_video_cover_companion_media,
     collect_message_media,
     collect_post_payload,
     guess_mime_type,
@@ -3174,6 +3176,14 @@ class QzoneStablePlugin(Star):
                 media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
                 if media is not None:
                     return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
         return None
 
     async def _onebot_file_url_media(
@@ -3196,6 +3206,14 @@ class QzoneStablePlugin(Star):
                 media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
                 if media is not None:
                     return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
         return None
 
     async def _resolve_onebot_segment_media(
@@ -3321,7 +3339,10 @@ class QzoneStablePlugin(Star):
                     depth=depth + 1,
                 )
             )
-        return self._dedupe_media(media)
+        result = self._dedupe_media(media)
+        if kind in {"reply", "quote", "quoted", "reference"}:
+            return collapse_single_video_cover_companion_media(result)
+        return result
 
     async def _event_runtime_media(self, event: AstrMessageEvent) -> list[PostMedia]:
         media: list[PostMedia] = []
@@ -3353,8 +3374,10 @@ class QzoneStablePlugin(Star):
                 logger.debug("qzone referenced message lookup failed message_id=%s: %s", message_id, exc)
                 continue
             data_payload = self._onebot_data_payload(payload)
-            media.extend(await self._onebot_payload_media(bot, data_payload, event=event))
-            media.extend(collect_message_media(data_payload))
+            message_media: list[PostMedia] = []
+            message_media.extend(await self._onebot_payload_media(bot, data_payload, event=event))
+            message_media.extend(collect_message_media(data_payload))
+            media.extend(collapse_single_video_cover_companion_media(self._dedupe_media(message_media)))
         return self._dedupe_media(media)
 
     async def _collect_target_post_payload(
@@ -3417,8 +3440,9 @@ class QzoneStablePlugin(Star):
             if not getattr(self.settings, "native_video_publish", True):
                 raise QzoneParseError(
                     "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
-                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone autovideoauth 或 /qzone videoauth "
-                    "启用 Web Cookie H5 video+cover 直发或绑定 QQ upload A2/vLoginData 后再发布。"
+                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone videoauth 绑定 QQ upload A2/vLoginData；"
+                    "如果只使用 /qzone autovideoauth 绑定到 Web Cookie H5 video+cover 后台直发路径，发布后仍必须验证到 "
+                    "appid=311 且同一 sVid，未验证会直接报错。"
                 )
             render_post = await self._prepare_publish_payload(post)
             await self._maybe_bind_video_upload_credentials(event)
@@ -4404,7 +4428,22 @@ class QzoneStablePlugin(Star):
         if not isinstance(status, dict):
             return False
         video_upload = status.get("video_upload")
-        return isinstance(video_upload, dict) and bool(video_upload.get("configured"))
+        return isinstance(video_upload, dict) and bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
+
+    @staticmethod
+    def _status_has_video_publish_ready(status: dict[str, Any] | None) -> bool:
+        if not isinstance(status, dict):
+            return False
+        video_upload = status.get("video_upload")
+        if not isinstance(video_upload, dict):
+            return False
+        return bool(
+            video_upload.get("ready")
+            or video_upload.get("qq_upload_configured")
+            or video_upload.get("configured")
+            or video_upload.get("web_cookie_configured")
+            or video_upload.get("h5_upload_available")
+        )
 
     async def _auto_bind_video_upload_credentials(
         self,
@@ -4418,7 +4457,9 @@ class QzoneStablePlugin(Star):
                 status = await self.controller.get_status(probe_daemon=False)
             except QzoneBridgeError:
                 status = {}
-            if not force and self._status_has_video_upload_credentials(status):
+            if not force and (
+                self._status_has_video_upload_credentials(status) or self._status_has_video_publish_ready(status)
+            ):
                 return status
 
             bot = self._capture_onebot_client(event)
@@ -5431,17 +5472,52 @@ class QzoneStablePlugin(Star):
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("autovideoauth")
-    async def qzone_autovideoauth(self, event: AstrMessageEvent):
-        """从 OneBot 自动获取 QQ upload 二进制登录材料，用于 daemon 原生视频直发。"""
+    async def qzone_autovideoauth(self, event: AstrMessageEvent, probe_mode: str = ""):
+        """自动启用视频发布授权；默认优先确认 H5 Web Cookie 路径，显式传 a2/probe/force 才探测 QQ upload A2。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
             return
         cookie_bind_error: QzoneBridgeError | None = None
+        force_a2_probe = str(probe_mode or "").strip().lower() in {"a2", "qq", "probe", "force", "upload"}
+
+        def _video_upload_from_status(status_payload: dict[str, Any] | None) -> dict[str, Any]:
+            video_upload = status_payload.get("video_upload") if isinstance(status_payload, dict) else {}
+            return video_upload if isinstance(video_upload, dict) else {}
+
+        def _h5_ready(status_payload: dict[str, Any] | None) -> bool:
+            video_upload = _video_upload_from_status(status_payload)
+            return bool(video_upload.get("h5_upload_available") or video_upload.get("web_cookie_configured"))
+
+        def _ready_text(status_payload: dict[str, Any] | None, *, suffix: str = "") -> str:
+            return (
+                "视频发布授权已就绪：daemon 已确认 Qzone Web Cookie/p_skey 可用，H5 video+cover 后台直发路径已就绪。"
+                "QQ upload A2/vLoginData 未绑定仅表示 Tencent upload 后备链路不可用，不影响当前视频发布；"
+                "该路径不会打开 QQ/QQNT 客户端，会尝试上传 video_qzone 视频和 pic_qzone 视频封面，再发布 richval；"
+                "但只有在最近动态/详情验证到 "
+                "appid=311 且同一 sVid 时才会返回成功。未验证到 feed 会报错，不会把 H5 upload sVid、publish_v6 tid "
+                "或 appid=4 相册/封面动态误报为视频说说发布成功。"
+                "LLBot/PMHQ 返回的 clientkey/keyIndex 只是 Web 跳转登录材料，不是 A2。"
+                "如需强制重新探测 QQ upload A2，可使用 `，qzone autovideoauth a2`。"
+                f"{suffix}\n{format_status(status_payload if isinstance(status_payload, dict) else {})}"
+            )
+
         try:
             try:
-                await self._ensure_cookie_ready_for_video_auth(event)
+                cookie_status = await self._ensure_cookie_ready_for_video_auth(event)
             except QzoneBridgeError as exc:
                 cookie_bind_error = exc
+                cookie_status = {}
+            if not force_a2_probe:
+                try:
+                    status_payload = await self._status_with_recovery()
+                except QzoneBridgeError:
+                    status_payload = cookie_status if isinstance(cookie_status, dict) else {}
+                if _h5_ready(status_payload):
+                    yield self._command_result(event, _ready_text(status_payload))
+                    return
+                if self._status_has_video_upload_credentials(status_payload):
+                    yield self._command_result(event, format_status(status_payload))
+                    return
             payload = await self._auto_bind_video_upload_credentials(event, force=True, source="onebot")
             if not self._status_has_video_upload_credentials(payload):
                 probe = getattr(self, "_last_video_upload_probe", {}) or {}
@@ -5465,28 +5541,17 @@ class QzoneStablePlugin(Star):
                     status_payload = await self._status_with_recovery()
                 except QzoneBridgeError:
                     status_payload = payload if isinstance(payload, dict) else {}
-                video_upload = status_payload.get("video_upload") if isinstance(status_payload, dict) else {}
-                if not isinstance(video_upload, dict):
-                    video_upload = {}
-                h5_ready = bool(
-                    video_upload.get("h5_publish_supported")
-                    or video_upload.get("h5_upload_available")
-                    or video_upload.get("web_cookie_configured")
-                )
-                if h5_ready:
+                if _h5_ready(status_payload):
                     yield self._command_result(
                         event,
-                        "OneBot 未返回 QQ upload A2/vLoginData；已改用当前 Qzone Web Cookie 的 H5 video+cover daemon 后台直发路径。"
-                        "该路径不会打开 QQ/QQNT 客户端，会先上传 video_qzone 视频，再上传 pic_qzone 视频封面，最后轮询最近动态验证同一 sVid；"
-                        "未验证到 feed 会报错，不会把封面图误报为视频发布成功。"
-                        f"{suffix}\n{format_status(status_payload)}",
+                        _ready_text(status_payload, suffix=suffix),
                     )
                     return
                 yield self._command_result(
                     event,
                     "OneBot 未返回 QQ upload A2/vLoginData，且当前 daemon 也没有可用 Qzone Web Cookie/p_skey，"
-                    "因此不能启用 daemon 原生视频后台直发。请先使用 /qzone autobind 绑定 Cookie；"
-                    "如果协议端支持 A2/vLoginData，也可以继续使用 /qzone videoauth 手动绑定。"
+                    "因此不能启用 daemon 原生视频后台直发。请先使用 `，qzone autobind` 绑定 Cookie；"
+                    "如果协议端支持 A2/vLoginData，也可以继续使用 `，qzone videoauth` 手动绑定。"
                     f"{suffix}",
                 )
                 return

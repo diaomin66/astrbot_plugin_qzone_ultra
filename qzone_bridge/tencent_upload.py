@@ -40,6 +40,11 @@ QZONE_VIDEO_BUSINESS_TYPE = "QZoneVideo"
 QZONE_PIC_BUSINESS_TYPE = "QZonePhoto"
 QZONE_VIDEO_CONNECT_TYPE = "Epoll"
 QZONE_RECORD_VIDEO_BUSINESS_TYPE = 1
+QZONE_UPLOAD_PIC_INFO_REQ_UNI_KEY = "UploadPicInfoReq"
+QZONE_UPLOAD_PIC_INFO_REQ_TYPE = "FileUpload.UploadPicInfoReq"
+QZONE_WUP_SERVANT_NAME = "ServantName"
+QZONE_WUP_FUNC_NAME = "FuncName"
+QZONE_WUP_VERSION_2 = 2
 QZONE_PUBLISH_MOOD_UNI_KEY = "publishmood"
 QZONE_PUBLISH_MOOD_TYPE = "NS_MOBILE_OPERATION.operation_publishmood_req"
 QZONE_PUBLISH_MOOD_RSP_TYPE = "NS_MOBILE_OPERATION.operation_publishmood_rsp"
@@ -521,7 +526,7 @@ def encode_pic_extend_info(info: PicExtendInfo) -> Any:
     return jce_struct(fields)
 
 
-def encode_upload_pic_info_req(request: UploadPicInfoReq) -> bytes:
+def _upload_pic_info_req_fields(request: UploadPicInfoReq) -> list[JceField]:
     fields = [
         JceField(0, request.title),
         JceField(1, request.desc),
@@ -567,7 +572,15 @@ def encode_upload_pic_info_req(request: UploadPicInfoReq) -> bytes:
     if request.external_data is not None:
         fields.append(JceField(32, dict(request.external_data)))
     fields.append(JceField(33, request.resource_type))
-    return encode_struct(fields)
+    return fields
+
+
+def upload_pic_info_req_struct(request: UploadPicInfoReq) -> Any:
+    return jce_struct(_upload_pic_info_req_fields(request))
+
+
+def encode_upload_pic_info_req(request: UploadPicInfoReq) -> bytes:
+    return encode_struct(_upload_pic_info_req_fields(request))
 
 
 def decode_upload_video_info_rsp(payload: bytes) -> UploadVideoInfoRsp:
@@ -669,6 +682,69 @@ def encode_old_uni_attribute(entries: dict[str, tuple[str, Any]]) -> bytes:
             raise TencentUploadProtocolError("UniAttribute entries require non-empty key and type name")
         wrapped[key_text] = {type_text: encode_struct([JceField(0, value)])}
     return encode_struct([JceField(0, wrapped)])
+
+
+def encode_wup_request_packet_v2(
+    *,
+    data: bytes,
+    servant_name: str = QZONE_WUP_SERVANT_NAME,
+    func_name: str = QZONE_WUP_FUNC_NAME,
+    request_id: int = 0,
+    packet_type: int = 0,
+    message_type: int = 0,
+    timeout: int = 0,
+    context: dict[str, str] | None = None,
+    status: dict[str, str] | None = None,
+    with_length_prefix: bool = True,
+) -> bytes:
+    """Encode the Java `UniPacket.encode()` RequestPacket v2 envelope.
+
+    Qzone's Android `QzoneMediaUploadRequest.pack(name, obj)` creates
+    `com.qq.jce.wup.UniPacket`, sets request id 0 plus literal servant/func
+    names, calls `put(name, obj)`, and stores the returned bytes directly in
+    `VideoUploadTask.vBusiNessData`.
+    """
+
+    body = encode_struct(
+        [
+            JceField(1, QZONE_WUP_VERSION_2),
+            JceField(2, int(packet_type or 0)),
+            JceField(3, int(message_type or 0)),
+            JceField(4, int(request_id or 0)),
+            JceField(5, str(servant_name or "")),
+            JceField(6, str(func_name or "")),
+            JceField(7, bytes(data or b"")),
+            JceField(8, int(timeout or 0)),
+            JceField(9, {str(key): str(value) for key, value in dict(context or {}).items()}),
+            JceField(10, {str(key): str(value) for key, value in dict(status or {}).items()}),
+        ]
+    )
+    if not with_length_prefix:
+        return body
+    return _u32be(len(body) + 4) + body
+
+
+def encode_wup_unipacket_v2(
+    name: str,
+    *,
+    type_name: str,
+    value: Any,
+    servant_name: str = QZONE_WUP_SERVANT_NAME,
+    func_name: str = QZONE_WUP_FUNC_NAME,
+    request_id: int = 0,
+    with_length_prefix: bool = True,
+) -> bytes:
+    key_text = str(name or "")
+    type_text = str(type_name or "")
+    if not key_text or not type_text:
+        raise TencentUploadProtocolError("WUP UniPacket requires non-empty name and type")
+    return encode_wup_request_packet_v2(
+        data=encode_old_uni_attribute({key_text: (type_text, value)}),
+        servant_name=servant_name,
+        func_name=func_name,
+        request_id=request_id,
+        with_length_prefix=with_length_prefix,
+    )
 
 
 def operation_publish_mood_req_struct(
@@ -779,6 +855,93 @@ def encode_record_video_publish_business_data(
             "hostuin": (QZONE_UNI_INT64_TYPE, int(uin or 0)),
             QZONE_PUBLISH_MOOD_UNI_KEY: (QZONE_PUBLISH_MOOD_TYPE, publish_req),
         }
+    )
+
+
+def encode_record_video_upload_pic_business_data(
+    *,
+    uin: int | str,
+    content: str,
+    video_size: int = 0,
+    duration_ms: int = 0,
+    sync_weibo: bool = False,
+    client_key: str = "",
+    publish_time: int = 0,
+    upload_time: int = 0,
+    batch_id: int = 0,
+    batch_upload_num: int = 1,
+    current_upload: int = 0,
+    business_type: int = QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+    refer: str = "",
+    include_client_cover_flags: bool = True,
+    is_original_video: int = 0,
+    is_format_f20: int = 0,
+    media_type: int = 1,
+    media_bit_type: int = 1,
+    media_sub_type: int = 0,
+    shoot_params: dict[Any, Any] | None = None,
+    stored_extend_info: dict[Any, Any] | None = None,
+    proto_extend_info: dict[Any, Any] | None = None,
+) -> bytes:
+    """Encode Android `buildVideoTaskExtra()` for `VideoUploadTask.vBusiNessData`.
+
+    The video task business payload is not the `publishmood` UniAttribute
+    directly. Android first embeds that publish payload inside
+    `FileUpload.UploadPicInfoReq.vBusiNessData`, then packs the pic request
+    with `UniPacket.pack("UploadPicInfoReq", req)`.
+    """
+
+    upload_time = int(upload_time or publish_time or time.time())
+    publish_time = int(publish_time or upload_time)
+    client_key = str(client_key or "")
+    publish_business_data = encode_record_video_publish_business_data(
+        uin=uin,
+        content=content,
+        video_size=video_size,
+        sync_weibo=sync_weibo,
+        client_key=client_key,
+        publish_time=publish_time,
+        media_type=media_type,
+        media_bit_type=media_bit_type,
+        media_sub_type=media_sub_type,
+        is_original_video=is_original_video,
+        is_format_f20=is_format_f20,
+        shoot_params=shoot_params,
+        stored_extend_info=stored_extend_info,
+        proto_extend_info=proto_extend_info,
+    )
+    params: dict[str, str] = {}
+    if client_key:
+        params["clientkey"] = client_key
+    external_map_ext: dict[str, str] = {}
+    if include_client_cover_flags:
+        external_map_ext["is_client_upload_cover"] = "1"
+        external_map_ext["is_pic_video_mix_feeds"] = "1"
+    if int(video_size or 0) > 0:
+        external_map_ext["mix_videoSize"] = str(int(video_size))
+    external_map_ext["mix_isOriginalVideo"] = str(int(is_original_video or 0))
+    if int(duration_ms or 0) > 0:
+        external_map_ext["mix_time"] = str(int(duration_ms))
+    map_ext = {"mobile_fakefeeds_clientkey": client_key}
+    if str(refer or ""):
+        map_ext["refer"] = str(refer)
+    request = UploadPicInfoReq(
+        batch_id=int(batch_id or _batch_id_from_client_key(client_key) or upload_time),
+        multi_pic_info=MultiPicInfo(
+            batch_upload_num=max(1, int(batch_upload_num or 1)),
+            current_upload=max(0, int(current_upload or 0)),
+        ),
+        extend_info=PicExtendInfo(params=params),
+        upload_time=upload_time,
+        map_ext=map_ext,
+        business_type=int(business_type or 0),
+        business_data=publish_business_data if int(business_type or 0) == QZONE_RECORD_VIDEO_BUSINESS_TYPE else b"",
+        external_map_ext=external_map_ext,
+    )
+    return encode_wup_unipacket_v2(
+        QZONE_UPLOAD_PIC_INFO_REQ_UNI_KEY,
+        type_name=QZONE_UPLOAD_PIC_INFO_REQ_TYPE,
+        value=upload_pic_info_req_struct(request),
     )
 
 
@@ -985,7 +1148,8 @@ class QzoneTencentVideoUploader:
     """Synchronous Tencent upload SDK client for daemon-side video experiments.
 
     This implements the socket/PDU/JCE upload layer. For record-video shuoshuo
-    it can embed the mobile publishmood UniAttribute in UploadVideoInfoReq.
+    it can embed Android's packed UploadPicInfoReq business payload in
+    UploadVideoInfoReq.
     """
 
     def __init__(
@@ -1001,6 +1165,7 @@ class QzoneTencentVideoUploader:
         port: int = QZONE_VIDEO_UPLOAD_PORT,
         timeout: float = 30.0,
         socket_factory: Callable[..., Any] | None = None,
+        environment: StEnvironment | None = None,
     ) -> None:
         if not bytes(login_data or b""):
             raise QzoneNativeVideoCredentialError(
@@ -1018,6 +1183,7 @@ class QzoneTencentVideoUploader:
         self.port = int(port)
         self.timeout = float(timeout)
         self.socket_factory = socket_factory or socket.create_connection
+        self.environment = environment or StEnvironment()
         self._seq = 1
 
     def upload_video(
@@ -1038,8 +1204,11 @@ class QzoneTencentVideoUploader:
         client_key: str = "",
         publish_time: int = 0,
         upload_time: int = 0,
+        is_new: int = 1,
         is_original_video: int = 0,
         is_format_f20: int = 0,
+        video_format: str | None = None,
+        control_asy_upload: int = 1,
         media_type: int = 1,
         media_bit_type: int = 1,
         media_sub_type: int = 0,
@@ -1054,16 +1223,18 @@ class QzoneTencentVideoUploader:
         upload_time = int(upload_time or time.time())
         publish_time = int(publish_time or upload_time)
         if not business_data and publish_content is not None:
-            business_data = encode_record_video_publish_business_data(
+            business_data = encode_record_video_upload_pic_business_data(
                 uin=self.uin,
                 content=publish_content,
                 video_size=file_size,
+                duration_ms=play_time,
                 sync_weibo=sync_weibo,
                 client_key=client_key,
                 publish_time=publish_time,
+                upload_time=upload_time,
+                batch_upload_num=1,
+                current_upload=0,
                 media_type=media_type,
-                media_bit_type=media_bit_type,
-                media_sub_type=media_sub_type,
                 is_original_video=is_original_video,
                 is_format_f20=is_format_f20,
                 shoot_params=shoot_params,
@@ -1073,7 +1244,7 @@ class QzoneTencentVideoUploader:
             business_type = int(business_type or QZONE_RECORD_VIDEO_BUSINESS_TYPE)
         upload_extend_info = {str(key): str(value) for key, value in dict(extend_info or {}).items()}
         upload_extend_info.setdefault("video_type", "3")
-        upload_extend_info.setdefault("qz_video_format", _qzone_video_format(path))
+        upload_extend_info.setdefault("qz_video_format", str(video_format or _qzone_video_format(path)).lstrip("."))
         if client_key:
             upload_extend_info.setdefault("clientkey", str(client_key))
         info_req = UploadVideoInfoReq(
@@ -1084,6 +1255,7 @@ class QzoneTencentVideoUploader:
             business_data=business_data,
             play_time=play_time,
             cover_url=cover_url,
+            is_new=int(is_new or 0),
             is_original_video=is_original_video,
             is_format_f20=is_format_f20,
             extend_info=upload_extend_info,
@@ -1095,7 +1267,9 @@ class QzoneTencentVideoUploader:
             token=self.token,
             checksum=sha1_file(path),
             file_len=file_size,
+            env=self.environment,
             biz_req=encode_upload_video_info_req(info_req),
+            asy_upload=int(control_asy_upload),
         )
         with self._connect() as sock:
             control_rsp = self._send_control(sock, control_req)
@@ -1136,6 +1310,9 @@ class QzoneTencentVideoUploader:
         upload_time: int = 0,
         business_type: int = 0,
         business_data: bytes | None = None,
+        upload_type: int = 0,
+        need_feeds: int = 0,
+        control_asy_upload: int = 1,
         extra_map_ext: dict[str, str] | None = None,
         extra_params: dict[str, str] | None = None,
     ) -> QzoneTencentPicUploadResult:
@@ -1177,6 +1354,8 @@ class QzoneTencentVideoUploader:
             pic_path=str(video_path or path),
             width=width,
             height=height,
+            upload_type=int(upload_type or 0),
+            need_feeds=int(need_feeds or 0),
             upload_time=upload_time,
             map_ext=map_ext,
             distinct_use=0x37DD,
@@ -1191,7 +1370,9 @@ class QzoneTencentVideoUploader:
             checksum=md5_file(path),
             check_type=TENCENT_UPLOAD_CHECK_TYPE_MD5,
             file_len=file_size,
+            env=self.environment,
             biz_req=encode_upload_pic_info_req(info_req),
+            asy_upload=int(control_asy_upload),
         )
         with self._connect(host=QZONE_PIC_UPLOAD_HOST, port=QZONE_PIC_UPLOAD_PORT) as sock:
             control_rsp = self._send_control(sock, control_req)
@@ -1387,7 +1568,7 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
         NativeVideoDaemonRequirement(
             name="publishmood_business_data",
             status="implemented",
-            detail="Record-video shuoshuo uses UniAttribute(hostuin, publishmood) as UploadVideoInfoReq.vBusiNessData/iBusiNessType=1 instead of a separate final publish RPC.",
+            detail="Record-video shuoshuo uses Android UniPacket(UploadPicInfoReq) as UploadVideoInfoReq.vBusiNessData/iBusiNessType=1; the UploadPicInfoReq embeds UniAttribute(hostuin, publishmood).",
         ),
         NativeVideoDaemonRequirement(
             name="video_cover_pic_qzone_upload",
@@ -1441,8 +1622,8 @@ def qzone_video_upload_protocol_spec(video_path: str | Path | None = None) -> Qz
         {
             "step": "publish_business_data",
             "cmd": "embedded",
-            "jce": "UniAttribute(hostuin, publishmood)",
-            "input": "UploadVideoInfoReq.iBusiNessType=1 and vBusiNessData before slice upload",
+            "jce": "UniPacket(RequestPacket v2, key=UploadPicInfoReq) -> UploadPicInfoReq.vBusiNessData=UniAttribute(hostuin,publishmood)",
+            "input": "UploadVideoInfoReq.iBusiNessType=1 and Android-packed vBusiNessData before slice upload",
         },
     )
     return QzoneVideoUploadProtocolSpec(

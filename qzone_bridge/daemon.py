@@ -18,7 +18,7 @@ from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import configure_standalone_logging, get_logger
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .h5_video import qzone_h5_video_upload_available
+from .h5_video import QZONE_H5_VIDEO_TOKEN_APPID, QZONE_H5_VIDEO_TOKEN_TYPE, h5_video_token_data, qzone_h5_video_upload_available
 from .local_media import resolve_trusted_local_media_path
 from .media import (
     QZONE_MAX_IMAGES,
@@ -26,6 +26,7 @@ from .media import (
     QZONE_VIDEO_SUFFIXES,
     PostMedia,
     PostPayload,
+    collapse_single_video_cover_companion_media,
     is_supported_image,
     is_video_media,
     media_reference_text,
@@ -42,9 +43,11 @@ from .tencent_upload import (
     QzoneVideoUploadCredentials,
     QzoneTencentVideoUploader,
     QzoneTencentVideoUploadError,
+    StEnvironment,
     TencentUploadPduError,
     TencentUploadProtocolError,
     encode_record_video_publish_business_data,
+    encode_record_video_upload_pic_business_data,
     encode_video_shuoshuo_upload_finish_uni_attribute,
     qzone_video_upload_credentials_from_base64,
     qzone_video_upload_credentials_configured,
@@ -255,6 +258,105 @@ def _raw_contains_text(value: Any, needle: str, *, depth: int = 0) -> bool:
     return False
 
 
+def _verified_native_video_feed_item(
+    item: dict[str, Any],
+    *,
+    vid: str,
+    login_uin: int,
+    raw: Any = None,
+) -> bool:
+    if not isinstance(item, dict):
+        return False
+    try:
+        appid = int(item.get("appid") or 0)
+    except (TypeError, ValueError):
+        appid = 0
+    if appid != 311:
+        return False
+    try:
+        hostuin = int(item.get("hostuin") or item.get("uin") or login_uin or 0)
+    except (TypeError, ValueError):
+        hostuin = 0
+    if int(login_uin or 0) and hostuin != int(login_uin or 0):
+        return False
+    item_raw = raw if raw is not None else item.get("raw")
+    return _raw_contains_text(item, vid) or _raw_contains_text(item_raw, vid)
+
+
+def _native_video_item_context(
+    item: dict[str, Any],
+    *,
+    login_uin: int,
+) -> dict[str, Any] | None:
+    """Return appid/hostuin context only for self mood-feed video candidates."""
+
+    if not isinstance(item, dict):
+        return None
+    try:
+        appid = int(item.get("appid") or 0)
+    except (TypeError, ValueError):
+        appid = 0
+    if appid != 311:
+        return None
+    try:
+        hostuin = int(item.get("hostuin") or item.get("uin") or login_uin or 0)
+    except (TypeError, ValueError):
+        hostuin = 0
+    if int(login_uin or 0) and hostuin != int(login_uin or 0):
+        return None
+    return {"appid": appid, "hostuin": hostuin}
+
+
+def _short_diagnostic_text(value: Any, *, limit: int = 180) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _safe_error_diagnostic(exc: Exception) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": _short_diagnostic_text(exc),
+    }
+    code = getattr(exc, "code", None)
+    if code:
+        detail["code"] = str(code)
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        detail["status_code"] = status_code
+    return detail
+
+
+def _append_diagnostic_sample(values: list[Any], value: Any, *, limit: int = 5) -> None:
+    if len(values) < limit:
+        values.append(value)
+
+
+def _item_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _native_video_feed_item_diagnostic(
+    item: dict[str, Any],
+    *,
+    vid: str,
+    login_uin: int,
+) -> dict[str, Any]:
+    raw = item.get("raw")
+    appid = _item_int(item.get("appid"))
+    hostuin = _item_int(item.get("hostuin") or item.get("uin") or login_uin)
+    fid = str(item.get("fid") or item.get("tid") or item.get("key") or "").strip()
+    return {
+        "fid": fid,
+        "appid": appid,
+        "hostuin": hostuin,
+        "self_hostuin": bool(not login_uin or hostuin == login_uin),
+        "contains_svid": bool(_raw_contains_text(item, vid) or _raw_contains_text(raw, vid)),
+    }
+
+
 class QzoneDaemonService:
     def __init__(
         self,
@@ -320,15 +422,27 @@ class QzoneDaemonService:
     def _video_upload_summary(self) -> dict[str, Any]:
         summary = self.state.video_upload.summary()
         h5_ready = self._h5_video_upload_configured()
-        stable_ready = bool(summary.get("configured"))
+        qq_upload_ready = self._video_upload_credentials_configured()
+        state_qq_upload_ready = bool(summary.get("configured"))
+        ready = bool(qq_upload_ready or h5_ready)
+        verification_required = bool(h5_ready and not qq_upload_ready)
+        summary["qq_upload_configured"] = qq_upload_ready
+        summary["qq_upload_state_configured"] = state_qq_upload_ready
         summary["web_cookie_configured"] = h5_ready
         summary["h5_upload_available"] = h5_ready
         summary["h5_publish_supported"] = h5_ready
-        summary["configured"] = stable_ready
-        if stable_ready:
+        summary["ready"] = ready
+        summary["verification_required"] = verification_required
+        summary["h5_publish_verified"] = False
+        summary["h5_publish_verification_required"] = verification_required
+        summary["configured"] = qq_upload_ready
+        if qq_upload_ready:
             summary["method"] = "tencent_upload"
+            if not state_qq_upload_ready and not summary.get("source"):
+                summary["source"] = "env"
         elif h5_ready:
             summary["method"] = "h5_video_cover_publish"
+            summary["stability"] = "ready_requires_appid311_svid_verification"
             if not summary.get("updated_at"):
                 summary["updated_at"] = self.state.session.updated_at
         else:
@@ -880,28 +994,80 @@ class QzoneDaemonService:
         if not vid:
             return None
         fid = str(fid or "").strip()
+        login_uin = int(self.state.session.uin or 0)
         last_error: Exception | None = None
         checked_detail_keys: set[tuple[int, str, int]] = set()
+        diagnostics: dict[str, Any] = {
+            "vid_present": True,
+            "publish_tid": fid,
+            "publish_tid_present": bool(fid),
+            "login_uin": login_uin,
+            "attempts": 0,
+            "direct_detail": {
+                "attempts": 0,
+                "contains_svid_without_verified_context": False,
+                "errors": [],
+            },
+            "scopes": {},
+            "checked_detail_count": 0,
+            "detail_errors": [],
+            "result": "pending",
+        }
+        self._last_native_video_verification_diagnostics = diagnostics
         for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
+            diagnostics["attempts"] += 1
             if delay > 0:
                 await asyncio.sleep(delay)
             if fid:
                 hostuin = int(self.state.session.uin or 0)
+                diagnostics["direct_detail"]["attempts"] += 1
                 try:
                     detail = await self.detail_feed(hostuin=hostuin, fid=fid, appid=311)
                 except (QzoneRequestError, QzoneParseError) as exc:
                     last_error = exc
+                    _append_diagnostic_sample(diagnostics["direct_detail"]["errors"], _safe_error_diagnostic(exc))
                     log.debug("qzone native video direct detail verification failed fid=%s: %s", fid, exc)
                 else:
-                    if _raw_contains_text(detail, vid):
-                        entry = detail.get("entry") if isinstance(detail, dict) else None
+                    entry = detail.get("entry") if isinstance(detail, dict) else None
+                    raw = detail.get("raw") if isinstance(detail, dict) else detail
+                    diagnostics["direct_detail"]["contains_svid_without_verified_context"] = bool(
+                        diagnostics["direct_detail"]["contains_svid_without_verified_context"]
+                        or _raw_contains_text(detail, vid)
+                    )
+                    if isinstance(entry, dict):
+                        entry_with_context = {"appid": 311, "hostuin": hostuin, **entry}
+                    else:
+                        entry_with_context = {"fid": fid, "appid": 311, "hostuin": hostuin}
+                    if _verified_native_video_feed_item(
+                        entry_with_context,
+                        vid=vid,
+                        login_uin=login_uin,
+                        raw=raw,
+                    ):
                         verified = dict(entry) if isinstance(entry, dict) else {"fid": fid, "hostuin": hostuin}
                         verified.setdefault("fid", fid)
                         verified.setdefault("hostuin", hostuin)
+                        verified.setdefault("appid", 311)
                         verified.setdefault("raw", detail.get("raw") if isinstance(detail, dict) else detail)
                         verified.setdefault("verification_source", "publishmood_rsp_detail")
+                        diagnostics["result"] = "verified_direct_detail"
+                        diagnostics["verified_source"] = "publishmood_rsp_detail"
                         return verified
             for scope in ("self", "active", "profile"):
+                scope_diag = diagnostics["scopes"].setdefault(
+                    scope,
+                    {
+                        "fetch_attempts": 0,
+                        "fetch_errors": [],
+                        "last_item_count": 0,
+                        "appid_counts": {},
+                        "self_hostuin_mismatch_count": 0,
+                        "native_video_candidate_count": 0,
+                        "native_video_candidate_fids": [],
+                        "svid_hits": [],
+                    },
+                )
+                scope_diag["fetch_attempts"] += 1
                 try:
                     page = await self.list_feeds(
                         hostuin=int(self.state.session.uin or 0),
@@ -911,34 +1077,67 @@ class QzoneDaemonService:
                     )
                 except (QzoneRequestError, QzoneParseError) as exc:
                     last_error = exc
+                    _append_diagnostic_sample(scope_diag["fetch_errors"], _safe_error_diagnostic(exc))
                     log.debug("qzone native video feed verification fetch failed scope=%s: %s", scope, exc)
                     continue
-                for item in page.get("items") or []:
+                raw_items = page.get("items") or []
+                items = raw_items if isinstance(raw_items, list) else []
+                scope_diag["last_item_count"] = len(items)
+                for item in items:
                     if not isinstance(item, dict):
                         continue
+                    item_diag = _native_video_feed_item_diagnostic(item, vid=vid, login_uin=login_uin)
+                    appid_key = str(item_diag["appid"])
+                    scope_diag["appid_counts"][appid_key] = int(scope_diag["appid_counts"].get(appid_key, 0)) + 1
+                    if not item_diag["self_hostuin"]:
+                        scope_diag["self_hostuin_mismatch_count"] += 1
+                    if item_diag["appid"] == 311 and item_diag["self_hostuin"]:
+                        scope_diag["native_video_candidate_count"] += 1
+                        if item_diag["fid"]:
+                            _append_diagnostic_sample(scope_diag["native_video_candidate_fids"], item_diag["fid"])
+                    if item_diag["contains_svid"]:
+                        _append_diagnostic_sample(
+                            scope_diag["svid_hits"],
+                            {
+                                "fid": item_diag["fid"],
+                                "appid": item_diag["appid"],
+                                "hostuin": item_diag["hostuin"],
+                                "accepted_context": bool(item_diag["appid"] == 311 and item_diag["self_hostuin"]),
+                            },
+                        )
                     raw = item.get("raw")
-                    if _raw_contains_text(item, vid) or _raw_contains_text(raw, vid):
+                    if _verified_native_video_feed_item(item, vid=vid, login_uin=login_uin, raw=raw):
                         item.setdefault("verification_source", f"{scope}_feed")
+                        diagnostics["result"] = "verified_feed"
+                        diagnostics["verified_source"] = f"{scope}_feed"
                         return item
-                for item in (page.get("items") or [])[:NATIVE_VIDEO_VERIFY_DETAIL_LIMIT]:
+                for item in items[:NATIVE_VIDEO_VERIFY_DETAIL_LIMIT]:
                     if not isinstance(item, dict):
+                        continue
+                    item_context = _native_video_item_context(item, login_uin=login_uin)
+                    if item_context is None:
                         continue
                     fid = str(item.get("fid") or item.get("tid") or item.get("key") or "").strip()
                     if not fid:
                         continue
                     try:
-                        hostuin = int(item.get("hostuin") or item.get("uin") or self.state.session.uin or 0)
-                        appid = int(item.get("appid") or 311)
+                        hostuin = int(item_context["hostuin"])
+                        appid = int(item_context["appid"])
                     except (TypeError, ValueError):
                         continue
                     detail_key = (hostuin, fid, appid)
                     if detail_key in checked_detail_keys:
                         continue
                     checked_detail_keys.add(detail_key)
+                    diagnostics["checked_detail_count"] = len(checked_detail_keys)
                     try:
                         detail = await self.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
                     except (QzoneRequestError, QzoneParseError) as exc:
                         last_error = exc
+                        _append_diagnostic_sample(
+                            diagnostics["detail_errors"],
+                            {"scope": scope, "fid": fid, **_safe_error_diagnostic(exc)},
+                        )
                         log.debug(
                             "qzone native video detail verification fetch failed scope=%s fid=%s: %s",
                             scope,
@@ -946,14 +1145,28 @@ class QzoneDaemonService:
                             exc,
                         )
                         continue
-                    if _raw_contains_text(detail, vid):
-                        entry = detail.get("entry") if isinstance(detail, dict) else None
+                    entry = detail.get("entry") if isinstance(detail, dict) else None
+                    raw = detail.get("raw") if isinstance(detail, dict) else detail
+                    entry_with_context = {**item_context, **(entry if isinstance(entry, dict) else {})}
+                    if _verified_native_video_feed_item(
+                        entry_with_context,
+                        vid=vid,
+                        login_uin=login_uin,
+                        raw=raw,
+                    ):
                         verified = dict(entry) if isinstance(entry, dict) else dict(item)
+                        verified.setdefault("fid", fid)
+                        verified.setdefault("hostuin", hostuin)
+                        verified.setdefault("appid", appid)
                         verified.setdefault("raw", detail.get("raw") if isinstance(detail, dict) else detail)
                         verified.setdefault("verification_source", f"{scope}_detail")
+                        diagnostics["result"] = "verified_detail"
+                        diagnostics["verified_source"] = f"{scope}_detail"
                         return verified
         if last_error is not None:
+            diagnostics["last_error"] = _safe_error_diagnostic(last_error)
             log.warning("qzone native video feed verification ended with fetch errors: %s", last_error)
+        diagnostics["result"] = "not_verified"
         return None
 
     async def _publish_native_video_if_configured(
@@ -985,67 +1198,122 @@ class QzoneDaemonService:
                 cover_path = _trusted_daemon_image_path(cover)
                 if cover_path is None:
                     raise QzoneParseError(
-                        "daemon H5 视频后台直发无法生成可读取的视频封面，已停止发布",
+                        "daemon Web Cookie 视频后台直发无法生成可读取的视频封面，已停止发布",
                         detail={"name": video.name or path.name},
                     )
-                result = await self.client.upload_h5_video(
+                web_upload_token = h5_video_token_data(self.state.session).encode("utf-8")
+                uploader = QzoneTencentVideoUploader(
+                    uin=self.state.session.uin,
+                    login_data=web_upload_token,
+                    login_key=b"",
+                    token_type=QZONE_H5_VIDEO_TOKEN_TYPE,
+                    token_appid=QZONE_H5_VIDEO_TOKEN_APPID,
+                    token_wt_appid=0,
+                    timeout=float(getattr(self.client, "timeout", 30.0) or 30.0),
+                    environment=StEnvironment(refer="qzone", device="h5", device_info="h5"),
+                )
+                publish_business_data = encode_record_video_publish_business_data(
+                    uin=self.state.session.uin,
+                    content=content,
+                    video_size=file_size,
+                    sync_weibo=sync_weibo,
+                    client_key=client_key,
+                    publish_time=upload_time,
+                )
+                video_upload_business_data = encode_record_video_upload_pic_business_data(
+                    uin=self.state.session.uin,
+                    content=content,
+                    video_size=file_size,
+                    duration_ms=duration_ms,
+                    sync_weibo=sync_weibo,
+                    client_key=client_key,
+                    publish_time=upload_time,
+                    upload_time=upload_time,
+                    refer="qzone",
+                )
+                result = await asyncio.to_thread(
+                    uploader.upload_video,
                     path,
                     title=video.name or path.name,
                     desc=content,
                     play_time=duration_ms,
+                    business_data=video_upload_business_data,
+                    publish_content=content,
+                    sync_weibo=sync_weibo,
+                    client_key=client_key,
+                    publish_time=upload_time,
                     upload_time=upload_time,
-                    extend_info={"clientkey": client_key},
+                    business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+                    is_new=111,
+                    video_format=path.suffix.lower().lstrip(".") or "mp4",
+                    control_asy_upload=0,
                 )
-                cover_result = await self.client.upload_h5_video_cover(
+                result_upload_time = int(getattr(result, "upload_time", 0) or upload_time)
+                cover_result = await asyncio.to_thread(
+                    uploader.upload_video_cover,
                     cover_path,
                     vid=result.vid,
                     video_path=path,
                     client_key=client_key,
-                    upload_time=upload_time,
+                    upload_time=result_upload_time,
                     video_size=file_size,
                     duration_ms=duration_ms,
                     desc=content,
-                )
-                publish_result = await self.client.publish_video_mood(
-                    content,
-                    vid=result.vid,
-                    sync_weibo=sync_weibo,
+                    business_type=QZONE_RECORD_VIDEO_BUSINESS_TYPE,
+                    business_data=publish_business_data,
+                    upload_type=2,
+                    need_feeds=1,
+                    control_asy_upload=0,
                 )
             except FileNotFoundError as exc:
-                raise QzoneParseError("视频文件不存在，无法进行 Qzone H5 原生视频后台上传", detail={"path": str(path)}) from exc
-            except (OSError, QzoneRequestError, QzoneParseError) as exc:
-                if isinstance(exc, (QzoneRequestError, QzoneParseError)):
-                    raise
+                raise QzoneParseError("视频文件不存在，无法进行 Web Cookie 视频后台上传", detail={"path": str(path)}) from exc
+            except QzoneNativeVideoCredentialError as exc:
+                raise QzoneParseError(str(exc)) from exc
+            except (OSError, TencentUploadPduError, TencentUploadProtocolError, QzoneTencentVideoUploadError) as exc:
                 raise QzoneRequestError(
-                    "Qzone H5 原生视频后台上传失败",
+                    "QQ 空间 Web Cookie 视频后台上传失败",
                     detail={"type": type(exc).__name__, "message": str(exc)},
                 ) from exc
-            verified_feed = await self._wait_for_native_video_feed(vid=result.vid)
+            publish_response = getattr(result, "publish_response", None)
+            publish_tid = str(getattr(publish_response, "tid", "") or "")
+            verified_feed = await self._wait_for_native_video_feed(vid=result.vid, fid=publish_tid)
             if verified_feed is None:
+                verification_diagnostics = getattr(self, "_last_native_video_verification_diagnostics", None) or {
+                    "vid_present": bool(result.vid),
+                    "publish_tid": publish_tid,
+                    "publish_tid_present": bool(publish_tid),
+                    "result": "not_verified",
+                    "diagnostics_available": False,
+                }
                 raise QzoneRequestError(
-                    "QQ 空间 H5 视频上传/封面上传/发布接口已返回 sVid，但未在最近动态中验证到同一视频；"
-                    "已拒绝宣称发布成功",
+                    "QQ 空间 Web Cookie 视频上传/封面上传已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",
                     detail={
                         "vid": result.vid,
                         "client_key": client_key,
                         "cover_upload": cover_result.to_dict(),
-                        "publish_result": publish_result,
+                        "verification": verification_diagnostics,
                     },
                 )
             return {
-                "fid": str(verified_feed.get("fid") or publish_result.get("tid") or publish_result.get("fid") or ""),
+                "fid": str(verified_feed.get("fid") or ""),
                 "vid": result.vid,
-                "message": "已验证 QQ 空间 H5 原生视频后台直发成功",
+                "message": "已验证 QQ 空间 Web Cookie 视频后台直发成功",
                 "native_video": True,
                 "status": "published_native_video",
                 "operation_status": "verified_feed_video",
                 "media_count": len(media),
                 "photo_count": 1,
                 "raw": {
-                    "method": "h5_video_cover_publish",
+                    "method": "tencent_upload_web_cookie",
                     "upload_result": result.to_dict(),
                     "cover_upload_result": cover_result.to_dict(),
-                    "publish_result": publish_result,
+                    "credentials": {
+                        "login_data_length": len(web_upload_token),
+                        "login_key_length": 0,
+                        "token_type": QZONE_H5_VIDEO_TOKEN_TYPE,
+                        "token_appid": QZONE_H5_VIDEO_TOKEN_APPID,
+                        "token_wt_appid": 0,
+                    },
                     "video": video.to_dict(),
                     "cover": cover.to_dict(),
                     "client_key": client_key,
@@ -1096,13 +1364,24 @@ class QzoneDaemonService:
                 client_key=client_key,
                 publish_time=upload_time,
             )
+            video_upload_business_data = encode_record_video_upload_pic_business_data(
+                uin=self.state.session.uin,
+                content=content,
+                video_size=file_size,
+                duration_ms=duration_ms,
+                sync_weibo=sync_weibo,
+                client_key=client_key,
+                publish_time=upload_time,
+                upload_time=upload_time,
+                refer="mqq",
+            )
             result = await asyncio.to_thread(
                 uploader.upload_video,
                 path,
                 title=video.name or path.name,
                 desc=content,
                 play_time=duration_ms,
-                business_data=publish_business_data,
+                business_data=video_upload_business_data,
                 publish_content=content,
                 sync_weibo=sync_weibo,
                 client_key=client_key,
@@ -1139,9 +1418,21 @@ class QzoneDaemonService:
         publish_tid = str(getattr(publish_response, "tid", "") or "")
         verified_feed = await self._wait_for_native_video_feed(vid=result.vid, fid=publish_tid)
         if verified_feed is None:
+            verification_diagnostics = getattr(self, "_last_native_video_verification_diagnostics", None) or {
+                "vid_present": bool(result.vid),
+                "publish_tid": publish_tid,
+                "publish_tid_present": bool(publish_tid),
+                "result": "not_verified",
+                "diagnostics_available": False,
+            }
             raise QzoneRequestError(
                 "QQ 空间原生视频后台上传已返回 sVid，但未在最近动态中验证到同一视频，已拒绝宣称发布成功",
-                detail={"vid": result.vid, "client_key": client_key, "cover_upload": cover_result.to_dict()},
+                detail={
+                    "vid": result.vid,
+                    "client_key": client_key,
+                    "cover_upload": cover_result.to_dict(),
+                    "verification": verification_diagnostics,
+                },
             )
         return {
             "fid": str(verified_feed.get("fid") or ""),
@@ -1173,11 +1464,12 @@ class QzoneDaemonService:
         content_sanitized: bool = False,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
-        normalized_media = normalize_media_list(media)
+        normalized_media = collapse_single_video_cover_companion_media(normalize_media_list(media))
         normalized_media, _video_sources_changed = materialize_video_source_list(
             normalized_media,
             self.store.root / "video_sources",
         )
+        normalized_media = collapse_single_video_cover_companion_media(normalized_media)
         native_payload = await self._publish_native_video_if_configured(
             content=content,
             sync_weibo=sync_weibo,

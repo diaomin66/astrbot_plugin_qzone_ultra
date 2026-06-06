@@ -240,6 +240,7 @@ class QzoneDaemonController:
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen | None = None
         self._health_cache: tuple[int, str, bool, float] | None = None
+        self._health_cache_data: tuple[int, str, dict[str, Any]] | None = None
         self._health_cache_ttl = 1.0
         self._incompatible_daemon: tuple[int, str] | None = None
 
@@ -337,6 +338,7 @@ class QzoneDaemonController:
 
     def _invalidate_health_cache(self) -> None:
         self._health_cache = None
+        self._health_cache_data = None
 
     @staticmethod
     def _health_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -366,6 +368,48 @@ class QzoneDaemonController:
             and self._bridge_api_version_from_health(payload) >= BRIDGE_API_VERSION
             and str(data.get("daemon_version") or "") == BRIDGE_VERSION
         )
+
+    def _cached_health_data(self, port: int | None = None, secret: str | None = None) -> dict[str, Any]:
+        runtime = self._runtime()
+        resolved_port = int(port or runtime.daemon_port or self.default_port or 0)
+        resolved_secret = secret or runtime.secret
+        if not self._health_cache_data:
+            return {}
+        cached_port, cached_secret, data = self._health_cache_data
+        if cached_port == resolved_port and cached_secret == resolved_secret:
+            return dict(data)
+        return {}
+
+    @staticmethod
+    def _merge_health_status(status: dict[str, Any], health_data: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(health_data, dict) or not health_data:
+            return status
+        merged = dict(status)
+        public_keys = {
+            "daemon_state",
+            "daemon_pid",
+            "daemon_port",
+            "daemon_version",
+            "bridge_api_version",
+            "started_at",
+            "last_seen_at",
+            "uptime_seconds",
+            "login_uin",
+            "session_source",
+            "cookie_summary",
+            "cookie_count",
+            "needs_rebind",
+            "last_ok_at",
+            "last_error",
+            "video_upload",
+            "qzonetoken_hosts",
+            "feed_cache_size",
+            "session_revision",
+        }
+        for key in public_keys:
+            if key in health_data:
+                merged[key] = health_data[key]
+        return merged
 
     async def _stop_incompatible_daemon(self, port: int, secret: str) -> None:
         if self._incompatible_daemon != (int(port or 0), secret):
@@ -462,6 +506,7 @@ class QzoneDaemonController:
                 self._invalidate_health_cache()
                 return False
             self._incompatible_daemon = None
+            self._health_cache_data = (resolved_port, resolved_secret, dict(self._health_data(payload)))
             self._health_cache = (
                 resolved_port,
                 resolved_secret,
@@ -518,7 +563,10 @@ class QzoneDaemonController:
             runtime = self._runtime()
             port = runtime.daemon_port or self.default_port
             if await self._probe_health(port):
-                return self._status_from_state(self.store.read(), daemon_state="ready")
+                return self._merge_health_status(
+                    self._status_from_state(self.store.read(), daemon_state="ready"),
+                    self._cached_health_data(port, runtime.secret),
+                )
             await self._stop_incompatible_daemon(port, runtime.secret)
 
             if not self._daemon_script().exists():
@@ -577,7 +625,10 @@ class QzoneDaemonController:
                             True,
                             asyncio.get_running_loop().time() + self._health_cache_ttl,
                         )
-                        return self._status_from_state(state, daemon_state="ready")
+                        return self._merge_health_status(
+                            self._status_from_state(state, daemon_state="ready"),
+                            self._cached_health_data(port, runtime.secret),
+                        )
                     if self._process and self._process.poll() is not None:
                         break
                     await asyncio.sleep(0.5)
@@ -697,11 +748,13 @@ class QzoneDaemonController:
         runtime = state.runtime
         needs_rebind = self._session_needs_rebind(state.session)
         daemon_state = "offline"
+        health_data: dict[str, Any] = {}
         if probe_daemon and runtime.daemon_port and await self._probe_health(runtime.daemon_port):
-            daemon_state = "needs_rebind" if needs_rebind else "ready"
+            health_data = self._cached_health_data(runtime.daemon_port, runtime.secret)
+            daemon_state = str(health_data.get("daemon_state") or ("needs_rebind" if needs_rebind else "ready"))
         elif state.session.cookies:
             daemon_state = "needs_rebind" if needs_rebind else "degraded"
-        return self._status_from_state(state, daemon_state=daemon_state)
+        return self._merge_health_status(self._status_from_state(state, daemon_state=daemon_state), health_data)
 
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:

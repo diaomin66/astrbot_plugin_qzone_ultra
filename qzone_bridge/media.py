@@ -1008,13 +1008,15 @@ def iter_referenced_media(event: Any) -> list[PostMedia]:
         for value in _iter_mapping_values(component, REFERENCE_OWNER_KEYS):
             media.extend(_collect_referenced_media(value, seen=seen))
 
-    return media
+    return collapse_single_video_cover_companion_media(media)
 
 
 def collect_message_media(payload: Any) -> list[PostMedia]:
     """Return media segments from a message payload fetched from the platform."""
 
-    media = _collect_referenced_media(payload, seen=set(), trusted_message=True)
+    media = collapse_single_video_cover_companion_media(
+        _collect_referenced_media(payload, seen=set(), trusted_message=True)
+    )
     result: list[PostMedia] = []
     seen: set[tuple[str, str]] = set()
     for item in media:
@@ -1117,6 +1119,22 @@ def iter_reference_message_ids(event: Any) -> list[int | str]:
 
 def _media_dedupe_key(item: PostMedia) -> tuple[str, str]:
     return (item.kind, item.source)
+
+
+def collapse_single_video_cover_companion_media(items: Iterable[PostMedia]) -> list[PostMedia]:
+    media: list[PostMedia] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        key = _media_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        media.append(item)
+    videos = [item for item in media if item.kind == "video" or is_video_media(item)]
+    images = [item for item in media if is_supported_image(item)]
+    if len(videos) == 1 and len(images) == 1 and len(media) == 2:
+        return [videos[0]]
+    return media
 
 
 def _append_collected_media(
@@ -1266,17 +1284,13 @@ def collect_post_payload(
                 add_attachment_reference=True,
             )
 
-    for item in iter_referenced_media(event):
-        _append_collected_media(
-            item,
-            media=media,
-            attachments=attachments,
-            reference_parts=reference_parts,
-            seen=seen_media,
-            add_attachment_reference=True,
-        )
-
-    for item in normalize_media_list(extra_media, trusted_local=False):
+    referenced_and_extra_media = [
+        *iter_referenced_media(event),
+        *normalize_media_list(extra_media, trusted_local=False),
+    ]
+    if not media:
+        referenced_and_extra_media = collapse_single_video_cover_companion_media(referenced_and_extra_media)
+    for item in referenced_and_extra_media:
         _append_collected_media(
             item,
             media=media,
@@ -1311,4 +1325,5 @@ def collect_post_payload(
     if reference_parts:
         refs = "\n".join(reference_parts)
         content = "\n".join(part for part in (content, refs) if part)
+    media = collapse_single_video_cover_companion_media(media)
     return PostPayload(content=content, media=media, attachments=attachments)

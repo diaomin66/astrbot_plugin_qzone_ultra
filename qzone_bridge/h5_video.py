@@ -498,7 +498,11 @@ def build_qzone_video_publish_payload(
         "hostuin": int(uin or 0),
         "code_version": "1",
         "richtype": "3",
-        "subrichtype": "7",
+        # Reversed from Qzone's `/models/mood/video:3.1`: URL videos keep
+        # the default subtype 7, but an uploaded local video calls
+        # `setSubType(6)` after a successful `sVid` upload.  This daemon path
+        # always publishes an uploaded `sVid`, so use the local-video subtype.
+        "subrichtype": "6",
         "richval": build_qzone_video_richval(uin=uin, vid=vid),
         "issyncweibo": int(bool(sync_weibo)),
         "format": "json",
