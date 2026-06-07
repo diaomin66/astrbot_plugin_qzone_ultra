@@ -49,15 +49,9 @@ def format_status(status: dict) -> str:
         method = video_upload.get("method") or "-"
         qq_upload_ready = bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
         web_cookie_ready = bool(video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
-        h5_publish_ready = bool(
-            video_upload.get("ready")
-            and video_upload.get("h5_publish_supported")
-            and video_upload.get("h5_publish_experimental")
-        )
-        ready = bool(qq_upload_ready or h5_publish_ready)
-        verification_required = bool(
-            video_upload.get("verification_required") or video_upload.get("h5_publish_verification_required")
-        )
+        h5_diagnostic_ready = bool(video_upload.get("h5_upload_diagnostic_available") or web_cookie_ready)
+        ready = bool(qq_upload_ready)
+        verification_required = bool(video_upload.get("verification_required"))
         if ready:
             upload_state = "ready"
         else:
@@ -66,19 +60,15 @@ def format_status(status: dict) -> str:
         lines.append(f"- qq_upload_configured: {qq_upload_ready}")
         lines.append(f"- web_cookie_configured: {web_cookie_ready}")
         lines.append(f"- video_upload_verification_required: {verification_required}")
+        if h5_diagnostic_ready:
+            lines.append("- h5_video_upload: diagnostic_only")
         if qq_upload_ready and source != "-":
             lines.append(f"- video_upload_source: {source}")
         if ready:
             lines.append(f"- video_upload_method: {method}")
             lines.append(f"- video_upload_updated: {updated_at}")
-            if "h5_upload_available" in video_upload:
-                lines.append(f"- h5_video_upload: {bool(video_upload.get('h5_upload_available'))}")
-            if "h5_publish_supported" in video_upload:
-                lines.append(f"- h5_video_publish: {bool(video_upload.get('h5_publish_supported'))}")
-            if "h5_publish_experimental" in video_upload:
-                lines.append(f"- h5_video_publish_experimental: {bool(video_upload.get('h5_publish_experimental'))}")
-            if verification_required:
-                lines.append("- h5_video_publish_note: requires appid=311 + same sVid feed/detail verification")
+        if "h5_publish_supported" in video_upload:
+            lines.append(f"- h5_video_publish_supported: {bool(video_upload.get('h5_publish_supported'))}")
     if status.get("daemon_port"):
         lines.append(f"- endpoint: 127.0.0.1:{status['daemon_port']}")
     if status.get("daemon_pid"):

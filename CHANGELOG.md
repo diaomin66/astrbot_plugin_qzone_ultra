@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- fix: make `/qzone autovideoauth` bind Qzone Web Cookie/p_skey when OneBot only returns Cookie/CSRF, so the daemon H5 video+cover path becomes ready without requiring QQ upload A2/vLoginData.
-- fix: report Qzone Web Cookie/p_skey H5 video publishing as `video_upload: ready` while keeping missing A2/vLoginData as a non-blocking Tencent upload fallback diagnostic.
+- fix: keep Qzone Web Cookie/p_skey H5 video upload diagnostic-only when OneBot does not return QQ upload A2/vLoginData.
+- fix: report `video_upload: ready` only when QQ upload A2/vLoginData is configured and keep H5 publish disabled for public video posts.
 - fix: accept more OneBot protocol-end A2/vLoginData shapes, including hex/base64 alias fields, targeted NTQQ raw binary strings, and LLOneBot `llonebot_debug` PMHQ `httpSend` login-misc forwarding.
 - fix: block video posts when `native_video_publish` is disabled so video attachments can no longer be reported as successful cover/rendered-image publishes.
 - fix: support generic OneBot protocol dispatchers for video auth probing, including `send_api`/`send_action`/`request_api`/`api_call`, nested protocol client wrappers, single `{"action": "...", "params": {...}}` envelopes, and the `llbot` platform alias.
@@ -18,9 +18,9 @@
 
 - 修复：引用视频或 Pages 上传视频落到无扩展名临时文件时仍按视频保留，避免媒体被丢弃后误报“说说内容或图片不能为空”。
 - 修复：Pages 发布入口支持视频上传、视频预览和视频-only 发布，上传按钮与提示从图片扩展为图片/视频。
-- 新增：daemon 原生视频直发优先使用 Qzone H5 `sliceUpload/FileUploadVideo`，直接复用已绑定 Cookie 的 `p_skey` 上传视频取得 `sVid`，再通过 Web 视频 `richval` 调 `emotion_cgi_publish_v6` 发布真实视频说说。
-- 新增：H5 视频分片上传使用 `filename="blob"` 且默认 `Content-Type: application/octet-stream` 的 multipart `data` 片段；若接口返回 `-115`，自动后备重试无 part `Content-Type` 形态；发布成功前继续轮询最近动态验证同一 `sVid`。
-- 变更：QQ upload A2/vLoginData 材料和 `/qzone autovideoauth` 变为旧 Tencent upload SDK 后备；已有 Qzone Cookie/`p_skey` 时不再因 OneBot 没有返回 A2 材料而阻止 daemon 原生视频直发。
+- 变更：H5 `sliceUpload/FileUploadVideo` 保留为 Cookie/`p_skey` 上传可达性诊断历史，不再作为 daemon 公共视频说说发布路径。
+- 变更：`video_upload: ready` 重新收紧为 QQ upload A2/vLoginData 已配置；仅有 Qzone Cookie/`p_skey` 时不会绕过 OneBot 未返回 A2 材料的阻断。
+- 变更：稳定公共视频路径仍要求 Tencent upload SDK A2/vLoginData，或协议端原生视频发布 action 返回 `sVid` 后由 daemon 验证 `appid=311`、同一 `sVid`、全部人可见。
 - 新增：daemon 原生视频直发补齐 Android 双腿上传链路：`video_qzone` 上传视频取得 `sVid` 后，继续用 `pic_qzone` 上传视频封面，并携带 `vid/clientkey/mobile_fakefeeds_clientkey/mix_*` 字段触发真实视频动态。
 - 新增：daemon 原生视频发布成功前会轮询最近动态并验证同一 `sVid`；只拿到上传响应但没有生成 feed 时会报错，不再宣称发布成功。
 - 修复：单个视频在缺少 QQ upload 登录材料时不再静默提取封面并按图片说说发布；daemon 会阻止视频帧替代发布并提示绑定 `/qzone videoauth` 或 `/qzone autovideoauth`。

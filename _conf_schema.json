@@ -15,7 +15,7 @@
     "description": "优先使用 daemon 原生视频后台直发",
     "type": "bool",
     "default": true,
-    "hint": "开启后，单个本地视频说说会交给本地 daemon 后台直发。默认稳定公开视频路径需要 QQ upload A2/vLoginData：可通过 /qzone videoauth、/qzone autovideoauth 或环境变量提供，字段可用 a2/a2_hex/a2_b64、vLoginData/vLoginDataHex/vLoginDataB64、Node Buffer/数字数组或目标 login-misc 原始二进制字符串。仅有 Qzone Web Cookie/p_skey 时，H5 video_qzone + pic_qzone 上传只作为实验诊断路径，默认不会发布，避免生成仅自己可见的视频动态；如需实测必须显式设置 QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH=1。未验证到 appid=311 且同一 sVid 的全部人可见 feed/detail 时阻止发布，不再把视频帧当图片发出，也不再打开 QQ/QQNT 客户端。关闭后会拒绝视频发布，避免把视频封面/渲染图误报为成功。"
+    "hint": "Enabled: a single local video is sent through the local daemon native video publisher. Stable public video publishing requires QQ upload A2/vLoginData from /qzone videoauth, /qzone autovideoauth, or environment variables; accepted shapes include a2/a2_hex/a2_b64, vLoginData/vLoginDataHex/vLoginDataB64, Node Buffer/number arrays, and targeted login-misc raw binary strings. Qzone Web Cookie/p_skey H5 video_qzone + pic_qzone upload is diagnostic-only and is not used for publishing. Publishing succeeds only after appid=311, same sVid, and public/all-visible feed/detail verification. Disabling this option rejects video posts instead of reporting a cover/rendered image as success."
   },
   "llm": {
     "description": "大模型配置",

@@ -3509,8 +3509,8 @@ class QzoneStablePlugin(Star):
                 raise QzoneParseError(
                     "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
                     "已阻止本次发布。请开启 native_video_publish，并通过 /qzone videoauth 绑定 QQ upload A2/vLoginData；"
-                    "如果只使用 /qzone autovideoauth 绑定到 Web Cookie H5 video+cover 后台直发路径，发布后仍必须验证到 "
-                    "appid=311 且同一 sVid，未验证会直接报错。"
+                    "如果 /qzone autovideoauth 只拿到 Web Cookie/H5 诊断材料，视频发布仍会被阻止；"
+                    "必须绑定 QQ upload A2/vLoginData 或使用可返回 sVid 的 OneBot 原生发布 action。"
                 )
             render_post = await self._prepare_publish_payload(post)
             onebot_payload = await self._publish_onebot_native_video_if_available(
@@ -4504,13 +4504,7 @@ class QzoneStablePlugin(Star):
         video_upload = status.get("video_upload")
         if not isinstance(video_upload, dict):
             return False
-        if video_upload.get("qq_upload_configured") or video_upload.get("configured"):
-            return True
-        return bool(
-            video_upload.get("ready")
-            and video_upload.get("h5_publish_supported")
-            and video_upload.get("h5_publish_experimental")
-        )
+        return bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
 
     async def _auto_bind_video_upload_credentials(
         self,

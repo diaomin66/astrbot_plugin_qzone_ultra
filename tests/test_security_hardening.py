@@ -936,10 +936,11 @@ def test_controller_status_merges_h5_video_health_from_daemon(tmp_path) -> None:
                     "needs_rebind": False,
                     "video_upload": {
                         "configured": False,
-                        "method": "h5_video_cover_publish",
+                        "method": "",
                         "web_cookie_configured": True,
                         "h5_upload_available": True,
-                        "h5_publish_supported": True,
+                        "h5_upload_diagnostic_available": True,
+                        "h5_publish_supported": False,
                     },
                 },
             }
@@ -955,8 +956,9 @@ def test_controller_status_merges_h5_video_health_from_daemon(tmp_path) -> None:
     status = asyncio.run(controller.get_status())
 
     assert status["daemon_state"] == "ready"
-    assert status["video_upload"]["method"] == "h5_video_cover_publish"
-    assert status["video_upload"]["h5_publish_supported"] is True
+    assert status["video_upload"]["method"] == ""
+    assert status["video_upload"]["h5_upload_diagnostic_available"] is True
+    assert status["video_upload"]["h5_publish_supported"] is False
     assert status["video_upload"]["web_cookie_configured"] is True
 
 
@@ -4421,11 +4423,11 @@ def test_autovideoauth_requires_a2_even_when_h5_cookie_available(
             "configured": False,
             "method": "",
             "ready": False,
-            "verification_required": True,
+            "verification_required": False,
             "qq_upload_configured": False,
             "h5_upload_available": True,
             "h5_publish_supported": False,
-            "h5_publish_verification_required": True,
+            "h5_publish_verification_required": False,
             "web_cookie_configured": True,
             "requires": "qq_upload_a2_vlogin_data",
         },
@@ -4553,6 +4555,7 @@ def test_status_renderer_reports_cookie_h5_path_as_missing_without_experimental_
     assert "- qq_upload_configured: False" in rendered
     assert "- web_cookie_configured: True" in rendered
     assert "- video_upload_verification_required: False" in rendered
+    assert "- h5_video_publish_supported: False" in rendered
     assert "- video_upload_method:" not in rendered
 
 
