@@ -166,7 +166,7 @@ get_qzone_video_upload_a2
 get_login_misc_data
 ```
 
-返回值必须是非空 QQ upload A2/vLoginData 二进制材料，可用 base64、hex、Node `Buffer` JSON 或数字数组表达。Cookie/CSRF、PSKey、`clientKey/keyIndex` 只能作为 Web 诊断材料，不能冒充 A2/vLoginData。
+返回值必须是非空 QQ upload A2/A2Ticket/vLoginData 二进制材料，可用 base64、hex、Node `Buffer` JSON 或数字数组表达。Cookie/CSRF、PSKey、`clientKey/keyIndex`、`ForceFetchFileTransSig` 只能作为诊断材料，不能冒充 QQ upload 登录材料。
 
 ## NapCat / LLBot 实现建议
 
@@ -195,3 +195,23 @@ get_login_misc_data
 - action 响应出现非公开权限标记：立即失败。
 - daemon 未验证到 `appid=311`、同一 `sVid`、全部人可见：失败。
 - 视频组合不是单个可信本地视频：不走协议端原生发布。
+
+## A2Ticket credential extension
+
+If a protocol end cannot implement native `publish_qzone_video_mood`, it may expose true QQ upload binary login material for the daemon Tencent-upload path. Native publish actions must not return sensitive material; only credential-extension actions may return binary upload material. The preferred action names are:
+
+```text
+get_qzone_video_upload_a2_ticket
+get_qzone_upload_a2_ticket
+get_video_upload_a2_ticket
+get_qq_upload_a2_ticket
+get_ntqq_a2_ticket
+get_nt_a2_ticket
+get_a2_ticket
+```
+
+The plugin also probes the same names with a leading underscore. The response must contain real QQ upload A2/vLoginData/A2Ticket binary material, for example `a2TicketHex`, `a2TicketB64`, `A2TicketBytes`, `vLoginData`, or a Node `Buffer` result. LLBot/LLOneBot PMHQ implementers may wire this to `nodeIKernelTicketService/getA2Ticket` or `wrapperSession.getTicketService().getA2Ticket`.
+
+The code also accepts compatibility aliases such as `get_qzone_video_a2_ticket`, `get_video_a2_ticket`, and `get_upload_a2_ticket`; implementers should prefer the names above so the action purpose stays unambiguous.
+
+These values are not acceptable substitutes and will only be recorded as diagnostics: Cookie, `p_skey`, PSKey, CSRF/bkn, `clientKey/keyIndex`, `forceFetchClientKey`, `ForceFetchFileTransSig`, file-transfer signatures, or Web jump-login material. `ForceFetchFileTransSig` is rejected even inside a targeted A2/A2Ticket response. A response that only proves Web/H5 access must not report video upload readiness.

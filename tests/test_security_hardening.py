@@ -4789,6 +4789,119 @@ def test_onebot_video_upload_probe_accepts_generic_onebot_a2_action_buffer() -> 
     assert probe.credentials.source == "test:get_qzone_video_upload_a2"
 
 
+def test_onebot_video_upload_probe_accepts_generic_onebot_a2_ticket_action() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-ticket-from-generic-action"
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == "get_a2_ticket":
+                return {"result": 0, "value": {"type": "Buffer", "data": list(raw_a2)}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:get_a2_ticket"
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "_get_a2_ticket",
+        "_get_ntqq_a2_ticket",
+        "_get_qzone_video_upload_a2_ticket",
+        "get_ntqq_a2_ticket",
+        "get_nt_a2_ticket",
+        "get_qzone_video_upload_a2_ticket",
+        "get_qzone_upload_a2_ticket",
+        "get_video_upload_a2_ticket",
+        "get_qq_upload_a2_ticket",
+    ],
+)
+def test_onebot_video_upload_probe_accepts_a2_ticket_action_aliases(alias: str) -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = f"binary-a2-ticket-from-{alias}".encode("ascii")
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == alias:
+                return {"result": 0, "value": {"type": "Buffer", "data": list(raw_a2)}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == f"test:{alias}"
+
+
+def test_onebot_video_upload_probe_accepts_llonebot_pmhq_get_a2_ticket() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-ticket-from-pmhq"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "call"
+                and params.get("args") == ["wrapperSession.getTicketService().getA2Ticket", []]
+            ):
+                return {"result": 0, "value": raw_a2.hex()}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:llonebot_debug"
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("invoke", ["nodeIKernelTicketService/getA2Ticket", []]),
+        ("call", ["wrapperSession.getTicketService().GetA2Ticket", []]),
+    ],
+)
+def test_onebot_video_upload_probe_accepts_llonebot_pmhq_a2_ticket_variants(method: str, args: list[object]) -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = f"binary-a2-ticket-from-pmhq-{method}".encode("ascii")
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == method
+                and params.get("args") == args
+            ):
+                return {"result": 0, "value": raw_a2.hex()}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source == "test:llonebot_debug"
+
+
+@pytest.mark.parametrize("key", ["a2Ticket", "a2_ticket"])
+def test_onebot_video_upload_credentials_accept_a2_ticket_aliases(key: str) -> None:
+    from qzone_bridge.onebot_upload import extract_video_upload_credentials
+
+    credentials = extract_video_upload_credentials({"data": {key: b"binary-a2-ticket-alias".hex()}})
+
+    assert credentials is not None
+    assert credentials.login_data_b64 == base64.b64encode(b"binary-a2-ticket-alias").decode("ascii")
+
+
 def test_onebot_video_upload_probe_accepts_embedded_ntqq_login_misc_service() -> None:
     from qzone_bridge.onebot_upload import probe_video_upload_credentials
 
@@ -4819,6 +4932,49 @@ def test_onebot_video_upload_probe_accepts_embedded_ntqq_login_misc_service() ->
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source.startswith("test:embedded:")
     assert any("getLoginService().getLoginMiscData:key=a2" in item for item in probe.returned_actions)
+
+
+def test_onebot_video_upload_probe_accepts_embedded_ntqq_ticket_service() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-embedded-ticket-service"
+
+    class _TicketService:
+        async def getA2Ticket(self):
+            return {"result": 0, "value": raw_a2.hex()}
+
+    class _Session:
+        def getTicketService(self):
+            return _TicketService()
+
+    class _Context:
+        session = _Session()
+
+    class _Bot:
+        context = _Context()
+
+        async def call_action(self, *_args, **_params):
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is not None
+    assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
+    assert probe.credentials.source.startswith("test:embedded:")
+    assert any("getTicketService().getA2Ticket" in item for item in probe.returned_actions)
+
+
+def test_onebot_video_upload_probe_ignores_async_http_get_as_pmhq_getter(recwarn: pytest.WarningsRecorder) -> None:
+    from qzone_bridge.onebot_upload import _pmhq_candidates
+
+    class _HttpClientLike:
+        async def get(self, _url: str):
+            return {"not": "pmhq"}
+
+    candidates = _pmhq_candidates("owner", _HttpClientLike())
+
+    assert candidates == []
+    assert not [warning for warning in recwarn if issubclass(warning.category, RuntimeWarning)]
 
 
 def test_onebot_video_upload_probe_accepts_embedded_napcat_wrapper_login_service() -> None:
@@ -5006,6 +5162,79 @@ def test_onebot_video_upload_probe_does_not_accept_hex_clientkey_value_as_a2() -
 
     assert probe.credentials is None
     assert "get_qzone_video_upload_credentials" in probe.client_key_actions
+
+
+def test_onebot_video_upload_probe_does_not_treat_file_trans_sig_as_a2() -> None:
+    from qzone_bridge.onebot_upload import _action_may_return_raw_login_data, _action_targets_login_data
+
+    params = {"apiClass": "pmhq", "method": "invoke", "args": ["nodeIKernelTicketService/forceFetchFileTransSig", []]}
+
+    assert _action_may_return_raw_login_data("llonebot_debug", params) is False
+    assert _action_targets_login_data("llonebot_debug", params) is False
+
+
+@pytest.mark.parametrize(
+    ("method", "args", "payload"),
+    [
+        ("invoke", ["nodeIKernelTicketService/forceFetchFileTransSig", []], {"value": b"file-trans-sig".hex()}),
+        ("invoke", ["nodeIKernelTicketService/getA2Ticket", []], {"value": b"not-a2".hex(), "ForceFetchFileTransSig": "present"}),
+        ("call", ["wrapperSession.getTicketService().getA2Ticket", []], {"fileTransSig": {"type": "Buffer", "data": list(b"sig")}, "value": b"not-a2".hex()}),
+    ],
+)
+def test_onebot_video_upload_probe_rejects_file_trans_sig_end_to_end(
+    method: str,
+    args: list[object],
+    payload: dict[str, object],
+) -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == method
+                and params.get("args") == args
+            ):
+                return payload
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+
+
+@pytest.mark.parametrize("metadata_key", ["PSKey", "Cookie", "ForceFetchFileTransSig"])
+def test_onebot_video_upload_probe_rejects_non_a2_ticket_metadata_as_raw_a2(metadata_key: str) -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    hex_like_non_a2 = "00112233445566778899aabbccddeeff"
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            if action == "get_qzone_video_upload_credentials":
+                return {"result": 0, "value": hex_like_non_a2, metadata_key: "not-upload-a2"}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "get_qzone_video_upload_credentials" in probe.returned_actions
+
+
+def test_onebot_video_upload_probe_rejects_force_fetch_client_key_buffer_as_a2() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "llonebot_debug" and params.get("method") == "forceFetchClientKey":
+                return {"type": "Buffer", "data": list(b"client-key-buffer")}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "llonebot_debug" in probe.client_key_actions
 
 
 def test_onebot_video_upload_credentials_accept_binary_a2_material() -> None:
