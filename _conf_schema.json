@@ -15,7 +15,7 @@
     "description": "优先使用 daemon 原生视频后台直发",
     "type": "bool",
     "default": true,
-    "hint": "Enabled: a single local video is sent through the local daemon native video publisher. Stable public video publishing requires QQ upload A2/vLoginData from /qzone videoauth, /qzone autovideoauth, or environment variables; accepted shapes include a2/a2_hex/a2_b64, vLoginData/vLoginDataHex/vLoginDataB64, Node Buffer/number arrays, and targeted login-misc raw binary strings. Qzone Web Cookie/p_skey H5 video_qzone + pic_qzone upload is diagnostic-only and is not used for publishing. Publishing succeeds only after appid=311, same sVid, and public/all-visible feed/detail verification. Disabling this option rejects video posts instead of reporting a cover/rendered image as success."
+    "hint": "Enabled: a single local video is sent through the local daemon native video publisher. When Qzone Web Cookie/p_skey is available, the daemon prefers the H5 video_qzone + pic_qzone path: publish the video mood, call the permission update CGI to set ugc_right=1/who=1, then verify public/all-visible feed/detail before reporting success. QQ upload A2/vLoginData from /qzone videoauth, /qzone autovideoauth, or environment variables remains a fallback; accepted shapes include a2/a2_hex/a2_b64, vLoginData/vLoginDataHex/vLoginDataB64, Node Buffer/number arrays, and targeted login-misc raw binary strings. Disabling this option rejects video posts instead of reporting a cover/rendered image as success."
   },
   "llm": {
     "description": "大模型配置",

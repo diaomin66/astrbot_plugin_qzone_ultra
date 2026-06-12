@@ -854,6 +854,26 @@ def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
     )
 
 
+def test_remote_media_policy_allows_trusted_qq_media_domain_with_mixed_public_and_fake_ip_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_policy.remote_media_host_resolves_safely.cache_clear()
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (source_policy.socket.AF_INET, 0, 0, "", ("198.18.0.56", 0)),
+            (source_policy.socket.AF_INET, 0, 0, "", ("1.1.1.1", 0)),
+        ],
+    )
+
+    assert source_policy.is_remote_media_url_allowed(
+        "https://multimedia.nt.qq.com.cn/download?"
+        "appid=1413&format=origin&orgfmt=t264&spec=0&"
+        "rkey=test-onebot-qq-multimedia-video-rkey"
+    )
+
+
 def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -71,6 +71,17 @@ def is_proxy_fake_ip_address(value: str) -> bool:
     return any(address in network for network in PROXY_FAKE_IP_NETWORKS)
 
 
+def _remote_media_addresses_are_safe_for_host(host: str, addresses: set[str]) -> bool:
+    if not addresses:
+        return False
+    if is_trusted_remote_media_host(host):
+        return all(
+            is_proxy_fake_ip_address(address) or not is_unsafe_media_host(address)
+            for address in addresses
+        )
+    return not any(is_unsafe_media_host(address) for address in addresses)
+
+
 @lru_cache(maxsize=512)
 def remote_media_host_resolves_safely(host: str) -> bool:
     normalized = str(host or "").strip().lower().rstrip(".")
@@ -88,11 +99,7 @@ def remote_media_host_resolves_safely(host: str) -> bool:
     except OSError:
         return False
     addresses = {item[4][0] for item in infos if item and item[4]}
-    if not addresses:
-        return False
-    if is_trusted_remote_media_host(normalized) and all(is_proxy_fake_ip_address(address) for address in addresses):
-        return True
-    return not any(is_unsafe_media_host(address) for address in addresses)
+    return _remote_media_addresses_are_safe_for_host(normalized, addresses)
 
 
 def resolve_remote_media_redirect(base_url: str, location: str) -> str:
