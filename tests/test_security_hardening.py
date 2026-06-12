@@ -837,6 +837,23 @@ def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
     )
 
 
+def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_policy.remote_media_host_resolves_safely.cache_clear()
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", ("198.18.0.56", 0))],
+    )
+
+    assert source_policy.is_remote_media_url_allowed(
+        "https://multimedia.nt.qq.com.cn/download?"
+        "appid=1413&format=origin&orgfmt=t264&spec=0&"
+        "rkey=test-onebot-qq-multimedia-video-rkey"
+    )
+
+
 def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4566,6 +4583,95 @@ def test_plugin_publish_uses_onebot_protocol_native_video_when_available(
         "method": "onebot_protocol_video_publish",
     }
     assert payload["raw"]["method"] == "onebot_protocol_video_publish"
+
+
+def test_plugin_publish_prefers_ready_daemon_h5_over_broken_onebot_action(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake video bytes")
+    original = main.PostPayload(
+        content="hello",
+        media=[
+            main.PostMedia(
+                kind="video",
+                source=str(source),
+                name="clip.mp4",
+                mime_type="video/mp4",
+                trusted_local=True,
+            )
+        ],
+    )
+    cover = main.PostPayload(
+        content="hello",
+        media=[main.PostMedia(kind="image", source=str(tmp_path / "cover.jpg"), raw_type="video", trusted_local=True)],
+    )
+    captured: dict[str, object] = {"onebot_called": False, "bind_called": False}
+
+    async def fake_prepare(post):
+        return cover
+
+    async def fake_onebot_publish(*_args, **_kwargs):
+        captured["onebot_called"] = True
+        raise QzoneRequestError(
+            "OneBot Qzone video publish action failed after it was invoked; refusing daemon fallback to avoid duplicate publish"
+        )
+
+    async def fake_bind(_event=None):
+        captured["bind_called"] = True
+        raise AssertionError("daemon H5-ready path should not probe A2 before publish")
+
+    class _Controller:
+        async def get_status(self, **kwargs):
+            captured["status_kwargs"] = kwargs
+            return {
+                "video_upload": {
+                    "ready": True,
+                    "configured": False,
+                    "qq_upload_configured": False,
+                    "web_cookie_configured": True,
+                    "h5_upload_available": True,
+                    "h5_publish_supported": True,
+                    "method": "h5_video_publish_update_visibility",
+                }
+            }
+
+        async def publish_post(self, **kwargs):
+            captured["publish_kwargs"] = kwargs
+            return {
+                "vid": "vid-h5",
+                "fid": "fid-h5",
+                "native_video": True,
+                "operation_status": "verified_feed_video_public_after_permission_update",
+                "raw": {"method": "h5_video_publish_update_visibility"},
+            }
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(native_video_publish=True)
+    plugin.data_dir = tmp_path
+    plugin.controller = _Controller()
+    plugin._prepare_publish_payload = fake_prepare
+    plugin._maybe_bind_video_upload_credentials = fake_bind
+    plugin._capture_onebot_client = lambda event=None: object()
+    monkeypatch.setattr(main, "publish_qzone_video_via_onebot", fake_onebot_publish)
+
+    render_post, payload = asyncio.run(plugin._publish_post_payload(original, event=types.SimpleNamespace()))
+
+    assert render_post is cover
+    assert payload["operation_status"] == "verified_feed_video_public_after_permission_update"
+    assert payload["raw"]["method"] == "h5_video_publish_update_visibility"
+    assert captured["onebot_called"] is False
+    assert captured["bind_called"] is False
+    assert captured["status_kwargs"] == {}
+    assert captured["publish_kwargs"] == {
+        "content": "hello",
+        "sync_weibo": False,
+        "media": [original.media[0].to_dict()],
+        "content_sanitized": True,
+    }
 
 
 def test_plugin_publish_routes_mixed_video_media_to_daemon_instead_of_cover_fallback(

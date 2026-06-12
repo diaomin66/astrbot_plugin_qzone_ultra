@@ -3495,6 +3495,16 @@ class QzoneStablePlugin(Star):
             raw.setdefault("onebot_publish", result.to_dict())
         return payload
 
+    async def _daemon_video_publish_ready(self) -> bool:
+        """Return whether the local daemon can already publish videos directly."""
+
+        try:
+            status = await self.controller.get_status()
+        except Exception as exc:
+            logger.debug("qzone daemon video publish readiness check skipped: %s", exc)
+            return False
+        return self._status_has_video_publish_ready(status)
+
     async def _publish_post_payload(
         self,
         post: PostPayload,
@@ -3513,14 +3523,16 @@ class QzoneStablePlugin(Star):
                     "或使用可返回 sVid 且声明公开视频权限的 OneBot 原生发布 action。"
                 )
             render_post = await self._prepare_publish_payload(post)
-            onebot_payload = await self._publish_onebot_native_video_if_available(
-                post,
-                sync_weibo=sync_weibo,
-                event=event,
-            )
-            if onebot_payload is not None:
-                return render_post, onebot_payload
-            await self._maybe_bind_video_upload_credentials(event)
+            daemon_video_ready = await self._daemon_video_publish_ready()
+            if not daemon_video_ready:
+                onebot_payload = await self._publish_onebot_native_video_if_available(
+                    post,
+                    sync_weibo=sync_weibo,
+                    event=event,
+                )
+                if onebot_payload is not None:
+                    return render_post, onebot_payload
+                await self._maybe_bind_video_upload_credentials(event)
             payload = await self.controller.publish_post(
                 content=post.content,
                 sync_weibo=sync_weibo,
