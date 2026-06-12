@@ -11,6 +11,17 @@ from urllib.parse import urljoin, urlparse
 REMOTE_MEDIA_SCHEMES = {"http", "https"}
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 UNSAFE_HOST_NAMES = {"localhost", "localhost.localdomain"}
+PROXY_FAKE_IP_NETWORKS = (
+    ipaddress.ip_network("198.18.0.0/15"),
+)
+TRUSTED_REMOTE_MEDIA_HOST_SUFFIXES = (
+    "multimedia.nt.qq.com.cn",
+    "qpic.cn",
+    "gtimg.cn",
+    "qlogo.cn",
+    "qzone.qq.com",
+    "photo.qq.com",
+)
 
 
 def is_windows_drive_path(source: str) -> bool:
@@ -45,6 +56,21 @@ def is_unsafe_media_host(host: str) -> bool:
     )
 
 
+def is_trusted_remote_media_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if not normalized or is_unsafe_media_host(normalized):
+        return False
+    return any(normalized == suffix or normalized.endswith(f".{suffix}") for suffix in TRUSTED_REMOTE_MEDIA_HOST_SUFFIXES)
+
+
+def is_proxy_fake_ip_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip().strip("[]"))
+    except ValueError:
+        return False
+    return any(address in network for network in PROXY_FAKE_IP_NETWORKS)
+
+
 @lru_cache(maxsize=512)
 def remote_media_host_resolves_safely(host: str) -> bool:
     normalized = str(host or "").strip().lower().rstrip(".")
@@ -64,6 +90,8 @@ def remote_media_host_resolves_safely(host: str) -> bool:
     addresses = {item[4][0] for item in infos if item and item[4]}
     if not addresses:
         return False
+    if is_trusted_remote_media_host(normalized) and all(is_proxy_fake_ip_address(address) for address in addresses):
+        return True
     return not any(is_unsafe_media_host(address) for address in addresses)
 
 

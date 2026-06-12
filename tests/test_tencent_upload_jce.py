@@ -214,7 +214,7 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
         video_size=4096,
         duration_ms=1234,
         sync_weibo=True,
-        client_key="3112333596_1780329600",
+        client_key="3112333596_1780329600123",
         publish_time=1780329600,
         upload_time=1780329600,
         refer="qzone",
@@ -231,13 +231,13 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
     pic_payload = uni_map[QZONE_UPLOAD_PIC_INFO_REQ_UNI_KEY][QZONE_UPLOAD_PIC_INFO_REQ_TYPE]
     pic_req = field_value(decode_struct(pic_payload), 0)
 
-    assert field_value(pic_req, 8) == 1780329600
+    assert field_value(pic_req, 8) == 1780329600123
     assert field_value(pic_req, 9) is not None
     assert field_value(pic_req, 6) == 2
     assert field_value(pic_req, 22) == 1
     assert field_value(pic_req, 23) == 1780329600
     assert field_value(pic_req, 24) == {
-        "mobile_fakefeeds_clientkey": "3112333596_1780329600",
+        "mobile_fakefeeds_clientkey": "3112333596_1780329600123",
         "refer": "qzone",
     }
     assert field_value(pic_req, 29) == QZONE_RECORD_VIDEO_BUSINESS_TYPE
@@ -247,7 +247,7 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
     assert field_value(pic_req, 31)["mix_time"] == "1234"
 
     extend_nodes = field_value(pic_req, 10)
-    assert field_value(extend_nodes, 4) == {"clientkey": "3112333596_1780329600"}
+    assert field_value(extend_nodes, 4) == {"clientkey": "3112333596_1780329600123"}
 
     inner_business = field_value(pic_req, 30)
     inner_uni_map = field_value(decode_struct(inner_business), 0)
@@ -255,7 +255,7 @@ def test_record_video_upload_pic_business_data_encodes_android_unipacket() -> No
     publish_req = field_value(decode_struct(publish_payload), 0)
     assert field_value(publish_req, 1) == "hello video"
     assert field_value(publish_req, 3) == 1
-    assert field_value(publish_req, 11) == "3112333596_1780329600"
+    assert field_value(publish_req, 11) == "3112333596_1780329600123"
     assert field_value(field_value(publish_req, 13), 0) == 1
     assert field_value(publish_req, 15) == 1780329600
     assert field_value(publish_req, 19)["has_video"] == "1"
@@ -456,7 +456,7 @@ def test_qzone_tencent_video_uploader_control_and_slice_flow(tmp_path: Path) -> 
     ]
 
 
-def test_qzone_tencent_video_uploader_uses_shared_android_upload_time(tmp_path: Path) -> None:
+def test_qzone_tencent_video_uploader_uses_android_seconds_upload_time_and_millisecond_client_key(tmp_path: Path) -> None:
     video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 9), JceField(2, b"biz-rsp")])
     result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
     control_rsp = jce_struct([JceField(1, result), JceField(2, "session-1"), JceField(3, 5), JceField(5, video_rsp)])
@@ -476,7 +476,7 @@ def test_qzone_tencent_video_uploader_uses_shared_android_upload_time(tmp_path: 
         video,
         title="clip.mp4",
         publish_content="hello",
-        client_key="3112333596_1780329600",
+        client_key="3112333596_1780329600123",
         upload_time=1780329600,
     )
 
@@ -491,14 +491,54 @@ def test_qzone_tencent_video_uploader_uses_shared_android_upload_time(tmp_path: 
     publish_req = field_value(decode_struct(publish_payload), 0)
 
     assert field_value(info_nodes, 3) == 1780329600
-    assert field_value(info_nodes, 11)["clientkey"] == "3112333596_1780329600"
+    assert field_value(info_nodes, 11)["clientkey"] == "3112333596_1780329600123"
     assert field_value(pic_req, 23) == 1780329600
-    assert field_value(pic_req, 24)["mobile_fakefeeds_clientkey"] == "3112333596_1780329600"
-    assert field_value(publish_req, 11) == "3112333596_1780329600"
+    assert field_value(pic_req, 8) == 1780329600123
+    assert field_value(pic_req, 24)["mobile_fakefeeds_clientkey"] == "3112333596_1780329600123"
+    assert field_value(publish_req, 11) == "3112333596_1780329600123"
     assert field_value(publish_req, 15) == 1780329600
     assert uploaded.upload_time == 1780329600
-    assert uploaded.client_key == "3112333596_1780329600"
+    assert uploaded.client_key == "3112333596_1780329600123"
     assert uploaded.to_dict()["upload_time"] == 1780329600
+
+
+def test_qzone_tencent_video_uploader_normalizes_millisecond_video_upload_time(tmp_path: Path) -> None:
+    video_rsp = encode_struct([JceField(0, "vid-1"), JceField(1, 9), JceField(2, b"biz-rsp")])
+    result = jce_struct([JceField(1, 0), JceField(2, 0), JceField(3, "ok")])
+    control_rsp = jce_struct([JceField(1, result), JceField(2, "session-1"), JceField(3, 5), JceField(5, video_rsp)])
+    socket = _FakeSocket(
+        [encode_upload_pdu(TENCENT_UPLOAD_CMD_CONTROL, 101, encode_struct([JceField(0, {"1": control_rsp})]))]
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"chunk")
+
+    uploader = QzoneTencentVideoUploader(
+        uin=3112333596,
+        login_data=b"login-data",
+        login_key=b"login-key",
+        socket_factory=lambda *args, **kwargs: socket,
+    )
+    uploaded = uploader.upload_video(
+        video,
+        title="clip.mp4",
+        publish_content="hello",
+        client_key="3112333596_1780329600123",
+        upload_time=1780329600123,
+        publish_time=1780329600123,
+    )
+
+    control_frame = decode_upload_pdu(socket.sent[0])
+    control_map = field_value(decode_struct(control_frame.payload), 0)
+    info_nodes = decode_struct(field_value(control_map["1"], 8))
+    pic_req = _decode_android_upload_pic_business_packet(field_value(info_nodes, 5))
+    inner_uni_map = field_value(decode_struct(field_value(pic_req, 30)), 0)
+    publish_payload = inner_uni_map[QZONE_PUBLISH_MOOD_UNI_KEY][QZONE_PUBLISH_MOOD_TYPE]
+    publish_req = field_value(decode_struct(publish_payload), 0)
+
+    assert field_value(info_nodes, 3) == 1780329600
+    assert field_value(pic_req, 23) == 1780329600
+    assert field_value(publish_req, 15) == 1780329600
+    assert uploaded.upload_time == 1780329600
 
 
 def test_qzone_tencent_video_uploader_decodes_publishmood_response(tmp_path: Path) -> None:

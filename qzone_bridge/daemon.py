@@ -304,8 +304,36 @@ def _raw_contains_text(value: Any, needle: str, *, depth: int = 0) -> bool:
     return False
 
 
-PUBLIC_VISIBILITY_RIGHT_VALUES = {"1"}
+PUBLIC_VISIBILITY_RIGHT_VALUES = {"1", "public", "all", "everyone", "all_visible", "all-visible"}
 PRIVATE_VISIBILITY_RIGHT_VALUES = {"64"}
+PUBLIC_VISIBILITY_BOOL_KEYS = {
+    "public",
+    "ispublic",
+    "is_public",
+    "allvisible",
+    "all_visible",
+}
+PUBLIC_VISIBILITY_TEXT_KEYS = {
+    "visibility",
+    "permission",
+    "privacy",
+    "visible",
+    "visible_to",
+    "visibleto",
+    "right",
+    "scope",
+}
+PUBLIC_VISIBILITY_TEXT_VALUES = {
+    "1",
+    "public",
+    "all",
+    "everyone",
+    "all_visible",
+    "all-visible",
+    "\u5168\u90e8\u4eba\u53ef\u89c1",
+    "\u6240\u6709\u4eba\u53ef\u89c1",
+    "\u516c\u5f00",
+}
 PRIVATE_VISIBILITY_KEYWORDS = ("仅自己可见", "仅自己", "私密", "only me", "private")
 NON_PUBLIC_VISIBILITY_KEYWORDS = (
     "好友可见",
@@ -334,6 +362,7 @@ PRIVATE_VISIBILITY_RIGHT_KEYS = {
     "ugcRight",
     "feedright",
     "feed_right",
+    "right",
     "viewright",
     "view_right",
 }
@@ -447,6 +476,8 @@ def _private_visibility_diagnostic(value: Any, *, depth: int = 0, path: str = ""
             item_path = f"{path}.{key_text}" if path else key_text
             if lowered_key in PRIVATE_VISIBILITY_BOOL_KEYS and bool(item):
                 markers.append({"path": item_path, "kind": "private_bool", "value": bool(item)})
+            if lowered_key in PUBLIC_VISIBILITY_BOOL_KEYS and item is False:
+                markers.append({"path": item_path, "kind": "non_public_bool", "value": False})
             if lowered_key in PRIVATE_VISIBILITY_RIGHT_KEYS:
                 item_text = _visibility_right_text(item)
                 if item_text in PRIVATE_VISIBILITY_RIGHT_VALUES:
@@ -466,17 +497,120 @@ def _private_visibility_diagnostic(value: Any, *, depth: int = 0, path: str = ""
     return markers
 
 
+def _public_visibility_diagnostic(value: Any, *, depth: int = 0, path: str = "") -> list[dict[str, Any]]:
+    if depth > 8:
+        return []
+    markers: list[dict[str, Any]] = []
+    if isinstance(value, (int, float, bool)) or value is None:
+        return []
+    if isinstance(value, str):
+        return markers
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            lowered_key = key_text.replace("-", "_").lower()
+            item_path = f"{path}.{key_text}" if path else key_text
+            if lowered_key in PRIVATE_VISIBILITY_RIGHT_KEYS:
+                item_text = _visibility_right_text(item)
+                if item_text in PUBLIC_VISIBILITY_RIGHT_VALUES:
+                    markers.append({"path": item_path, "kind": "public_right", "value": item_text})
+            if lowered_key in PUBLIC_VISIBILITY_BOOL_KEYS and item is True:
+                markers.append({"path": item_path, "kind": "public_bool", "value": True})
+            if lowered_key in PUBLIC_VISIBILITY_TEXT_KEYS and isinstance(item, (str, int, float)):
+                item_text = _visibility_right_text(item).strip().lower()
+                if item_text in PUBLIC_VISIBILITY_TEXT_VALUES:
+                    markers.append({"path": item_path, "kind": "public_text", "value": item_text})
+            if isinstance(item, (dict, list, tuple, set)):
+                markers.extend(_public_visibility_diagnostic(item, depth=depth + 1, path=item_path))
+            if len(markers) >= 5:
+                return markers[:5]
+        return markers
+    if isinstance(value, (list, tuple, set)):
+        for index, item in enumerate(value):
+            item_path = f"{path}[{index}]" if path else f"[{index}]"
+            markers.extend(_public_visibility_diagnostic(item, depth=depth + 1, path=item_path))
+            if len(markers) >= 5:
+                return markers[:5]
+    return markers
+
+
+def _native_video_public_upload_result(value: Any) -> dict[str, Any]:
+    if hasattr(value, "to_dict"):
+        try:
+            value = value.to_dict()
+        except Exception:
+            value = {}
+    if not isinstance(value, dict):
+        return {"type": type(value).__name__}
+    allowed = {
+        "vid",
+        "business_type",
+        "business_data_length",
+        "uploaded_bytes",
+        "upload_time",
+        "publish_response",
+    }
+    return {key: _json_safe_detail(item, key=key) for key, item in value.items() if key in allowed}
+
+
+def _native_video_public_cover_result(value: Any) -> dict[str, Any]:
+    if hasattr(value, "to_dict"):
+        try:
+            value = value.to_dict()
+        except Exception:
+            value = {}
+    if not isinstance(value, dict):
+        return {"type": type(value).__name__}
+    allowed = {
+        "photo_id",
+        "album_id",
+        "sloc",
+        "real_lloc",
+        "business_type",
+        "business_data_rsp_length",
+        "uploaded_bytes",
+    }
+    return {key: _json_safe_detail(item, key=key) for key, item in value.items() if key in allowed}
+
+
+def _extract_mood_fid(value: Any, *, depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    if isinstance(value, dict):
+        for key in ("fid", "tid", "feedskey", "feedsKey", "cellid", "cellId", "id"):
+            item = value.get(key)
+            if item not in (None, ""):
+                return str(item).strip()
+        for item in value.values():
+            found = _extract_mood_fid(item, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _extract_mood_fid(item, depth=depth + 1)
+            if found:
+                return found
+    return ""
+
+
 def _native_video_visibility_diagnostic(item: dict[str, Any], *, raw: Any = None) -> dict[str, Any]:
     markers = _private_visibility_diagnostic(item)
     if raw is not None:
         markers.extend(_private_visibility_diagnostic(raw, path="raw"))
     markers = markers[:5]
+    public_markers = _public_visibility_diagnostic(item)
+    if raw is not None:
+        public_markers.extend(_public_visibility_diagnostic(raw, path="raw"))
+    public_markers = public_markers[:5]
     private_markers = [marker for marker in markers if str(marker.get("kind") or "").startswith("private")]
+    if not markers and not public_markers:
+        markers = [{"path": "", "kind": "visibility_unproven", "value": "missing public marker"}]
     return {
-        "public": not markers,
+        "public": bool(public_markers) and not markers,
         "private": bool(private_markers),
         "non_public": bool(markers),
         "visibility_markers": markers,
+        "public_markers": public_markers,
         "private_markers": private_markers[:5],
     }
 
@@ -513,9 +647,11 @@ def _verified_native_video_feed_item(
     if appid != 311:
         return False
     try:
-        hostuin = int(item.get("hostuin") or item.get("uin") or login_uin or 0)
+        hostuin = int(item.get("hostuin") or item.get("uin") or 0)
     except (TypeError, ValueError):
         hostuin = 0
+    if not hostuin:
+        return False
     if int(login_uin or 0) and hostuin != int(login_uin or 0):
         return False
     item_raw = raw if raw is not None else item.get("raw")
@@ -538,9 +674,11 @@ def _native_video_item_context(
     if appid != 311:
         return None
     try:
-        hostuin = int(item.get("hostuin") or item.get("uin") or login_uin or 0)
+        hostuin = int(item.get("hostuin") or item.get("uin") or 0)
     except (TypeError, ValueError):
         hostuin = 0
+    if not hostuin:
+        return None
     if int(login_uin or 0) and hostuin != int(login_uin or 0):
         return None
     return {"appid": appid, "hostuin": hostuin}
@@ -593,9 +731,49 @@ def _native_video_verification_failure_message(method_label: str, diagnostics: d
 
 def _json_safe_detail(value: Any, *, key: str = "", depth: int = 0) -> Any:
     lowered_key = str(key or "").lower()
+    normalized_key = "".join(ch for ch in lowered_key if ch.isalnum())
     if depth > 6:
         return "<omitted>"
-    if lowered_key in {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}:
+    if normalized_key in {
+        "cookie",
+        "cookies",
+        "pskey",
+        "skey",
+        "pt4token",
+        "ptkey",
+        "qzonetoken",
+        "secret",
+        "token",
+        "clientkey",
+        "clientkeyb64",
+        "keyindex",
+        "session",
+        "a2",
+        "a2b64",
+        "a2base64",
+        "a2hex",
+        "a2bytes",
+        "a2ticket",
+        "a2ticketb64",
+        "a2ticketbase64",
+        "a2tickethex",
+        "a2ticketbytes",
+        "vlogindata",
+        "vlogindatab64",
+        "vlogindatabase64",
+        "vlogindatahex",
+        "vlogindatabytes",
+        "logindata",
+        "logindatab64",
+        "logindatabase64",
+        "logindatahex",
+        "logindatabytes",
+        "loginkey",
+        "loginkeyb64",
+        "loginkeybase64",
+        "loginkeyhex",
+        "loginkeybytes",
+    }:
         return "***"
     if lowered_key == "feedinfo":
         text = str(value or "")
@@ -636,13 +814,13 @@ def _native_video_feed_item_diagnostic(
 ) -> dict[str, Any]:
     raw = item.get("raw")
     appid = _item_int(item.get("appid"))
-    hostuin = _item_int(item.get("hostuin") or item.get("uin") or login_uin)
+    hostuin = _item_int(item.get("hostuin") or item.get("uin"))
     fid = str(item.get("fid") or item.get("tid") or item.get("key") or "").strip()
     return {
         "fid": fid,
         "appid": appid,
         "hostuin": hostuin,
-        "self_hostuin": bool(not login_uin or hostuin == login_uin),
+        "self_hostuin": bool(hostuin and (not login_uin or hostuin == login_uin)),
         "contains_svid": bool(_raw_contains_text(item, vid) or _raw_contains_text(raw, vid)),
     }
 
@@ -714,28 +892,29 @@ class QzoneDaemonService:
         h5_ready = self._h5_video_upload_configured()
         qq_upload_ready = self._video_upload_credentials_configured()
         state_qq_upload_ready = bool(summary.get("configured"))
-        ready = bool(qq_upload_ready)
+        ready = bool(qq_upload_ready or h5_ready)
         summary["qq_upload_configured"] = qq_upload_ready
         summary["qq_upload_state_configured"] = state_qq_upload_ready
         summary["web_cookie_configured"] = h5_ready
         summary["h5_upload_available"] = h5_ready
         summary["h5_upload_diagnostic_available"] = h5_ready
-        summary["h5_publish_supported"] = False
+        summary["h5_publish_supported"] = h5_ready
         summary["h5_publish_experimental"] = False
-        summary["h5_publish_disabled_reason"] = "not_verified_public_video_publish_route"
+        summary["h5_publish_permission_update_required"] = h5_ready
         summary["ready"] = ready
-        summary["verification_required"] = qq_upload_ready
-        summary["h5_publish_verified"] = False
-        summary["h5_publish_verification_required"] = False
+        summary["verification_required"] = ready
+        summary["h5_publish_verified"] = h5_ready
+        summary["h5_publish_verification_required"] = h5_ready
         summary["configured"] = qq_upload_ready
         if qq_upload_ready:
             summary["method"] = "tencent_upload"
             if not state_qq_upload_ready and not summary.get("source"):
                 summary["source"] = "env"
         elif h5_ready:
-            summary["method"] = ""
-            summary["stability"] = "h5_upload_only_public_publish_not_supported"
-            summary["requires"] = "qq_upload_a2_vlogin_data"
+            summary["method"] = "h5_video_publish_update_visibility"
+            summary["stability"] = "requires_post_publish_permission_update_and_public_verification"
+            if not summary.get("updated_at"):
+                summary["updated_at"] = self.state.session.updated_at
         else:
             summary["method"] = ""
         return summary
@@ -1280,7 +1459,13 @@ class QzoneDaemonService:
         self._set_success(defer_save=True)
         return {"items": visitors, "count": len(visitors), "raw": payload}
 
-    async def _wait_for_native_video_feed(self, *, vid: str, fid: str = "") -> dict[str, Any] | None:
+    async def _wait_for_native_video_feed(
+        self,
+        *,
+        vid: str,
+        fid: str = "",
+        stop_after_private_detail: bool = True,
+    ) -> dict[str, Any] | None:
         vid = str(vid or "").strip()
         if not vid:
             return None
@@ -1306,6 +1491,7 @@ class QzoneDaemonService:
             "checked_detail_count": 0,
             "detail_errors": [],
             "result": "pending",
+            "stop_after_private_detail": bool(stop_after_private_detail),
         }
         self._last_native_video_verification_diagnostics = diagnostics
         for delay in NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS:
@@ -1480,7 +1666,7 @@ class QzoneDaemonService:
                         diagnostics["result"] = "verified_detail"
                         diagnostics["verified_source"] = f"{scope}_detail"
                         return verified
-            if _should_stop_native_video_verification_after_private_detail(diagnostics):
+            if stop_after_private_detail and _should_stop_native_video_verification_after_private_detail(diagnostics):
                 diagnostics["result"] = "private_visibility"
                 diagnostics["early_stop_reason"] = "publish_tid_detail_access_denied"
                 return None
@@ -1494,6 +1680,214 @@ class QzoneDaemonService:
         else:
             diagnostics["result"] = "not_verified"
         return None
+
+    async def _discover_native_video_mood_fid(self, *, vid: str) -> tuple[str, dict[str, Any]]:
+        vid = str(vid or "").strip()
+        login_uin = int(self.state.session.uin or 0)
+        diagnostics: dict[str, Any] = {"vid": vid, "login_uin": login_uin, "scopes": {}}
+        if not vid:
+            return "", diagnostics
+        for scope in ("self", "active", "profile"):
+            scope_diag = diagnostics["scopes"].setdefault(
+                scope,
+                {"fetch_error": None, "last_item_count": 0, "svid_hits": []},
+            )
+            try:
+                page = await self.list_feeds(
+                    hostuin=login_uin,
+                    limit=20,
+                    scope=scope,
+                    record_recent=False,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                scope_diag["fetch_error"] = _safe_error_diagnostic(exc)
+                continue
+            raw_items = page.get("items") or []
+            items = raw_items if isinstance(raw_items, list) else []
+            scope_diag["last_item_count"] = len(items)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_diag = _native_video_feed_item_diagnostic(item, vid=vid, login_uin=login_uin)
+                if not item_diag["contains_svid"]:
+                    continue
+                hit = {
+                    "fid": item_diag["fid"],
+                    "appid": item_diag["appid"],
+                    "hostuin": item_diag["hostuin"],
+                    "accepted_context": bool(item_diag["appid"] == 311 and item_diag["self_hostuin"]),
+                }
+                _append_diagnostic_sample(scope_diag["svid_hits"], hit)
+                if hit["accepted_context"] and hit["fid"]:
+                    diagnostics["result"] = "found"
+                    diagnostics["fid"] = hit["fid"]
+                    diagnostics["source"] = scope
+                    return str(hit["fid"]), diagnostics
+        diagnostics["result"] = "not_found"
+        return "", diagnostics
+
+    async def _publish_h5_video_with_visibility_update(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool,
+        media: list[PostMedia],
+        video: PostMedia,
+        path: Path,
+        duration_ms: int,
+        file_size: int,
+        upload_time: int,
+        client_key: str,
+    ) -> dict[str, Any]:
+        try:
+            cover = video_cover_media(video, self.store.root / "video_covers")
+            cover_path = _trusted_daemon_image_path(cover)
+            if cover_path is None:
+                raise QzoneParseError(
+                    "daemon H5 视频直发无法生成可读取的视频封面，已停止发布",
+                    detail={"name": video.name or path.name},
+                )
+            result = await self.client.upload_h5_video(
+                path,
+                title=video.name or path.name,
+                desc=content,
+                play_time=duration_ms,
+                upload_time=upload_time,
+                extend_info={"clientkey": client_key},
+            )
+            cover_result = await self.client.upload_h5_video_cover(
+                cover_path,
+                vid=result.vid,
+                video_path=path,
+                client_key=client_key,
+                upload_time=upload_time,
+                video_size=file_size,
+                duration_ms=duration_ms,
+                desc=content,
+            )
+        except FileNotFoundError as exc:
+            raise QzoneParseError("视频文件不存在，无法进行 Qzone H5 原生视频上传", detail={"path": str(path)}) from exc
+        except (OSError, QzoneRequestError, QzoneParseError) as exc:
+            if isinstance(exc, (QzoneRequestError, QzoneParseError)):
+                raise
+            raise QzoneRequestError(
+                "Qzone H5 原生视频上传失败",
+                detail={"type": type(exc).__name__, "message": str(exc)},
+            ) from exc
+
+        publish_result: dict[str, Any] = {}
+        publish_error: Exception | None = None
+        try:
+            raw_publish_result = unwrap_payload(
+                await self.client.publish_video_mood(
+                    content,
+                    vid=result.vid,
+                    sync_weibo=sync_weibo,
+                )
+            )
+            publish_result = raw_publish_result if isinstance(raw_publish_result, dict) else {"data": raw_publish_result}
+        except (QzoneRequestError, QzoneParseError) as exc:
+            publish_error = exc
+            log.warning(
+                "qzone h5 video publish_v6 returned an error after upload; trying feed discovery before visibility update: %s",
+                exc,
+            )
+
+        publish_fid = _extract_mood_fid(publish_result)
+        discovery: dict[str, Any] = {}
+        if not publish_fid:
+            publish_fid, discovery = await self._discover_native_video_mood_fid(vid=result.vid)
+        if not publish_fid:
+            detail: dict[str, Any] = {
+                "vid": result.vid,
+                "client_key": client_key,
+                "upload_result": _native_video_public_upload_result(result),
+                "cover_upload": _native_video_public_cover_result(cover_result),
+                "publish_result": _json_safe_detail(publish_result),
+                "fid_discovery": _json_safe_detail(discovery),
+            }
+            if publish_error is not None:
+                detail["publish_error"] = _safe_error_diagnostic(publish_error)
+            raise QzoneRequestError(
+                "QQ 空间 H5 视频已上传/发布但未拿到或发现视频说说 tid/fid，无法调用权限修改接口，已拒绝宣称发布成功",
+                detail=detail,
+            ) from publish_error
+
+        try:
+            raw_update_result = unwrap_payload(
+                await self.client.update_mood_visibility_public(
+                    publish_fid,
+                    content=content,
+                    vid=result.vid,
+                )
+            )
+            visibility_update_result = raw_update_result if isinstance(raw_update_result, dict) else {"data": raw_update_result}
+        except (QzoneRequestError, QzoneParseError) as exc:
+            raise QzoneRequestError(
+                "QQ 空间 H5 视频说说已生成，但修改为全部人可见失败，已拒绝宣称发布成功",
+                detail={
+                    "vid": result.vid,
+                    "fid": publish_fid,
+                    "client_key": client_key,
+                    "publish_result": _json_safe_detail(publish_result),
+                    "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
+                    "permission_update_error": _safe_error_diagnostic(exc),
+                },
+            ) from exc
+
+        verified_feed = await self._wait_for_native_video_feed(
+            vid=result.vid,
+            fid=publish_fid,
+            stop_after_private_detail=False,
+        )
+        if verified_feed is None:
+            verification_diagnostics = getattr(self, "_last_native_video_verification_diagnostics", None) or {
+                "vid_present": bool(result.vid),
+                "publish_tid": publish_fid,
+                "publish_tid_present": bool(publish_fid),
+                "result": "not_verified",
+                "diagnostics_available": False,
+            }
+            raise QzoneRequestError(
+                _native_video_verification_failure_message(
+                    "H5 视频上传/发布/权限修改",
+                    verification_diagnostics,
+                ),
+                detail={
+                    "vid": result.vid,
+                    "fid": publish_fid,
+                    "client_key": client_key,
+                    "publish_result": _json_safe_detail(publish_result),
+                    "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
+                    "permission_update_result": _json_safe_detail(visibility_update_result),
+                    "cover_upload": _native_video_public_cover_result(cover_result),
+                    "verification": verification_diagnostics,
+                },
+            )
+
+        return {
+            "fid": str(verified_feed.get("fid") or publish_fid or ""),
+            "vid": result.vid,
+            "message": "已验证 QQ 空间 H5 视频直发成功，并已通过权限接口改为全部人可见",
+            "native_video": True,
+            "status": "published_native_video",
+            "operation_status": "verified_feed_video_public_after_permission_update",
+            "media_count": len(media),
+            "photo_count": 1,
+            "raw": {
+                "method": "h5_video_publish_update_visibility",
+                "upload_result": _native_video_public_upload_result(result),
+                "cover_upload_result": _native_video_public_cover_result(cover_result),
+                "publish_result": _json_safe_detail(publish_result),
+                "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
+                "permission_update_result": _json_safe_detail(visibility_update_result),
+                "fid_discovery": _json_safe_detail(discovery),
+                "video": video.to_dict(),
+                "cover": cover.to_dict(),
+                "client_key": client_key,
+                "verified_feed": _json_safe_detail(verified_feed),
+            },
+        }
 
     async def _publish_native_video_if_configured(
         self,
@@ -1514,23 +1908,38 @@ class QzoneDaemonService:
         self._ensure_session_ready()
         duration_ms = _probe_video_duration_ms(path)
         file_size = _file_size(path)
-        upload_time = int(datetime.now(timezone.utc).timestamp())
+        now = datetime.now(timezone.utc)
+        upload_time = int(now.timestamp())
+        batch_time_ms = int(now.timestamp() * 1000)
         upload_uin = getattr(getattr(self, "state", None), "session", SessionState()).uin
-        client_key = f"{upload_uin}_{upload_time}"
+        client_key = f"{upload_uin}_{batch_time_ms}"
+
+        if self._h5_video_upload_configured():
+            return await self._publish_h5_video_with_visibility_update(
+                content=content,
+                sync_weibo=sync_weibo,
+                media=media,
+                video=video,
+                path=path,
+                duration_ms=duration_ms,
+                file_size=file_size,
+                upload_time=upload_time,
+                client_key=client_key,
+            )
 
         if not self._video_upload_credentials_configured():
             raise QzoneParseError(
-                "daemon 原生视频后台直发缺少 QQ upload A2/vLoginData，无法确保视频权限为全部人可见。"
-                "当前 Web Cookie H5 video+cover 路径已降级为诊断/实验路径：实测会产生非公开视频动态，"
-                "默认不会再尝试，避免制造仅自己可见的副作用。请使用 /qzone autovideoauth a2 或 /qzone videoauth 绑定 QQ upload A2/vLoginData。",
+                "daemon 原生视频后台直发缺少可用登录材料：当前既没有 Web Cookie/p_skey 可走 H5 视频直发+权限修改，"
+                "也没有 QQ upload A2/vLoginData 可走 Tencent upload；已阻止视频封面替代发布。"
+                "请先使用 /qzone autobind 绑定 Qzone Cookie，或使用 /qzone videoauth 绑定 QQ upload A2/vLoginData。",
                 detail={
                     "name": video.name or path.name,
                     "video_upload_configured": False,
                     "web_cookie_configured": self._h5_video_upload_configured(),
                     "h5_upload_diagnostic_available": self._h5_video_upload_configured(),
                     "h5_publish_supported": False,
-                    "required": "QQ upload A2/vLoginData",
-                    "stable_method": "tencent_upload",
+                    "required": "Web Cookie/p_skey or QQ upload A2/vLoginData",
+                    "stable_method": "h5_video_publish_update_visibility",
                 },
             )
 
@@ -1635,8 +2044,7 @@ class QzoneDaemonService:
                     ),
                     detail={
                         "vid": result.vid,
-                        "client_key": client_key,
-                        "cover_upload": cover_result.to_dict(),
+                        "cover_upload": _native_video_public_cover_result(cover_result),
                         "verification": verification_diagnostics,
                     },
                 )
@@ -1647,8 +2055,7 @@ class QzoneDaemonService:
                 ),
                 detail={
                     "vid": result.vid,
-                    "client_key": client_key,
-                    "cover_upload": cover_result.to_dict(),
+                    "cover_upload": _native_video_public_cover_result(cover_result),
                     "verification": verification_diagnostics,
                 },
             )
@@ -1662,14 +2069,13 @@ class QzoneDaemonService:
             "media_count": len(media),
             "photo_count": 1,
             "raw": {
-                "upload_result": result.to_dict(),
-                "cover_upload_result": cover_result.to_dict(),
+                "upload_result": _native_video_public_upload_result(result),
+                "cover_upload_result": _native_video_public_cover_result(cover_result),
                 "credential_lengths": credentials.to_dict(),
                 "finish_report_payload_length": len(finish_report),
                 "video": video.to_dict(),
                 "cover": cover.to_dict(),
-                "client_key": client_key,
-                "verified_feed": verified_feed,
+                "verified_feed": _json_safe_detail(verified_feed),
             },
         }
 
@@ -1712,7 +2118,7 @@ class QzoneDaemonService:
             "operation_status": "verified_feed_video",
             "raw": {
                 "method": method,
-                "verified_feed": verified_feed,
+                "verified_feed": _json_safe_detail(verified_feed),
             },
         }
 

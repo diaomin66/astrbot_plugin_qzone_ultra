@@ -315,80 +315,134 @@ def test_qzone_client_h5_video_cover_upload_posts_pic_qzone_control_and_slices(t
     assert all(call["params"]["g_tk"] == 12345 for call in calls)
 
 
-def test_qzone_client_publish_video_mood_uses_web_richval() -> None:
-    captured: dict[str, object] = {}
-
+def test_qzone_client_publish_video_mood_posts_old_richval_payload() -> None:
     class _HTTP:
         async def request(self, method: str, url: str, **kwargs):
-            captured.update({"method": method, "url": url, **kwargs})
-            return _response(method, url, {"code": 0, "tid": "fid-1"})
+            assert method == "POST"
+            assert url.endswith("/emotion_cgi_publish_v6")
+            data = kwargs["data"]
+            assert data["con"] == "hello"
+            assert data["hostuin"] == 3112333596
+            assert data["ugc_right"] == 1
+            assert data["who"] == "1"
+            assert data["richtype"] == "3"
+            assert data["subrichtype"] == "7"
+            assert data["issyncweibo"] == 1
+            assert "vid=vid-h5" in data["richval"]
+            assert "cache.tv.qq.com" in data["richval"]
+            assert "qqplayerout.swf" in data["richval"]
+            assert kwargs["headers"]["Referer"] == "https://user.qzone.qq.com/3112333596"
+            assert kwargs["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
+            return _response(method, url, {"ret": 0, "data": {"tid": "fid-video"}})
 
     client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
     client._client = _HTTP()
 
-    payload = asyncio.run(client.publish_video_mood("hello", vid="vid-h5", sync_weibo=True))
+    result = asyncio.run(client.publish_video_mood("hello", vid="vid-h5", sync_weibo=True))
 
-    assert payload["tid"] == "fid-1"
-    data = captured["data"]
-    assert data["who"] == "1"
-    assert data["ugc_right"] == 1
-    assert data["pic_template"] == ""
-    assert data["special_url"] == ""
-    assert data["to_tweet"] == 0
-    assert data["richtype"] == "3"
-    assert data["subrichtype"] == "6"
-    assert data["issyncweibo"] == 1
-    assert "who=5" in data["richval"]
-    assert data["richval"].count("who=") == 1
-    assert "rich_flag=4" in data["richval"]
-    assert "vid=vid-h5" in data["richval"]
-    assert "qzvideo%2Fvid-h5" in data["richval"]
-    assert captured["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
+    assert result["tid"] == "fid-video"
 
 
-@pytest.mark.parametrize("experimental_env", [False, True])
-def test_daemon_publish_post_rejects_h5_cookie_video_without_a2(
+def test_qzone_client_update_mood_visibility_public_posts_update_payload() -> None:
+    class _HTTP:
+        async def request(self, method: str, url: str, **kwargs):
+            assert method == "POST"
+            assert url.endswith("/emotion_cgi_update")
+            data = kwargs["data"]
+            assert data["tid"] == "fid-video"
+            assert data["con"] == "hello"
+            assert data["hostuin"] == 3112333596
+            assert data["ugc_right"] == 1
+            assert data["who"] == "1"
+            assert data["to_tweet"] == 0
+            assert data["to_sign"] == 0
+            assert data["richtype"] == "3"
+            assert data["subrichtype"] == "7"
+            assert "vid=vid-h5" in data["richval"]
+            assert kwargs["headers"]["Referer"] == "https://user.qzone.qq.com/3112333596/mood/fid-video"
+            assert kwargs["timeout"] == H5_VIDEO_REQUEST_TIMEOUT_SECONDS
+            return _response(method, url, {"ret": 0, "data": {"tid": "fid-video", "ugc_right": 1}})
+
+    client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
+    client._client = _HTTP()
+
+    result = asyncio.run(client.update_mood_visibility_public("fid-video", content="hello", vid="vid-h5"))
+
+    assert result["ugc_right"] == 1
+
+
+def test_qzone_client_publish_video_mood_requires_vid() -> None:
+    from qzone_bridge.errors import QzoneParseError
+
+    client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
+
+    with pytest.raises(QzoneParseError):
+        asyncio.run(client.publish_video_mood("hello", vid=""))
+
+
+def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    experimental_env: bool,
 ) -> None:
     from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.h5_video import QzoneH5VideoCoverUploadResult, QzoneH5VideoUploadResult
     from qzone_bridge.daemon import QzoneDaemonService
-    from qzone_bridge.errors import QzoneParseError
     from qzone_bridge.media import PostMedia
 
+    monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 2345)
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"fake cover")
+
+    def fake_video_cover_media(_video, _cover_dir):
+        return PostMedia(kind="image", source=str(cover_path), name="cover.jpg", mime_type="image/jpeg", trusted_local=True)
+
+    monkeypatch.setattr(daemon_mod, "video_cover_media", fake_video_cover_media)
     monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
-    if experimental_env:
-        monkeypatch.setenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", "1")
-    else:
-        monkeypatch.delenv("QZONE_ALLOW_EXPERIMENTAL_H5_VIDEO_PUBLISH", raising=False)
+    calls: list[tuple[str, dict[str, object]]] = []
 
     class _Client:
-        async def upload_h5_video(self, *_args, **_kwargs):
-            raise AssertionError("cookie-only video path must not create H5 upload side effects")
+        async def upload_h5_video(self, path, **kwargs):
+            calls.append(("upload_h5_video", {"path": path, **kwargs}))
+            return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
 
-        async def upload_h5_video_cover(self, *_args, **_kwargs):
-            raise AssertionError("cookie-only video path must not upload H5 covers")
+        async def upload_h5_video_cover(self, path, **kwargs):
+            calls.append(("upload_h5_video_cover", {"path": path, **kwargs}))
+            return QzoneH5VideoCoverUploadResult(checksum="b" * 32, uploaded_bytes=3, photo_id="cover-photo")
 
-        async def publish_video_mood(self, *_args, **_kwargs):
-            raise AssertionError("cookie-only video path must not call publish_v6")
+        async def publish_video_mood(self, content, **kwargs):
+            calls.append(("publish_video_mood", {"content": content, **kwargs}))
+            return {"ret": 0, "tid": "fid-video"}
+
+        async def update_mood_visibility_public(self, fid, **kwargs):
+            calls.append(("update_mood_visibility_public", {"fid": fid, **kwargs}))
+            return {"ret": 0, "tid": fid, "ugc_right": 1}
 
     class _Uploader:
         def __init__(self, **_kwargs):
-            raise AssertionError("missing QQ upload credentials should fail before uploader construction")
+            raise AssertionError("H5-ready cookie path must not require QQ upload credentials")
 
     monkeypatch.setattr(daemon_mod, "QzoneTencentVideoUploader", _Uploader)
 
     service = object.__new__(QzoneDaemonService)
     service.store = types.SimpleNamespace(root=tmp_path)
-    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596, cookies={"p_skey": "ps-key"}))
+    service.state = types.SimpleNamespace(
+        session=SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"})
+    )
     service.client = _Client()
     service._ensure_session_ready = lambda: None
     service._set_success = lambda defer_save=True: None
 
-    async def fake_wait_for_native_video_feed(**_kwargs):
-        raise AssertionError("missing A2/vLoginData should fail before feed verification")
+    async def fake_wait_for_native_video_feed(**kwargs):
+        calls.append(("verify", dict(kwargs)))
+        assert kwargs == {"vid": "vid-h5", "fid": "fid-video", "stop_after_private_detail": False}
+        return {
+            "hostuin": 3112333596,
+            "fid": "fid-video",
+            "appid": 311,
+            "ugc_right": 1,
+            "raw": {"html": "qzvideo/vid-h5", "ugc_right": 1},
+        }
 
     service._wait_for_native_video_feed = fake_wait_for_native_video_feed
 
@@ -396,14 +450,80 @@ def test_daemon_publish_post_rejects_h5_cookie_video_without_a2(
     video_path.write_bytes(b"chunk")
     video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
 
-    with pytest.raises(QzoneParseError) as error:
+    payload = asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert payload["fid"] == "fid-video"
+    assert payload["vid"] == "vid-h5"
+    assert payload["operation_status"] == "verified_feed_video_public_after_permission_update"
+    assert [name for name, _ in calls] == [
+        "upload_h5_video",
+        "upload_h5_video_cover",
+        "publish_video_mood",
+        "update_mood_visibility_public",
+        "verify",
+    ]
+    assert calls[3][1]["fid"] == "fid-video"
+    assert calls[3][1]["vid"] == "vid-h5"
+
+
+def test_daemon_publish_post_fails_when_h5_visibility_update_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.h5_video import QzoneH5VideoCoverUploadResult, QzoneH5VideoUploadResult
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 0)
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"fake cover")
+
+    def fake_video_cover_media(_video, _cover_dir):
+        return PostMedia(kind="image", source=str(cover_path), name="cover.jpg", mime_type="image/jpeg", trusted_local=True)
+
+    monkeypatch.setattr(daemon_mod, "video_cover_media", fake_video_cover_media)
+    monkeypatch.delenv("QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64", raising=False)
+    monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
+
+    class _Client:
+        async def upload_h5_video(self, *_args, **_kwargs):
+            return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return QzoneH5VideoCoverUploadResult(checksum="b" * 32, uploaded_bytes=3, photo_id="cover-photo")
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            return {"ret": 0, "tid": "fid-video"}
+
+        async def update_mood_visibility_public(self, *_args, **_kwargs):
+            raise QzoneRequestError("update failed", detail={"ret": -1})
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(
+        session=SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"})
+    )
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**_kwargs):
+        raise AssertionError("permission update failure must stop before success verification")
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    with pytest.raises(QzoneRequestError) as error:
         asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
-    assert "A2/vLoginData" in str(error.value)
-    assert error.value.detail["web_cookie_configured"] is True
-    assert error.value.detail["h5_upload_diagnostic_available"] is True
-    assert error.value.detail["h5_publish_supported"] is False
-    assert error.value.detail["stable_method"] == "tencent_upload"
+    assert "修改" in str(error.value) or "update" in str(error.value)
+    assert error.value.detail["fid"] == "fid-video"
+    assert error.value.detail["permission_update_error"]["message"]
 
 
 def test_daemon_video_verification_rejects_active_album_upload_feed(
@@ -467,7 +587,8 @@ def test_daemon_video_verification_accepts_profile_mood_video(
         "fid": "mood-feed",
         "appid": 311,
         "summary": "real video mood",
-        "raw": {"html": "qzvideo/vid-in-visible-mood"},
+        "ugc_right": 1,
+        "raw": {"html": "qzvideo/vid-in-visible-mood", "ugc_right": 1},
     }
 
     async def fake_list_feeds(*, scope, **_kwargs):

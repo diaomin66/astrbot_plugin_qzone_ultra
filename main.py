@@ -3508,9 +3508,9 @@ class QzoneStablePlugin(Star):
             if not getattr(self.settings, "native_video_publish", True):
                 raise QzoneParseError(
                     "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
-                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone videoauth 绑定 QQ upload A2/vLoginData；"
-                    "如果 /qzone autovideoauth 只拿到 Web Cookie/H5 诊断材料，视频发布仍会被阻止；"
-                    "必须绑定 QQ upload A2/vLoginData 或使用可返回 sVid 的 OneBot 原生发布 action。"
+                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone autobind 绑定 Qzone Web Cookie/p_skey "
+                    "以启用 H5 直发+权限修改链路；也可以通过 /qzone videoauth 绑定 QQ upload A2/vLoginData，"
+                    "或使用可返回 sVid 且声明公开视频权限的 OneBot 原生发布 action。"
                 )
             render_post = await self._prepare_publish_payload(post)
             onebot_payload = await self._publish_onebot_native_video_if_available(
@@ -4504,7 +4504,14 @@ class QzoneStablePlugin(Star):
         video_upload = status.get("video_upload")
         if not isinstance(video_upload, dict):
             return False
-        return bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
+        return bool(
+            video_upload.get("qq_upload_configured")
+            or video_upload.get("configured")
+            or (
+                video_upload.get("h5_publish_supported")
+                and (video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
+            )
+        )
 
     async def _auto_bind_video_upload_credentials(
         self,
@@ -4518,7 +4525,7 @@ class QzoneStablePlugin(Star):
                 status = await self.controller.get_status(probe_daemon=False)
             except QzoneBridgeError:
                 status = {}
-            if not force and self._status_has_video_upload_credentials(status):
+            if not force and self._status_has_video_publish_ready(status):
                 return status
 
             bot = self._capture_onebot_client(event)
@@ -5532,7 +5539,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("autovideoauth")
     async def qzone_autovideoauth(self, event: AstrMessageEvent, probe_mode: str = ""):
-        """自动启用视频发布授权；公开视频发布默认需要 QQ upload A2/vLoginData。"""
+        """自动启用视频发布授权；优先使用 Cookie/H5 直发+权限修改，A2/vLoginData 可作为备用。"""
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
             return
@@ -5544,6 +5551,13 @@ class QzoneStablePlugin(Star):
             return video_upload if isinstance(video_upload, dict) else {}
 
         def _h5_ready(status_payload: dict[str, Any] | None) -> bool:
+            video_upload = _video_upload_from_status(status_payload)
+            return bool(
+                video_upload.get("h5_publish_supported")
+                and (video_upload.get("h5_upload_available") or video_upload.get("web_cookie_configured"))
+            )
+
+        def _h5_cookie_available(status_payload: dict[str, Any] | None) -> bool:
             video_upload = _video_upload_from_status(status_payload)
             return bool(video_upload.get("h5_upload_available") or video_upload.get("web_cookie_configured"))
 
@@ -5558,7 +5572,7 @@ class QzoneStablePlugin(Star):
                     status_payload = await self._status_with_recovery()
                 except QzoneBridgeError:
                     status_payload = cookie_status if isinstance(cookie_status, dict) else {}
-                if self._status_has_video_upload_credentials(status_payload):
+                if self._status_has_video_publish_ready(status_payload):
                     yield self._command_result(event, format_status(status_payload))
                     return
             payload = await self._auto_bind_video_upload_credentials(event, force=True, source="onebot")
@@ -5587,18 +5601,27 @@ class QzoneStablePlugin(Star):
                     status_payload = await self._status_with_recovery()
                 except QzoneBridgeError:
                     status_payload = payload if isinstance(payload, dict) else {}
+                if self._status_has_video_publish_ready(status_payload):
+                    yield self._command_result(event, format_status(status_payload))
+                    return
                 h5_available = _h5_ready(status_payload)
-                h5_note = (
-                    "当前 Web Cookie/p_skey 只能证明 H5 video+cover 上传接口可访问；"
-                    "该路径实测不能确保全部人可见，默认不会用于发布，以避免生成仅自己可见的视频动态。"
-                    if h5_available
-                    else "当前 daemon 也没有可用 Qzone Web Cookie/p_skey 作为诊断材料。"
-                )
+                cookie_available = _h5_cookie_available(status_payload)
+                if h5_available:
+                    h5_note = "当前 Web Cookie/p_skey 可用于 H5 视频直发；发布后会自动调用权限修改接口改为全部人可见，并做公开校验。"
+                    prefix = "OneBot 未返回 QQ upload A2/vLoginData。"
+                elif cookie_available:
+                    h5_note = (
+                        "当前 Web Cookie/p_skey 只能证明 H5 video+cover 上传接口可访问；"
+                        "该 daemon 版本尚未启用 H5 发布+权限修改路径，默认不会用于发布，以避免生成仅自己可见的视频动态。"
+                    )
+                    prefix = "OneBot 未返回 QQ upload A2/vLoginData，因此不能启用可保证全部人可见的 daemon 原生视频后台直发。"
+                else:
+                    h5_note = "当前 daemon 没有可用 Qzone Web Cookie/p_skey，且 OneBot 未返回 A2/vLoginData。"
+                    prefix = "OneBot 未返回 QQ upload A2/vLoginData，因此不能启用可保证全部人可见的 daemon 原生视频后台直发。"
                 yield self._command_result(
                     event,
-                    "OneBot 未返回 QQ upload A2/vLoginData，因此不能启用可保证全部人可见的 daemon 原生视频后台直发。"
-                    f"{h5_note}"
-                    "请使用 `，qzone autovideoauth a2` 继续强制探测，或使用 `，qzone videoauth` 手动绑定 A2/vLoginData。"
+                    f"{prefix}{h5_note}"
+                    "如需备用 Tencent upload 路径，可使用 `，qzone autovideoauth a2` 继续强制探测，或使用 `，qzone videoauth` 手动绑定 A2/vLoginData。"
                     f"{suffix}",
                 )
                 return

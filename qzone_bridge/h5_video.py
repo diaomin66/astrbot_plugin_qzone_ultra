@@ -30,7 +30,6 @@ QZONE_H5_PIC_CHECK_TYPE_MD5_COMPAT = 0
 QZONE_H5_DEFAULT_SLICE_SIZE = 256 * 1024
 QZONE_PUBLIC_UGC_RIGHT = 1
 QZONE_PUBLIC_WHO = "1"
-QZONE_VIDEO_RICHVAL_WHO = "5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +473,8 @@ def _find_text_key(value: Any, keys: set[str]) -> str:
 
 
 def build_qzone_video_richval(*, uin: int | str, vid: str) -> str:
+    """Build the Web/H5 video richval used by taotao publish/update CGIs."""
+
     vid = str(vid or "").strip()
     uin = str(uin or "").strip()
     safe = "-_.!~*'()"
@@ -483,7 +484,7 @@ def build_qzone_video_richval(*, uin: int | str, vid: str) -> str:
         [
             f"playurl={play_url}",
             f"detailurl={detail_url}",
-            f"who={QZONE_VIDEO_RICHVAL_WHO}",
+            "who=5",
             "rich_flag=4",
             f"vid={vid}",
         ]
@@ -497,26 +498,68 @@ def build_qzone_video_publish_payload(
     vid: str,
     sync_weibo: bool = False,
 ) -> dict[str, Any]:
+    """Build the old Web/H5 video-shuoshuo publish payload.
+
+    This endpoint can create the video mood, but Qzone may initially store it as
+    self-visible. The daemon must follow it with emotion_cgi_update and then
+    verify a public feed/detail before reporting success.
+    """
+
+    uin_int = int(uin or 0)
     return {
         "syn_tweet_verson": "1",
         "paramstr": "1",
+        "who": "1",
+        "con": str(content or ""),
+        "feedversion": "1",
+        "ver": "1",
+        "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
+        "to_sign": 0,
+        "hostuin": uin_int,
+        "code_version": "1",
+        "richtype": "3",
+        "subrichtype": "7",
+        "richval": build_qzone_video_richval(uin=uin_int, vid=vid),
+        "issyncweibo": int(bool(sync_weibo)),
+        "format": "json",
+        "qzreferrer": f"https://user.qzone.qq.com/{uin_int}",
+    }
+
+
+def build_qzone_video_visibility_update_payload(
+    *,
+    uin: int | str,
+    fid: str,
+    content: str = "",
+    vid: str = "",
+) -> dict[str, Any]:
+    """Build the Web/H5 edit payload that changes a mood to public visibility."""
+
+    uin_int = int(uin or 0)
+    vid = str(vid or "").strip()
+    data: dict[str, Any] = {
+        "tid": str(fid or "").strip(),
+        "syn_tweet_verson": "1",
+        "paramstr": "1",
         "pic_template": "",
-        "special_url": "",
-        "who": QZONE_PUBLIC_WHO,
+        "who": "1",
         "con": str(content or ""),
         "feedversion": "1",
         "ver": "1",
         "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
         "to_sign": 0,
         "to_tweet": 0,
-        "hostuin": int(uin or 0),
+        "hostuin": uin_int,
         "code_version": "1",
-        "richtype": "3",
-        # Qzone's Web mood/video model uses subtype 6 after a local sVid upload.
-        # Subtype 7 is for URL-style rich videos and can produce a non-public echo.
-        "subrichtype": "6",
-        "richval": build_qzone_video_richval(uin=uin, vid=vid),
-        "issyncweibo": int(bool(sync_weibo)),
         "format": "json",
-        "qzreferrer": f"https://user.qzone.qq.com/{int(uin or 0)}",
+        "qzreferrer": f"https://user.qzone.qq.com/{uin_int}",
     }
+    if vid:
+        data.update(
+            {
+                "richtype": "3",
+                "subrichtype": "7",
+                "richval": build_qzone_video_richval(uin=uin_int, vid=vid),
+            }
+        )
+    return data

@@ -22,6 +22,7 @@ from .h5_video import (
     build_h5_video_cover_control_payload,
     build_h5_video_control_payload,
     build_qzone_video_publish_payload,
+    build_qzone_video_visibility_update_payload,
     encode_h5_video_cover_slice_multipart,
     encode_h5_video_slice_multipart,
     extract_h5_control_session,
@@ -90,8 +91,10 @@ QZONE_UNLIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/
 QZONE_LIKE_URL = QZONE_LIKE_DIRECT_URL
 QZONE_UNLIKE_URL = QZONE_UNLIKE_DIRECT_URL
 QZONE_VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
+QZONE_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
 QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
+QZONE_UPDATE_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update"
 MAX_UPLOAD_IMAGE_BYTES: int | None = None
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -1277,7 +1280,7 @@ class QzoneClient:
             )
         payload = await self._request_json(
             "POST",
-            "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
+            QZONE_PUBLISH_URL,
             data=data,
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
             origin="https://user.qzone.qq.com",
@@ -1290,6 +1293,8 @@ class QzoneClient:
         vid = str(vid or "").strip()
         if not vid:
             raise QzoneParseError("发布 Qzone 视频说说缺少 sVid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法发布 Qzone 视频说说")
         data = build_qzone_video_publish_payload(
             uin=self.login_uin,
             content=content,
@@ -1298,9 +1303,39 @@ class QzoneClient:
         )
         return await self._request_json(
             "POST",
-            "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
+            QZONE_PUBLISH_URL,
             data=data,
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=self.login_uin,
+            attach_token=False,
+            max_attempts=1,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    async def update_mood_visibility_public(
+        self,
+        fid: str,
+        *,
+        content: str = "",
+        vid: str = "",
+    ) -> dict[str, Any]:
+        fid = str(fid or "").strip()
+        if not fid:
+            raise QzoneParseError("修改 Qzone 视频说说权限缺少 tid/fid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法修改 Qzone 视频说说权限")
+        data = build_qzone_video_visibility_update_payload(
+            uin=self.login_uin,
+            fid=fid,
+            content=content,
+            vid=vid,
+        )
+        return await self._request_json(
+            "POST",
+            QZONE_UPDATE_URL,
+            data=data,
+            referer=f"https://user.qzone.qq.com/{self.login_uin}/mood/{fid}",
             origin="https://user.qzone.qq.com",
             hostuin=self.login_uin,
             attach_token=False,

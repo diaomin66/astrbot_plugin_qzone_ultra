@@ -822,6 +822,49 @@ def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytes
     assert not source_policy.is_remote_media_url_allowed("https://media.example.test/a.png")
 
 
+def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_policy.remote_media_host_resolves_safely.cache_clear()
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", ("198.18.0.53", 0))],
+    )
+
+    assert source_policy.is_remote_media_url_allowed(
+        "https://multimedia.nt.qq.com.cn/download?appid=1413&format=origin&rkey=test"
+    )
+
+
+def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_policy.remote_media_host_resolves_safely.cache_clear()
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", ("198.18.0.53", 0))],
+    )
+
+    assert not source_policy.is_remote_media_url_allowed("https://media.example.test/a.mp4")
+
+
+def test_remote_media_policy_blocks_trusted_domain_with_private_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_policy.remote_media_host_resolves_safely.cache_clear()
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", ("10.0.0.5", 0))],
+    )
+
+    assert not source_policy.is_remote_media_url_allowed(
+        "https://multimedia.nt.qq.com.cn/download?appid=1413&format=origin&rkey=test"
+    )
+
+
 def test_base64_upload_sources_do_not_apply_plugin_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     import qzone_bridge.client as client_module
 
@@ -2019,6 +2062,7 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
                     "business_data_length": 3,
                     "uploaded_bytes": 5,
                     "session": "session-1",
+                    "client_key": "3112333596_1780329600123",
                 },
             )
 
@@ -2072,6 +2116,10 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
     assert payload["status"] == "published_native_video"
     assert payload["fid"] == "fid-video"
     assert payload["vid"] == "vid-1"
+    assert "client_key" not in payload["raw"]
+    assert "client_key" not in payload["raw"]["upload_result"]
+    assert "session" not in payload["raw"]["upload_result"]
+    assert "session" not in payload["raw"]["cover_upload_result"]
     assert captured["upload_path"] == video_path
     assert captured["cover_path"] == cover_path
     assert captured["upload_kwargs"]["business_type"] == 1
@@ -2084,7 +2132,10 @@ def test_daemon_publish_post_uses_native_video_upload_when_credentials_exist(
     assert captured["upload_kwargs"]["upload_time"] == captured["cover_kwargs"]["upload_time"]
     assert captured["upload_kwargs"]["publish_time"] == captured["upload_kwargs"]["upload_time"]
     assert captured["upload_kwargs"]["client_key"] == captured["cover_kwargs"]["client_key"]
-    assert captured["upload_kwargs"]["client_key"] == f"3112333596_{captured['upload_kwargs']['upload_time']}"
+    client_uin, client_time = str(captured["upload_kwargs"]["client_key"]).split("_", 1)
+    assert client_uin == "3112333596"
+    assert client_time.isdigit()
+    assert int(client_time) // 1000 == captured["upload_kwargs"]["upload_time"]
     assert captured["cover_kwargs"]["vid"] == "vid-1"
     assert captured["cover_kwargs"]["video_path"] == video_path
     assert captured["cover_kwargs"]["video_size"] == 5
@@ -2157,6 +2208,7 @@ def test_daemon_native_video_upload_must_verify_feed_before_success(
 
     assert "sVid" in str(error.value)
     assert error.value.detail["vid"] == "vid-1"
+    assert "client_key" not in error.value.detail
     assert error.value.detail["verification"]["result"] == "not_verified"
     assert error.value.detail["verification"]["diagnostics_available"] is False
 
@@ -2191,8 +2243,8 @@ def test_daemon_native_video_verification_checks_feed_detail_for_vid(
     async def fake_detail_feed(**kwargs):
         calls["details"].append(kwargs)
         return {
-            "entry": {"fid": kwargs["fid"], "summary": "detail"},
-            "raw": {"video_id": "1074_target_vid", "is_video": 1},
+            "entry": {"fid": kwargs["fid"], "summary": "detail", "ugc_right": 1},
+            "raw": {"video_id": "1074_target_vid", "is_video": 1, "ugc_right": 1},
         }
 
     service.list_feeds = fake_list_feeds
@@ -2222,8 +2274,8 @@ def test_daemon_native_video_verification_uses_publishmood_tid_first(
     async def fake_detail_feed(**kwargs):
         calls["details"].append(kwargs)
         return {
-            "entry": {"fid": kwargs["fid"], "summary": "detail"},
-            "raw": {"video": {"vid": "1074_target_vid"}},
+            "entry": {"fid": kwargs["fid"], "summary": "detail", "ugc_right": 1},
+            "raw": {"video": {"vid": "1074_target_vid"}, "ugc_right": 1},
         }
 
     async def fake_list_feeds(**_kwargs):
@@ -2242,6 +2294,123 @@ def test_daemon_native_video_verification_uses_publishmood_tid_first(
     assert calls["listed"] is False
 
 
+def test_daemon_native_video_verification_rejects_unproven_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+
+    async def fake_list_feeds(**_kwargs):
+        return {
+            "items": [
+                {
+                    "fid": "fid-visible-unknown",
+                    "hostuin": 3112333596,
+                    "appid": 311,
+                    "raw": {"video": {"vid": "1074_target_vid"}},
+                }
+            ]
+        }
+
+    async def fake_detail_feed(**kwargs):
+        return {
+            "entry": {"fid": kwargs["fid"], "summary": "detail"},
+            "raw": {"video": {"vid": "1074_target_vid"}},
+        }
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    verified = asyncio.run(service._wait_for_native_video_feed(vid="1074_target_vid"))
+
+    assert verified is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "non_public_visibility"
+    assert diagnostics["non_public_visibility_hits"][0]["visibility_markers"][0]["kind"] == "visibility_unproven"
+
+
+def test_daemon_native_video_verification_rejects_public_text_without_visibility_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+
+    item = {
+        "fid": "fid-public-word-only",
+        "hostuin": 3112333596,
+        "appid": 311,
+        "summary": "public",
+        "raw": {"video": {"vid": "1074_target_vid"}, "title": "public"},
+    }
+
+    async def fake_list_feeds(**_kwargs):
+        return {"items": [dict(item)]}
+
+    async def fake_detail_feed(**kwargs):
+        return {"entry": {"fid": kwargs["fid"], "summary": "public"}, "raw": dict(item["raw"])}
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    verified = asyncio.run(service._wait_for_native_video_feed(vid="1074_target_vid"))
+
+    assert verified is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "non_public_visibility"
+    assert diagnostics["non_public_visibility_hits"][0]["visibility_markers"][0]["kind"] == "visibility_unproven"
+
+
+def test_daemon_native_video_verification_requires_explicit_self_hostuin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.models import SessionState
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0.0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=3112333596))
+    calls: dict[str, int] = {"detail": 0}
+
+    async def fake_list_feeds(**_kwargs):
+        return {
+            "items": [
+                {
+                    "fid": "fid-missing-hostuin",
+                    "appid": 311,
+                    "ugc_right": 1,
+                    "raw": {"video": {"vid": "1074_target_vid"}, "ugc_right": 1},
+                }
+            ]
+        }
+
+    async def fake_detail_feed(**_kwargs):
+        calls["detail"] += 1
+        raise AssertionError("missing hostuin feed item must not be used for detail verification")
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+
+    verified = asyncio.run(service._wait_for_native_video_feed(vid="1074_target_vid"))
+
+    assert verified is None
+    assert calls["detail"] == 0
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "not_verified"
+    assert diagnostics["scopes"]["self"]["native_video_candidate_count"] == 0
+    assert diagnostics["scopes"]["self"]["svid_hits"][0]["accepted_context"] is False
+
+
 def test_daemon_verify_native_video_feed_requires_public_svid() -> None:
     from qzone_bridge.daemon import QzoneDaemonService
     from qzone_bridge.models import SessionState
@@ -2257,6 +2426,7 @@ def test_daemon_verify_native_video_feed_requires_public_svid() -> None:
             "fid": "fid-onebot",
             "hostuin": 3112333596,
             "appid": 311,
+            "ugc_right": 1,
             "raw": {"html": "qzvideo/vid-onebot"},
         }
 
@@ -2315,6 +2485,63 @@ def test_daemon_error_detail_compacts_large_video_publish_payload() -> None:
     assert detail["publish_result"]["feedinfo"] == {"present": True, "length": 8009}
     assert detail["cover_upload"]["upload_responses"] == {"count": 20}
     assert detail["cover_upload"]["control_response"] == {"present": True, "ret": 0, "msg": "ok"}
+
+
+def test_daemon_error_detail_redacts_upload_session_identifiers() -> None:
+    from qzone_bridge import daemon as daemon_mod
+
+    detail = daemon_mod._error_detail(
+        QzoneRequestError(
+            "failed",
+            detail={
+                "upload_result": {
+                    "session": "upload-session",
+                    "client_key": "3112333596_1780329600123",
+                    "a2_b64": "secret-a2",
+                    "A2TicketBytes": [1, 2, 3],
+                    "vLoginDataB64": "secret-vlogin",
+                    "login_data_base64": "secret-login",
+                },
+                "cover_upload": {"session": "cover-session"},
+            },
+        )
+    )
+
+    assert detail["upload_result"]["session"] == "***"
+    assert detail["upload_result"]["client_key"] == "***"
+    assert detail["upload_result"]["a2_b64"] == "***"
+    assert detail["upload_result"]["A2TicketBytes"] == "***"
+    assert detail["upload_result"]["vLoginDataB64"] == "***"
+    assert detail["upload_result"]["login_data_base64"] == "***"
+    assert detail["cover_upload"]["session"] == "***"
+
+
+def test_native_video_publish_diagnostics_redact_upload_credential_aliases() -> None:
+    from qzone_bridge.onebot_native_video import _safe_payload_summary
+
+    payload = {
+        "status": "failed",
+        "retcode": 1200,
+        "a2_b64": "secret-a2",
+        "A2TicketBytes": [1, 2, 3],
+        "vLoginDataB64": "secret-vlogin",
+        "login_data_base64": "secret-login",
+        "session": "upload-session",
+        "data": {
+            "sVid": "vid-onebot",
+            "clientKey": "secret-client-key",
+            "public": True,
+        },
+    }
+
+    summary = _safe_payload_summary(payload)
+
+    assert "a2_b64" not in summary["keys"]
+    assert "A2TicketBytes" not in summary["keys"]
+    assert "vLoginDataB64" not in summary["keys"]
+    assert "login_data_base64" not in summary["keys"]
+    assert "session" not in summary["keys"]
+    assert "clientKey" not in summary["data_keys"]
 
 
 def test_native_video_module_removes_client_handoff_helpers() -> None:
@@ -4101,7 +4328,11 @@ def test_onebot_native_video_publish_action_uses_public_visibility_contract(tmp_
         async def call_action(self, action: str, **params):
             captured["action"] = action
             captured["params"] = params
-            return {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "fid": "fid-onebot"}}
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"sVid": "vid-onebot", "fid": "fid-onebot", "right": "public", "ugc_right": 1},
+            }
 
     result = asyncio.run(
         publish_qzone_video_via_onebot(
@@ -4124,6 +4355,10 @@ def test_onebot_native_video_publish_action_uses_public_visibility_contract(tmp_
     assert params["who"] == 1
     assert params["ugc_right"] == 1
     assert params["visibility"] == "public"
+    assert params["path"] == str(video)
+    assert params["file"] == str(video)
+    assert params["video"]["file"] == str(video)
+    assert params["media"][0]["file"] == str(video)
 
 
 def test_onebot_native_video_publish_rejects_success_without_svid(tmp_path: Path) -> None:
@@ -4141,6 +4376,114 @@ def test_onebot_native_video_publish_rejects_success_without_svid(tmp_path: Path
 
     assert "sVid" in str(error.value)
     assert error.value.detail["required"] == "sVid"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "fid": "fid-onebot"}},
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "public": False}},
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "visibility": "public", "ugc_right": 2}},
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "public": True, "ugc_right": 64}},
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "raw": {"title": "public"}}},
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "message": "public"}},
+        {
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "sVid": "vid-onebot",
+                "result": {"status": "ok"},
+                "echo": {"visibility": "public", "ugc_right": 1},
+            },
+        },
+        {"status": "ok", "retcode": 0, "data": {"sVid": "vid-onebot", "visible_to": "friends"}},
+    ],
+)
+def test_onebot_native_video_publish_requires_public_response_marker(tmp_path: Path, payload: dict) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+
+    class _Bot:
+        async def call_action(self, *_args, **_params):
+            return payload
+
+    with pytest.raises(QzoneRequestError):
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+
+def test_onebot_native_video_publish_stops_on_failed_payload_without_alias_retry(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+    calls: list[str] = []
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            calls.append(action)
+            if action == "publish_qzone_video_mood":
+                return {"status": "failed", "retcode": 1200, "message": "publish timeout"}
+            return {"status": "ok", "retcode": 0, "data": {"sVid": "duplicate-risk", "visibility": "public"}}
+
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+    assert "ambiguous response" in str(error.value)
+    assert calls == ["publish_qzone_video_mood"]
+
+
+def test_onebot_native_video_publish_rejects_nested_business_failure(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+
+    class _Bot:
+        async def call_action(self, *_args, **_params):
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"code": -1, "sVid": "vid-onebot", "visibility": "public", "ugc_right": 1},
+            }
+
+    with pytest.raises(QzoneRequestError):
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+
+def test_onebot_native_video_publish_type_error_is_not_retried(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+    calls: list[str] = []
+
+    class _Bot:
+        async def call_action(self, action: str, **_params):
+            calls.append(action)
+            raise TypeError("publish action raised after invocation")
+
+    with pytest.raises(QzoneRequestError):
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+    assert calls == ["publish_qzone_video_mood"]
+
+
+def test_onebot_native_video_publish_stops_on_invoked_action_timeout(tmp_path: Path) -> None:
+    from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video")
+
+    class _Bot:
+        async def call_action(self, *_args, **_params):
+            raise TimeoutError("publish action timed out after invocation")
+
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(publish_qzone_video_via_onebot(_Bot(), video_path=video, content="hello"))
+
+    assert "duplicate publish" in str(error.value)
 
 
 def test_plugin_publish_uses_onebot_protocol_native_video_when_available(
@@ -4527,6 +4870,79 @@ def test_autovideoauth_requires_a2_even_when_h5_cookie_available(
     assert captured["bound_source"] == "onebot"
 
 
+def test_autovideoauth_accepts_h5_publish_ready_without_a2_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"status_calls": 0, "probe_called": False}
+
+    ready_status = {
+        "daemon_state": "ready",
+        "login_uin": 12345,
+        "cookie_count": 4,
+        "needs_rebind": False,
+        "video_upload": {
+            "configured": False,
+            "method": "h5_video_publish_update_visibility",
+            "ready": True,
+            "verification_required": True,
+            "qq_upload_configured": False,
+            "h5_upload_available": True,
+            "h5_publish_supported": True,
+            "h5_publish_permission_update_required": True,
+            "h5_publish_verification_required": True,
+            "web_cookie_configured": True,
+        },
+    }
+
+    async def fake_probe(*_args, **_kwargs):
+        captured["probe_called"] = True
+        raise AssertionError("H5 publish-ready status must not force A2 probing")
+
+    class _Controller:
+        async def get_status(self, **kwargs):
+            captured["status_calls"] += 1
+            captured["last_status_kwargs"] = kwargs
+            return dict(ready_status)
+
+    class _Event:
+        def is_admin(self):
+            return True
+
+        def plain_result(self, text):
+            return text
+
+        def stop_event(self):
+            captured["stopped"] = True
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(admin_uins=set(), auto_bind_cookie=False)
+    plugin.controller = _Controller()
+    plugin._onebot_client = object()
+    plugin._context = None
+    plugin._cookie_lock = None
+    plugin._video_upload_lock = None
+    plugin._schedule_publish_render_asset_preload = lambda *args, **kwargs: None
+
+    async def fake_status_with_recovery():
+        return await plugin.controller.get_status()
+
+    plugin._status_with_recovery = fake_status_with_recovery
+    monkeypatch.setattr(main, "probe_video_upload_credentials", fake_probe)
+
+    async def collect_results():
+        return [item async for item in plugin.qzone_autovideoauth(_Event())]
+
+    results = asyncio.run(collect_results())
+
+    assert len(results) == 1
+    assert "- video_upload: ready" in results[0]
+    assert "- h5_video_upload: ready" in results[0]
+    assert "- video_upload_method: h5_video_publish_update_visibility" in results[0]
+    assert "- h5_video_publish_supported: True" in results[0]
+    assert captured["probe_called"] is False
+
+
 def test_status_renderer_reports_cookie_h5_path_as_missing_without_experimental_publish() -> None:
     from qzone_bridge.render import format_status
 
@@ -4860,6 +5276,72 @@ def test_onebot_video_upload_probe_accepts_llonebot_pmhq_get_a2_ticket() -> None
     assert probe.credentials is not None
     assert probe.credentials.login_data_b64 == base64.b64encode(raw_a2).decode("ascii")
     assert probe.credentials.source == "test:llonebot_debug"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Error: wrapperSession.getTicketService().getA2Ticket failed",
+        base64.b64encode(b"Error: wrapperSession.getTicketService().getA2Ticket failed").decode("ascii"),
+    ],
+)
+def test_onebot_video_upload_probe_rejects_pmhq_a2_ticket_error_value(value: str) -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "call"
+                and params.get("args") == ["wrapperSession.getTicketService().getA2Ticket", []]
+            ):
+                return {"result": 0, "value": value}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "llonebot_debug" in probe.returned_actions
+
+
+def test_onebot_video_upload_probe_rejects_buffer_wrapped_pmhq_error_value() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    error_text = b"Error: wrapperSession.getTicketService().getA2Ticket is not a function"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if (
+                action == "llonebot_debug"
+                and params.get("apiClass") == "pmhq"
+                and params.get("method") == "call"
+                and params.get("args") == ["wrapperSession.getTicketService().getA2Ticket", []]
+            ):
+                return {"result": 0, "value": {"type": "Buffer", "data": list(error_text)}}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "llonebot_debug" in probe.returned_actions
+
+
+def test_onebot_video_upload_probe_rejects_failed_status_even_with_value() -> None:
+    from qzone_bridge.onebot_upload import probe_video_upload_credentials
+
+    raw_a2 = b"binary-a2-from-failed-status"
+
+    class _Bot:
+        async def call_action(self, action: str, **params):
+            if action == "get_login_misc_data" and params == {"key": "a2"}:
+                return {"result": -1, "errMsg": "login misc unavailable", "value": raw_a2.hex()}
+            raise RuntimeError("unsupported")
+
+    probe = asyncio.run(probe_video_upload_credentials(_Bot(), source="test"))
+
+    assert probe.credentials is None
+    assert "get_login_misc_data" in probe.returned_actions
 
 
 @pytest.mark.parametrize(

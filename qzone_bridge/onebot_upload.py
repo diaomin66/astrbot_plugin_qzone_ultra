@@ -996,7 +996,7 @@ def _find_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None =
     if payload is None or _depth > 8:
         return None
     if isinstance(payload, bytes):
-        encoded = _bytes_to_b64(payload)
+        encoded = _bytes_value_to_b64(payload)
         return {"login_data_b64": encoded} if encoded else None
     if isinstance(payload, str):
         text = payload.strip()
@@ -1021,6 +1021,8 @@ def _find_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None =
     if obj_id in _seen:
         return None
     _seen.add(obj_id)
+    if _dict_reports_failure_status(payload):
+        return None
 
     normalized_login_data_keys = {_normalize_key(item) for item in LOGIN_DATA_KEYS}
     normalized_login_key_keys = {_normalize_key(item) for item in LOGIN_KEY_KEYS}
@@ -1488,6 +1490,8 @@ def _find_raw_login_data(
     if obj_id in _seen:
         return ""
     _seen.add(obj_id)
+    if _dict_reports_failure_status(payload):
+        return ""
 
     normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
     normalized_web_keys = {_normalize_key(item) for item in WEB_CREDENTIAL_KEYS}
@@ -1575,20 +1579,22 @@ def _value_to_b64(value: Any) -> str:
         return ""
     buffer_like = _buffer_like_to_bytes(value)
     if buffer_like is not None:
-        return _bytes_to_b64(buffer_like)
+        return _bytes_value_to_b64(buffer_like)
     if isinstance(value, bytes):
-        return _bytes_to_b64(value)
+        return _bytes_value_to_b64(value)
     if isinstance(value, bytearray):
-        return _bytes_to_b64(bytes(value))
+        return _bytes_value_to_b64(bytes(value))
     if isinstance(value, memoryview):
-        return _bytes_to_b64(value.tobytes())
+        return _bytes_value_to_b64(value.tobytes())
     if isinstance(value, list) and all(isinstance(item, int) for item in value):
         try:
-            return _bytes_to_b64(bytes(item & 0xFF for item in value))
+            return _bytes_value_to_b64(bytes(item & 0xFF for item in value))
         except ValueError:
             return ""
     text = str(value or "").strip()
     if not text:
+        return ""
+    if _looks_like_login_data_error_text(text):
         return ""
     if text.startswith("base64://"):
         text = text[len("base64://") :]
@@ -1610,7 +1616,71 @@ def _value_to_b64(value: Any) -> str:
             decoded = base64.urlsafe_b64decode(padded)
         except (binascii.Error, ValueError):
             return ""
+    if _bytes_look_like_login_data_error_text(decoded):
+        return ""
     return _bytes_to_b64(decoded) if decoded else ""
+
+
+def _bytes_value_to_b64(value: bytes) -> str:
+    data = bytes(value or b"")
+    if _bytes_look_like_login_data_error_text(data):
+        return ""
+    return _bytes_to_b64(data)
+
+
+def _dict_reports_failure_status(payload: dict[str, Any]) -> bool:
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in {"result", "ret", "retcode", "code", "errno", "err"}:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value not in (0, 200):
+                return True
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text and text not in {"0", "200", "ok", "success"}:
+                    return True
+        if normalized == "status":
+            text = str(value or "").strip().lower()
+            if text and text not in {"0", "200", "ok", "success", "done"}:
+                return True
+    return False
+
+
+def _looks_like_login_data_error_text(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "error:",
+            " failed",
+            "failed:",
+            "not available",
+            "not a function",
+            "no method",
+            "unsupported",
+            "timeout",
+            "娌℃湁鏂规硶",
+            "涓嶆敮鎸?",
+            "澶辫触",
+        )
+    )
+
+
+def _bytes_look_like_login_data_error_text(value: bytes) -> bool:
+    data = bytes(value or b"")
+    if not data:
+        return False
+    printable = sum(1 for item in data if item in (9, 10, 13) or 32 <= item <= 126)
+    if printable / len(data) < 0.85:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin1", errors="ignore")
+    return _looks_like_login_data_error_text(text)
 
 
 def _buffer_like_to_bytes(value: Any) -> bytes | None:

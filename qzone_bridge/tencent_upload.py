@@ -893,8 +893,8 @@ def encode_record_video_upload_pic_business_data(
     with `UniPacket.pack("UploadPicInfoReq", req)`.
     """
 
-    upload_time = int(upload_time or publish_time or time.time())
-    publish_time = int(publish_time or upload_time)
+    upload_time = _qzone_upload_time_seconds(upload_time or publish_time or time.time())
+    publish_time = _qzone_upload_time_seconds(publish_time or upload_time)
     client_key = str(client_key or "")
     publish_business_data = encode_record_video_publish_business_data(
         uin=uin,
@@ -1224,8 +1224,10 @@ class QzoneTencentVideoUploader:
         if not path.is_file():
             raise FileNotFoundError(str(path))
         file_size = path.stat().st_size
-        upload_time = int(upload_time or time.time())
-        publish_time = int(publish_time or upload_time)
+        upload_time = _qzone_upload_time_seconds(upload_time or time.time())
+        publish_time = _qzone_upload_time_seconds(publish_time or upload_time)
+        if publish_content is not None and not client_key and self.uin:
+            client_key = f"{self.uin}_{int(time.time() * 1000)}"
         if not business_data and publish_content is not None:
             business_data = encode_record_video_upload_pic_business_data(
                 uin=self.uin,
@@ -1694,6 +1696,20 @@ def _batch_id_from_client_key(client_key: str) -> int:
         return int(tail)
     except ValueError:
         return 0
+
+
+def _qzone_upload_time_seconds(value: int | float | str) -> int:
+    """Android Qzone uses second-level iUploadTime/publishTime in this path."""
+
+    try:
+        timestamp = int(float(value or 0))
+    except (TypeError, ValueError):
+        timestamp = 0
+    if timestamp <= 0:
+        timestamp = int(time.time())
+    while timestamp > 10_000_000_000:
+        timestamp //= 1000
+    return timestamp
 
 
 def _resolve_image_size(path: Path, width: int, height: int) -> tuple[int, int]:
