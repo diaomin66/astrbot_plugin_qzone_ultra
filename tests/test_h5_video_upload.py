@@ -497,6 +497,10 @@ def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
             calls.append(("update_mood_visibility_public", {"fid": fid, **kwargs}))
             return {"ret": 0, "tid": fid, "ugc_right": 1}
 
+        async def legacy_detail(self, hostuin, fid, **_kwargs):
+            calls.append(("verify_mood_visibility", {"hostuin": hostuin, "fid": fid}))
+            return {"ret": 0, "tid": fid, "ugc_right": 1, "right": 1, "secret": 0}
+
     service = object.__new__(QzoneDaemonService)
     service.store = types.SimpleNamespace(root=tmp_path)
     service.state = types.SimpleNamespace(
@@ -528,11 +532,17 @@ def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
     assert payload["fid"] == "fid-video"
     assert payload["vid"] == "vid-h5"
     assert payload["operation_status"] == "verified_feed_video_public_after_permission_update"
+    assert payload["raw"]["verified_mood_visibility"]["privacy_checks"] == {
+        "ugc_right_public": True,
+        "right_public": True,
+        "secret_flag_clear": True,
+    }
     assert [name for name, _ in calls] == [
         "upload_h5_video",
         "upload_h5_video_cover",
         "publish_video_mood",
         "update_mood_visibility_public",
+        "verify_mood_visibility",
         "verify",
     ]
     assert calls[3][1]["fid"] == "fid-video"
@@ -599,6 +609,68 @@ def test_daemon_publish_post_fails_when_h5_visibility_update_fails(
     assert error.value.detail["permission_update_error"]["message"]
 
 
+def test_daemon_publish_post_fails_when_mood_wrapper_visibility_stays_private(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.h5_video import QzoneH5VideoCoverUploadResult, QzoneH5VideoUploadResult
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneRequestError
+    from qzone_bridge.media import PostMedia
+
+    monkeypatch.setattr(daemon_mod, "_probe_video_duration_ms", lambda _path: 0)
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_MOOD_VISIBILITY_RETRY_DELAYS_SECONDS", (0,))
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"fake cover")
+
+    def fake_video_cover_media(_video, _cover_dir):
+        return PostMedia(kind="image", source=str(cover_path), name="cover.jpg", mime_type="image/jpeg", trusted_local=True)
+
+    monkeypatch.setattr(daemon_mod, "video_cover_media", fake_video_cover_media)
+
+    class _Client:
+        async def upload_h5_video(self, *_args, **_kwargs):
+            return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
+
+        async def upload_h5_video_cover(self, *_args, **_kwargs):
+            return QzoneH5VideoCoverUploadResult(checksum="b" * 32, uploaded_bytes=3, photo_id="cover-photo")
+
+        async def publish_video_mood(self, *_args, **_kwargs):
+            return {"ret": 0, "tid": "fid-video"}
+
+        async def update_mood_visibility_public(self, *_args, **_kwargs):
+            return {"ret": 0, "tid": "fid-video", "ugc_right": 1}
+
+        async def legacy_detail(self, _hostuin, fid, **_kwargs):
+            return {"ret": 0, "tid": fid, "ugc_right": 64, "right": 64, "secret": 1}
+
+    service = object.__new__(QzoneDaemonService)
+    service.store = types.SimpleNamespace(root=tmp_path)
+    service.state = types.SimpleNamespace(
+        session=SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"})
+    )
+    service.client = _Client()
+    service._ensure_session_ready = lambda: None
+    service._set_success = lambda defer_save=True: None
+
+    async def fake_wait_for_native_video_feed(**_kwargs):
+        raise AssertionError("mood wrapper visibility failure must stop before appid=4 verification")
+
+    service._wait_for_native_video_feed = fake_wait_for_native_video_feed
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"chunk")
+    video = PostMedia(kind="video", source=str(video_path), name="clip.mp4", mime_type="video/mp4", trusted_local=True)
+
+    with pytest.raises(QzoneRequestError) as error:
+        asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
+
+    assert "appid=311" in str(error.value)
+    assert error.value.detail["permission_update_result"]["ugc_right"] == 1
+    assert error.value.detail["mood_visibility"]["result"] in {"private_visibility", "not_verified"}
+
+
 def test_daemon_publish_post_fails_when_visibility_update_reports_ok_but_feed_stays_private(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -630,6 +702,9 @@ def test_daemon_publish_post_fails_when_visibility_update_reports_ok_but_feed_st
 
         async def update_mood_visibility_public(self, *_args, **_kwargs):
             return {"ret": 0, "tid": "fid-video", "ugc_right": 1}
+
+        async def legacy_detail(self, _hostuin, fid, **_kwargs):
+            return {"ret": 0, "tid": fid, "ugc_right": 1, "right": 1, "secret": 0}
 
     service = object.__new__(QzoneDaemonService)
     service.store = types.SimpleNamespace(root=tmp_path)

@@ -61,6 +61,7 @@ LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0)
 NATIVE_VIDEO_VERIFY_DETAIL_LIMIT = 5
 NATIVE_VIDEO_PRIVATE_DETAIL_EARLY_STOP_ATTEMPTS = 1
+NATIVE_VIDEO_MOOD_VISIBILITY_RETRY_DELAYS_SECONDS = (0.0, 1.0, 2.0, 3.0)
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
 PUBLIC_HEALTH_METHODS = {"GET", "HEAD"}
@@ -342,6 +343,7 @@ PRIVATE_VISIBILITY_BOOL_KEYS = {
     "only_self",
     "selfvisible",
     "self_visible",
+    "secret",
 }
 PRIVATE_VISIBILITY_RIGHT_KEYS = {
     "ugc_right",
@@ -1968,6 +1970,73 @@ class QzoneDaemonService:
         diagnostics["result"] = "not_found"
         return "", diagnostics
 
+    async def _wait_for_native_video_mood_visibility_public(self, *, fid: str) -> dict[str, Any] | None:
+        fid = str(fid or "").strip()
+        login_uin = int(self.state.session.uin or 0)
+        diagnostics: dict[str, Any] = {
+            "fid": fid,
+            "login_uin": login_uin,
+            "attempts": 0,
+            "errors": [],
+            "private_visibility_hits": [],
+            "non_public_visibility_hits": [],
+            "visibility_hits": [],
+            "result": "not_verified",
+        }
+        if not fid or not login_uin:
+            diagnostics["result"] = "missing_fid_or_uin"
+            self._last_native_video_mood_visibility_diagnostics = diagnostics
+            return None
+        for delay in NATIVE_VIDEO_MOOD_VISIBILITY_RETRY_DELAYS_SECONDS:
+            if delay:
+                await asyncio.sleep(delay)
+            diagnostics["attempts"] += 1
+            try:
+                raw_detail = unwrap_payload(await self.client.legacy_detail(login_uin, fid))
+            except (QzoneRequestError, QzoneParseError) as exc:
+                _append_diagnostic_sample(diagnostics["errors"], _safe_error_diagnostic(exc))
+                visibility = _native_video_access_denied_visibility(exc, path="mood_detail", fid=fid)
+                if visibility is not None:
+                    _append_diagnostic_sample(diagnostics["visibility_hits"], visibility)
+                    diagnostics["result"] = "private_visibility"
+                continue
+            detail = raw_detail if isinstance(raw_detail, dict) else {"data": raw_detail}
+            entry = {
+                "fid": str(detail.get("tid") or fid),
+                "hostuin": login_uin,
+                "appid": 311,
+                **detail,
+            }
+            visibility = _native_video_visibility_diagnostic(entry, raw=detail)
+            _append_diagnostic_sample(diagnostics["visibility_hits"], visibility)
+            if _native_video_visibility_public(visibility, diagnostics):
+                ugc_right_public = _visibility_right_text(detail.get("ugc_right")) in PUBLIC_VISIBILITY_RIGHT_VALUES
+                right_public = _visibility_right_text(detail.get("right")) in PUBLIC_VISIBILITY_RIGHT_VALUES
+                secret_text = _visibility_right_text(detail.get("secret")).lower()
+                secret_flag_clear = detail.get("secret") is False or secret_text in FALSE_TEXT_VALUES
+                diagnostics["result"] = "verified_mood_detail"
+                diagnostics["verified_source"] = "emotion_cgi_msgdetail_v6"
+                self._last_native_video_mood_visibility_diagnostics = diagnostics
+                return {
+                    "fid": fid,
+                    "hostuin": login_uin,
+                    "appid": 311,
+                    "verification_source": "emotion_cgi_msgdetail_v6",
+                    "visibility": visibility,
+                    "raw": detail,
+                    "ugcright_id": str(detail.get("ugcright_id") or ""),
+                    "ugc_right": detail.get("ugc_right"),
+                    "right": detail.get("right"),
+                    "secret": detail.get("secret"),
+                    "privacy_checks": {
+                        "ugc_right_public": ugc_right_public,
+                        "right_public": right_public,
+                        "secret_flag_clear": secret_flag_clear,
+                    },
+                }
+        self._last_native_video_mood_visibility_diagnostics = diagnostics
+        return None
+
     async def _publish_h5_video_with_visibility_update(
         self,
         *,
@@ -2077,6 +2146,26 @@ class QzoneDaemonService:
                 },
             ) from exc
 
+        verified_mood_visibility = await self._wait_for_native_video_mood_visibility_public(fid=publish_fid)
+        if verified_mood_visibility is None:
+            mood_visibility_diagnostics = getattr(self, "_last_native_video_mood_visibility_diagnostics", None) or {
+                "fid": publish_fid,
+                "result": "not_verified",
+                "diagnostics_available": False,
+            }
+            raise QzoneRequestError(
+                "QQ 空间 H5 视频说说权限接口已返回，但 appid=311 说说包装层未验证为全部人可见，已拒绝宣称发布成功",
+                detail={
+                    "vid": result.vid,
+                    "fid": publish_fid,
+                    "client_key": client_key,
+                    "publish_result": _json_safe_detail(publish_result),
+                    "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
+                    "permission_update_result": _json_safe_detail(visibility_update_result),
+                    "mood_visibility": mood_visibility_diagnostics,
+                },
+            )
+
         verified_feed = await self._wait_for_native_video_feed(
             vid=result.vid,
             fid=publish_fid,
@@ -2127,6 +2216,7 @@ class QzoneDaemonService:
                 "video": video.to_dict(),
                 "cover": cover.to_dict(),
                 "client_key": client_key,
+                "verified_mood_visibility": _json_safe_detail(verified_mood_visibility),
                 "verified_feed": _json_safe_detail(verified_feed),
             },
         }
