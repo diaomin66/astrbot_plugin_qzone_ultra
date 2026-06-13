@@ -96,6 +96,13 @@ QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
 QZONE_UPDATE_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update"
 QZONE_VIDEO_GET_DATA_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/video_get_data"
+QZONE_EMPTY_VIDEO_UPDATE_CONTENT = "\u200b"
+QZONE_EMPTY_VIDEO_UPDATE_CONTENT_FALLBACKS = (
+    QZONE_EMPTY_VIDEO_UPDATE_CONTENT,
+    "\u2060",
+    "\u2800",
+    "分享视频",
+)
 MAX_UPLOAD_IMAGE_BYTES: int | None = None
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -229,6 +236,19 @@ class QzoneClient:
             return True
         normalized = message.lower()
         return any(keyword in message or keyword in normalized for keyword in AUTH_ERROR_KEYWORDS)
+
+    @staticmethod
+    def _is_empty_content_update_error(exc: Exception) -> bool:
+        if not isinstance(exc, QzoneRequestError):
+            return False
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raw_code = detail.get("code", detail.get("ret"))
+        try:
+            code = int(raw_code or 0)
+        except (TypeError, ValueError):
+            code = 0
+        message = str(detail.get("message") or detail.get("msg") or exc)
+        return code == -10005 or "未输入内容" in message
 
     def _raise_payload_error(self, payload: Any, response: httpx.Response) -> None:
         if not isinstance(payload, dict):
@@ -1403,17 +1423,52 @@ class QzoneClient:
             vid=vid,
         )
         referer = f"https://user.qzone.qq.com/{self.login_uin}/main"
-        return await self._request_json(
-            "POST",
-            QZONE_UPDATE_URL,
-            data=data,
-            headers=self._pc_headers(referer=referer),
-            referer=referer,
-            hostuin=self.login_uin,
-            attach_token=False,
-            max_attempts=1,
-            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
-        )
+        try:
+            return await self._request_json(
+                "POST",
+                QZONE_UPDATE_URL,
+                data=data,
+                headers=self._pc_headers(referer=referer),
+                referer=referer,
+                hostuin=self.login_uin,
+                attach_token=False,
+                max_attempts=1,
+                timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+            )
+        except QzoneRequestError as exc:
+            if str(content or "").strip() or not self._is_empty_content_update_error(exc):
+                raise
+
+        last_retry_error: QzoneRequestError | None = None
+        for index, retry_content in enumerate(QZONE_EMPTY_VIDEO_UPDATE_CONTENT_FALLBACKS, start=1):
+            retry_data = build_qzone_video_visibility_update_payload(
+                uin=self.login_uin,
+                fid=fid,
+                content=retry_content,
+                vid=vid,
+            )
+            try:
+                result = await self._request_json(
+                    "POST",
+                    QZONE_UPDATE_URL,
+                    data=retry_data,
+                    headers=self._pc_headers(referer=referer),
+                    referer=referer,
+                    hostuin=self.login_uin,
+                    attach_token=False,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except QzoneRequestError as retry_exc:
+                last_retry_error = retry_exc
+                if not self._is_empty_content_update_error(retry_exc):
+                    raise
+                continue
+            result.setdefault("empty_content_retry", index)
+            return result
+        if last_retry_error is not None:
+            raise last_retry_error
+        raise QzoneRequestError("QQ 空间修改说说权限失败：空内容兼容重试未执行", detail={"fid": fid})
 
     async def add_comment(
         self,

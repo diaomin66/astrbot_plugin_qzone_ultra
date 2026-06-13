@@ -7,7 +7,12 @@ import types
 import httpx
 import pytest
 
-from qzone_bridge.client import H5_VIDEO_REQUEST_TIMEOUT_SECONDS, H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS, QzoneClient
+from qzone_bridge.client import (
+    H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+    H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS,
+    QZONE_EMPTY_VIDEO_UPDATE_CONTENT,
+    QzoneClient,
+)
 from qzone_bridge.models import SessionState
 
 
@@ -377,6 +382,43 @@ def test_qzone_client_update_mood_visibility_public_posts_update_payload() -> No
     result = asyncio.run(client.update_mood_visibility_public("fid-video", content="hello", vid="vid-h5"))
 
     assert result["ugc_right"] == 1
+
+
+def test_qzone_client_update_mood_visibility_public_retries_empty_video_content() -> None:
+    calls: list[dict[str, object]] = []
+
+    class _HTTP:
+        async def request(self, method: str, url: str, **kwargs):
+            assert method == "POST"
+            assert url.endswith("/emotion_cgi_update")
+            data = kwargs["data"]
+            calls.append(dict(data))
+            assert data["tid"] == "fid-video"
+            assert data["hostuin"] == "3112333596"
+            assert data["ugc_right"] == "1"
+            assert data["ugcright_id"] == "fid-video"
+            assert data["to_sign"] == "0"
+            assert data["richtype"] == ""
+            assert data["subrichtype"] == ""
+            assert data["richval"] == ""
+            if len(calls) == 1:
+                assert data["con"] == ""
+                return _response(
+                    method,
+                    url,
+                    {"code": -10005, "message": "您未输入内容，随便写点什么吧", "subcode": -4004},
+                )
+            assert data["con"] == QZONE_EMPTY_VIDEO_UPDATE_CONTENT
+            return _response(method, url, {"ret": 0, "data": {"tid": "fid-video", "ugc_right": 1}})
+
+    client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
+    client._client = _HTTP()
+
+    result = asyncio.run(client.update_mood_visibility_public("fid-video", content="", vid="vid-h5"))
+
+    assert len(calls) == 2
+    assert result["ugc_right"] == 1
+    assert result["empty_content_retry"] == 1
 
 
 def test_qzone_client_video_get_data_uses_appid4_endpoint() -> None:
