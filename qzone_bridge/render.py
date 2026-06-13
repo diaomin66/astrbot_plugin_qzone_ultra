@@ -47,11 +47,11 @@ def format_status(status: dict) -> str:
         source = video_upload.get("source") or "-"
         updated_at = video_upload.get("updated_at") or "-"
         method = video_upload.get("method") or "-"
-        qq_upload_ready = bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
+        qq_upload_ready = bool(video_upload.get("qq_upload_configured"))
         web_cookie_ready = bool(video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
         h5_diagnostic_ready = bool(video_upload.get("h5_upload_diagnostic_available") or web_cookie_ready)
         h5_publish_ready = bool(video_upload.get("h5_publish_supported") and web_cookie_ready)
-        ready = bool(video_upload.get("ready") or qq_upload_ready or h5_publish_ready)
+        ready = bool(h5_publish_ready)
         verification_required = bool(video_upload.get("verification_required"))
         if ready:
             upload_state = "ready"

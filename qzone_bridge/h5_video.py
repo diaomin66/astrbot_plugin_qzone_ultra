@@ -29,7 +29,9 @@ QZONE_H5_VIDEO_CHECK_TYPE_SHA1 = 1
 QZONE_H5_PIC_CHECK_TYPE_MD5_COMPAT = 0
 QZONE_H5_DEFAULT_SLICE_SIZE = 256 * 1024
 QZONE_PUBLIC_UGC_RIGHT = 1
+QZONE_SELF_UGC_RIGHT = 64
 QZONE_PUBLIC_WHO = "1"
+QZONE_LOCAL_VIDEO_SUBRICHTYPE = "6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +132,11 @@ def build_h5_video_control_payload(
     video_extend = {str(key): str(value) for key, value in dict(extend_info or {}).items()}
     video_extend.setdefault("video_type", "3")
     video_extend.setdefault("qz_video_format", str(video_format or "mp4").lstrip(".") or "mp4")
+    # Keep the uploaded video resource public-capable.  The follow-up
+    # shuoshuo creation step below is what intentionally starts as
+    # only-self-visible; if the upload/cover metadata is also self-only,
+    # emotion_cgi_update can flip the mood's ugc_right to 1 while the embedded
+    # video remains access-denied (Qzone reports video_right=640).
     video_extend.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
     video_extend.setdefault("who", QZONE_PUBLIC_WHO)
     return {
@@ -500,9 +507,10 @@ def build_qzone_video_publish_payload(
 ) -> dict[str, Any]:
     """Build the old Web/H5 video-shuoshuo publish payload.
 
-    This endpoint can create the video mood, but Qzone may initially store it as
-    self-visible. The daemon must follow it with emotion_cgi_update and then
-    verify a public feed/detail before reporting success.
+    This endpoint is used only as the creation step. The daemon deliberately
+    creates the video mood as self-visible, then follows it with
+    emotion_cgi_update and verifies a public feed/detail before reporting
+    success.
     """
 
     uin_int = int(uin or 0)
@@ -513,12 +521,12 @@ def build_qzone_video_publish_payload(
         "con": str(content or ""),
         "feedversion": "1",
         "ver": "1",
-        "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
+        "ugc_right": QZONE_SELF_UGC_RIGHT,
         "to_sign": 0,
         "hostuin": uin_int,
         "code_version": "1",
         "richtype": "3",
-        "subrichtype": "7",
+        "subrichtype": QZONE_LOCAL_VIDEO_SUBRICHTYPE,
         "richval": build_qzone_video_richval(uin=uin_int, vid=vid),
         "issyncweibo": int(bool(sync_weibo)),
         "format": "json",
@@ -533,33 +541,41 @@ def build_qzone_video_visibility_update_payload(
     content: str = "",
     vid: str = "",
 ) -> dict[str, Any]:
-    """Build the Web/H5 edit payload that changes a mood to public visibility."""
+    """Build the PC Web edit payload that changes a mood to public visibility.
+
+    The privacy edit endpoint is ``emotion_cgi_update``.  Its successful
+    response is not enough to prove the mood became public, so callers still
+    verify the public feed/detail after this request.
+
+    Keep this body intentionally aligned with onebot-qzone's ``ugc_right``
+    implementation for normal shuoshuo privacy edits: it edits only the
+    permission fields and leaves ``richtype`` / ``richval`` /
+    ``subrichtype`` empty.  Re-sending the local-video ``richval`` here can
+    make Qzone report ``ugc_right=1`` on the wrapper mood while the attached
+    video resource stays access-denied (``video_right=640``).
+    """
 
     uin_int = int(uin or 0)
-    vid = str(vid or "").strip()
+    _ = str(vid or "").strip()
+    fid = str(fid or "").strip()
     data: dict[str, Any] = {
-        "tid": str(fid or "").strip(),
         "syn_tweet_verson": "1",
+        "tid": fid,
         "paramstr": "1",
         "pic_template": "",
-        "who": "1",
+        "richtype": "",
+        "richval": "",
+        "special_url": "",
+        "subrichtype": "",
         "con": str(content or ""),
         "feedversion": "1",
         "ver": "1",
-        "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
-        "to_sign": 0,
-        "to_tweet": 0,
-        "hostuin": uin_int,
+        "ugc_right": str(QZONE_PUBLIC_UGC_RIGHT),
+        "to_sign": "0",
+        "ugcright_id": fid,
+        "hostuin": str(uin_int),
         "code_version": "1",
-        "format": "json",
-        "qzreferrer": f"https://user.qzone.qq.com/{uin_int}",
+        "format": "fs",
+        "qzreferrer": f"https://user.qzone.qq.com/{uin_int}/main",
     }
-    if vid:
-        data.update(
-            {
-                "richtype": "3",
-                "subrichtype": "7",
-                "richval": build_qzone_video_richval(uin=uin_int, vid=vid),
-            }
-        )
     return data

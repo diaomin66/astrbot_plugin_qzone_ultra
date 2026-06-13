@@ -1,9 +1,10 @@
 """Daemon-side native QQ/Qzone video selection and metadata helpers.
 
 This module intentionally does not build or open QQ/QQNT client protocol
-handoff URIs. Video publishing is handled by the local daemon Tencent upload
-path; unsupported video inputs must be rejected instead of falling back to a
-cover-image publish that would falsely report video success.
+handoff URIs. Video publishing is handled by the local daemon H5 private-create +
+permission-update + public-verification path; unsupported video inputs must be
+rejected instead of falling back to a cover-image publish that would falsely
+report video success.
 """
 
 from __future__ import annotations

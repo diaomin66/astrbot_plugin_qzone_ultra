@@ -95,6 +95,7 @@ QZONE_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/
 QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
 QZONE_UPDATE_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update"
+QZONE_VIDEO_GET_DATA_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/video_get_data"
 MAX_UPLOAD_IMAGE_BYTES: int | None = None
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -333,6 +334,27 @@ class QzoneClient:
             headers.update(extra)
         return headers
 
+    def _pc_headers(self, *, referer: str | None = None, origin: str | None = None) -> dict[str, str]:
+        """Headers for PC Qzone form endpoints such as emotion_cgi_update."""
+
+        headers = self._headers(
+            referer=referer or f"https://user.qzone.qq.com/{self.login_uin}/main",
+            origin=origin or "https://user.qzone.qq.com",
+            extra={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-site",
+                "Cache-Control": "max-age=0",
+            },
+        )
+        return headers
+
     def _media_download_headers(self) -> dict[str, str]:
         return {
             "User-Agent": self.user_agent,
@@ -359,6 +381,7 @@ class QzoneClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         json_body: Any | None = None,
+        headers: dict[str, str] | None = None,
         referer: str | None = None,
         origin: str | None = None,
         hostuin: int | None = None,
@@ -383,11 +406,12 @@ class QzoneClient:
                 current_params = params
                 redirects_left = 3
                 while True:
+                    request_headers = headers or self._headers(referer=referer, origin=origin)
                     request_kwargs: dict[str, Any] = {
                         "params": current_params,
                         "data": data,
                         "json": json_body,
-                        "headers": self._headers(referer=referer, origin=origin),
+                        "headers": request_headers,
                     }
                     if timeout is not None:
                         request_kwargs["timeout"] = max(float(timeout), float(self.timeout or 0.001))
@@ -510,6 +534,7 @@ class QzoneClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         json_body: Any | None = None,
+        headers: dict[str, str] | None = None,
         referer: str | None = None,
         origin: str | None = None,
         hostuin: int | None = None,
@@ -526,6 +551,7 @@ class QzoneClient:
             params=params,
             data=data,
             json_body=json_body,
+            headers=headers,
             referer=referer,
             origin=origin,
             hostuin=hostuin,
@@ -710,6 +736,51 @@ class QzoneClient:
             hostuin=hostuin,
             attach_token=False,
             follow_qzone_redirects=True,
+        )
+        return payload
+
+    async def video_get_data(
+        self,
+        hostuin: int,
+        *,
+        get_method: int = 2,
+        start: int = 0,
+        count: int = 20,
+        need_old: int = 1,
+        get_user_info: int = 1,
+    ) -> dict[str, Any]:
+        """Fetch Qzone's appid=4 video/photo timeline data.
+
+        This is the same endpoint used by Qzone photo managers to enumerate
+        uploaded videos.  The H5 local-video publish path can expose the real,
+        public video artifact here even when the appid=311 mood wrapper detail
+        remains unsuitable for public-video verification.
+        """
+
+        hostuin = int(hostuin or self.login_uin or 0)
+        if not hostuin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法读取 Qzone 视频列表")
+        payload = await self._request_json(
+            "GET",
+            QZONE_VIDEO_GET_DATA_URL,
+            params={
+                "uin": self.login_uin,
+                "hostUin": hostuin,
+                "appid": 4,
+                "getMethod": int(get_method),
+                "start": max(0, int(start)),
+                "count": max(1, min(int(count), 50)),
+                "need_old": int(need_old),
+                "getUserInfo": int(get_user_info),
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+            },
+            referer=f"https://user.qzone.qq.com/{hostuin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=hostuin,
+            attach_token=False,
+            follow_qzone_redirects=True,
+            max_attempts=1,
         )
         return payload
 
@@ -1331,12 +1402,13 @@ class QzoneClient:
             content=content,
             vid=vid,
         )
+        referer = f"https://user.qzone.qq.com/{self.login_uin}/main"
         return await self._request_json(
             "POST",
             QZONE_UPDATE_URL,
             data=data,
-            referer=f"https://user.qzone.qq.com/{self.login_uin}/mood/{fid}",
-            origin="https://user.qzone.qq.com",
+            headers=self._pc_headers(referer=referer),
+            referer=referer,
             hostuin=self.login_uin,
             attach_token=False,
             max_attempts=1,

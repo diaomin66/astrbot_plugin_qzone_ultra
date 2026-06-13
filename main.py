@@ -33,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060602
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026061301
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -52,7 +52,20 @@ SENSITIVE_LOG_KEYS = {
     "secret",
     "token",
 }
-SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+SENSITIVE_URL_QUERY_KEYS = {
+    "g_tk",
+    "gtk",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "token",
+    "secret",
+    "rkey",
+    "rk",
+    "lvkey",
+}
 LLM_INTERNAL_KEYS = SENSITIVE_LOG_KEYS | {"raw", "cursor", "fid", "curkey", "unikey", "busi_param"}
 LLM_REPLY_FORBIDDEN_TERMS = (
     "Result:",
@@ -717,7 +730,6 @@ from qzone_bridge.media import (
     source_name,
 )
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.native_video import native_video_candidate
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
     NewsItem,
@@ -727,9 +739,13 @@ from qzone_bridge.news import (
     merge_news_items,
     normalize_news_scopes,
 )
-from qzone_bridge.onebot_cookie import ONEBOT_ACTION_CALLER_ATTRS, fetch_cookie_text, iter_onebot_action_callers
-from qzone_bridge.onebot_native_video import publish_qzone_video_via_onebot
-from qzone_bridge.onebot_upload import probe_video_upload_credentials
+from qzone_bridge.onebot_cookie import (
+    COOKIE_ACTIONS,
+    ONEBOT_ACTION_CALLER_ATTRS,
+    ONEBOT_ACTION_OWNER_ATTRS,
+    fetch_cookie_text,
+    iter_onebot_action_callers,
+)
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
@@ -1675,7 +1691,7 @@ class QzoneStablePlugin(Star):
         if not self.settings.send_admin:
             logger.debug("qzone admin post card notification skipped: send_admin disabled")
             return
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             logger.warning("qzone admin post card notification skipped: no OneBot client")
             return
@@ -1704,7 +1720,7 @@ class QzoneStablePlugin(Star):
         *,
         comment_text: str = "",
     ) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             logger.warning("qzone event post card notification skipped: no OneBot client")
             return
@@ -1734,7 +1750,7 @@ class QzoneStablePlugin(Star):
         if not getattr(self.settings, "send_admin", False):
             logger.debug("qzone scheduled publish admin notification skipped: send_admin disabled")
             return
-        bot = self._capture_onebot_client(None)
+        bot = self._capture_onebot_sender(None)
         if bot is None:
             logger.warning("qzone scheduled publish admin notification skipped: no OneBot client")
             return
@@ -3430,80 +3446,18 @@ class QzoneStablePlugin(Star):
             self.data_dir / "video_covers",
         )
 
-    @staticmethod
-    def _native_video_path_for_protocol_action(post: PostPayload) -> Path | None:
-        video = native_video_candidate(post)
-        if video is None:
-            return None
-        source = normalize_source(video.source)
-        path = resolve_trusted_local_media_path(
-            source,
-            name=video.name or source_name(source),
-            suffixes=QZONE_VIDEO_SUFFIXES,
-        )
-        if path is not None:
-            return path
-        if is_video_media(video):
-            return resolve_trusted_local_media_path(
-                source,
-                name=video.name or source_name(source),
-                suffixes=None,
-            )
-        return None
-
-    async def _publish_onebot_native_video_if_available(
+    async def _publish_daemon_video_post(
         self,
         post: PostPayload,
         *,
         sync_weibo: bool,
-        event: AstrMessageEvent | None,
-    ) -> dict[str, Any] | None:
-        if event is None:
-            return None
-        bot = self._capture_onebot_client(event)
-        if bot is None:
-            return None
-        video_path = self._native_video_path_for_protocol_action(post)
-        if video_path is None:
-            return None
-        result = await publish_qzone_video_via_onebot(
-            bot,
-            video_path=video_path,
+    ) -> dict[str, Any]:
+        return await self.controller.publish_post(
             content=post.content,
             sync_weibo=sync_weibo,
-            source="onebot",
+            media=[item.to_dict() for item in [*post.media, *post.attachments]],
+            content_sanitized=True,
         )
-        if result is None:
-            return None
-        try:
-            payload = await self.controller.verify_native_video_feed(
-                vid=result.vid,
-                fid=result.fid,
-                method="onebot_protocol_video_publish",
-            )
-        except QzoneBridgeError as exc:
-            raise QzoneRequestError(
-                "OneBot protocol-end Qzone video publish returned sVid, but daemon could not verify a public video mood",
-                detail={
-                    "onebot_publish": result.to_dict(),
-                    "verification_error": self._status_error_payload(exc),
-                },
-            ) from exc
-        raw = payload.setdefault("raw", {})
-        if isinstance(raw, dict):
-            raw.setdefault("method", "onebot_protocol_video_publish")
-            raw.setdefault("onebot_publish", result.to_dict())
-        return payload
-
-    async def _daemon_video_publish_ready(self) -> bool:
-        """Return whether the local daemon can already publish videos directly."""
-
-        try:
-            status = await self.controller.get_status()
-        except Exception as exc:
-            logger.debug("qzone daemon video publish readiness check skipped: %s", exc)
-            return False
-        return self._status_has_video_publish_ready(status)
 
     async def _publish_post_payload(
         self,
@@ -3517,28 +3471,12 @@ class QzoneStablePlugin(Star):
         if _post_contains_video_media(post):
             if not getattr(self.settings, "native_video_publish", True):
                 raise QzoneParseError(
-                    "检测到视频附件，但 native_video_publish 已关闭；为避免误把视频封面/渲染图当作发布成功，"
-                    "已阻止本次发布。请开启 native_video_publish，并通过 /qzone autobind 绑定 Qzone Web Cookie/p_skey "
-                    "以启用 H5 直发+权限修改链路；也可以通过 /qzone videoauth 绑定 QQ upload A2/vLoginData，"
-                    "或使用可返回 sVid 且声明公开视频权限的 OneBot 原生发布 action。"
+                    "Video attachment detected but native_video_publish is disabled; refusing to publish a cover image as success. "
+                    "Enable native_video_publish and run /qzone autobind to bind Qzone Web Cookie/p_skey for the H5 "
+                    "private-create + permission-update + public-verification chain."
                 )
             render_post = await self._prepare_publish_payload(post)
-            daemon_video_ready = await self._daemon_video_publish_ready()
-            if not daemon_video_ready:
-                onebot_payload = await self._publish_onebot_native_video_if_available(
-                    post,
-                    sync_weibo=sync_weibo,
-                    event=event,
-                )
-                if onebot_payload is not None:
-                    return render_post, onebot_payload
-                await self._maybe_bind_video_upload_credentials(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                sync_weibo=sync_weibo,
-                media=[item.to_dict() for item in [*post.media, *post.attachments]],
-                content_sanitized=True,
-            )
+            payload = await self._publish_daemon_video_post(post, sync_weibo=sync_weibo)
             return render_post, payload
 
         if render_post is None:
@@ -3562,7 +3500,7 @@ class QzoneStablePlugin(Star):
         )
 
     async def _notify_review_target(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             return
         text = f"{message}\n{draft.preview(include_private=True)}"
@@ -3586,7 +3524,7 @@ class QzoneStablePlugin(Star):
             logger.debug("qzone draft review notification failed: %s", exc)
 
     async def _notify_draft_author(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None or not draft.author_uin:
             return
         try:
@@ -4303,47 +4241,173 @@ class QzoneStablePlugin(Star):
         if candidate is None:
             return False
         for action in (
+            *COOKIE_ACTIONS,
             *ONEBOT_ACTION_CALLER_ATTRS,
             "get_msg",
-            "send_group_msg",
-            "send_private_msg",
+            "get_file",
+            "get_record",
+            "get_image",
             "get_group_file_url",
             "get_private_file_url",
+            "get_file_url",
+            "get_video_url",
+            "get_stranger_info",
+            "get_group_member_info",
         ):
             if callable(getattr(candidate, action, None)):
                 return True
-        api = getattr(candidate, "api", None)
-        return any(callable(getattr(api, action, None)) for action in ONEBOT_ACTION_CALLER_ATTRS)
+        return False
+
+    @staticmethod
+    def _looks_like_onebot_sender(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        return any(
+            callable(getattr(candidate, action, None))
+            for action in ("send_group_msg", "send_private_msg", "send_msg")
+        )
 
     @classmethod
     def _extract_onebot_client(cls, owner: Any) -> Any | None:
-        if owner is None:
-            return None
-        if cls._looks_like_onebot_client(owner):
-            return owner
-        for attr in ("bot", "client", "onebot_client", "onebot", "cqhttp", "api_client"):
-            try:
-                candidate = getattr(owner, attr, None)
-            except Exception:
+        """Find a usable OneBot/Aiocqhttp action client without caching wrappers.
+
+        AstrBot adapters expose several wrapper shapes. Some events have a
+        ``bot`` attribute that is only a wrapper; returning it blindly makes
+        ``/qzone autobind`` call get_cookies on the wrong object. Only return
+        objects that really expose OneBot action dispatchers, while walking the
+        common nested adapter/API fields used by aiocqhttp, NapCat, LLOneBot,
+        Lagrange, and AstrBot platform managers.
+        """
+
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        getter_names = ("get_client", "get_bot", "get_adapter", "get_platform")
+
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
                 continue
-            if attr == "bot" and candidate is not None:
-                return candidate
-            if cls._looks_like_onebot_client(candidate):
-                return candidate
-        getter = getattr(owner, "get_client", None)
-        if callable(getter):
-            try:
-                candidate = getter()
-            except Exception:
-                candidate = None
-            if cls._looks_like_onebot_client(candidate):
-                return candidate
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            if cls._looks_like_onebot_client(current):
+                return current
+
+            for getter_name in getter_names:
+                try:
+                    getter = getattr(current, getter_name, None)
+                except Exception:
+                    getter = None
+                if not callable(getter):
+                    continue
+                try:
+                    candidate = getter()
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
         return None
 
-    def _capture_onebot_client_from_context(self) -> Any | None:
-        context = getattr(self, "_context", None) or getattr(self, "context", None)
-        platform = None
-        if context is not None:
+    @classmethod
+    def _extract_onebot_sender(cls, owner: Any) -> Any | None:
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            if cls._looks_like_onebot_sender(current) or cls._looks_like_onebot_client(current):
+                return current
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+        return None
+
+    @staticmethod
+    def _onebot_platform_meta_matches(candidate: Any) -> bool:
+        try:
+            meta_attr = getattr(candidate, "meta", None)
+            meta = meta_attr() if callable(meta_attr) else meta_attr
+        except Exception:
+            meta = None
+        values = [
+            getattr(candidate, "name", ""),
+            getattr(candidate, "type", ""),
+            getattr(candidate, "platform_type", ""),
+            getattr(candidate, "platform_name", ""),
+            getattr(meta, "name", ""),
+            getattr(meta, "type", ""),
+        ]
+        for value in values:
+            text = str(value or "").lower()
+            if (
+                text == "aiocqhttp"
+                or "onebot" in text
+                or "cqhttp" in text
+                or "napcat" in text
+                or "llbot" in text
+                or "llonebot" in text
+                or "lagrange" in text
+                or "shamrock" in text
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _iter_context_platform_candidates(cls, context: Any) -> list[Any]:
+        if context is None:
+            return []
+        candidates: list[Any] = []
+        seen: set[int] = set()
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    add(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            candidates.append(value)
+
+        add(context)
+
+        try:
+            get_platform = getattr(context, "get_platform", None)
+        except Exception:
+            get_platform = None
+        if callable(get_platform):
             for platform_type in (
                 "aiocqhttp",
                 "onebot",
@@ -4359,42 +4423,47 @@ class QzoneStablePlugin(Star):
                 "shamrock",
             ):
                 try:
-                    platform = context.get_platform(platform_type)
+                    add(get_platform(platform_type))
                 except Exception:
-                    platform = None
-                if platform is not None:
-                    break
-            if platform is None:
+                    pass
+
+        for attr in ("platform", "adapter", "bot"):
+            try:
+                add(getattr(context, attr, None))
+            except Exception:
+                pass
+
+        try:
+            platform_manager = getattr(context, "platform_manager", None)
+        except Exception:
+            platform_manager = None
+        if platform_manager is not None:
+            for attr in ("platform_insts", "platforms", "adapters", "instances"):
                 try:
-                    platform_manager = getattr(context, "platform_manager", None)
-                    for candidate in getattr(platform_manager, "platform_insts", []):
-                        meta = candidate.meta()
-                        platform_name = str(getattr(meta, "name", "") or "").lower()
-                        platform_type = str(getattr(meta, "type", "") or "").lower()
-                        if (
-                            platform_name == "aiocqhttp"
-                            or "onebot" in platform_name
-                            or "napcat" in platform_name
-                            or "llbot" in platform_name
-                            or "llonebot" in platform_name
-                            or "lagrange" in platform_name
-                            or "shamrock" in platform_name
-                            or platform_type == "aiocqhttp"
-                            or "onebot" in platform_type
-                            or "napcat" in platform_type
-                            or "llbot" in platform_type
-                            or "llonebot" in platform_type
-                            or "lagrange" in platform_type
-                            or "shamrock" in platform_type
-                        ):
-                            platform = candidate
-                            break
+                    add(getattr(platform_manager, attr, None))
                 except Exception:
-                    platform = None
-        if platform is not None:
-            bot = self._extract_onebot_client(platform)
+                    pass
+            for getter_name in ("get_platforms", "get_all_platforms", "list_platforms"):
+                try:
+                    getter = getattr(platform_manager, getter_name, None)
+                except Exception:
+                    getter = None
+                if callable(getter):
+                    try:
+                        add(getter())
+                    except Exception:
+                        pass
+        return candidates
+
+    def _capture_onebot_client_from_context(self) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        for candidate in self._iter_context_platform_candidates(context):
+            bot = self._extract_onebot_client(candidate)
             if bot is not None:
                 self._onebot_client = bot
+                return bot
+            if self._onebot_platform_meta_matches(candidate):
+                logger.debug("qzone found OneBot-like AstrBot platform but no action client on it")
         return getattr(self, "_onebot_client", None)
 
     def _capture_onebot_client(self, event: AstrMessageEvent | None = None) -> Any | None:
@@ -4413,8 +4482,38 @@ class QzoneStablePlugin(Star):
                     return bot
         return self._capture_onebot_client_from_context()
 
+    def _capture_onebot_sender(self, event: AstrMessageEvent | None = None) -> Any | None:
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "bot", None),
+                getattr(event, "platform", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_sender(owner)
+                if bot is not None:
+                    return bot
+        return self._capture_onebot_client_from_context()
+
     def _cookie_binding_hint(self) -> str:
-        return "没有从 AstrBot 拿到 OneBot 协议端客户端，请先用 /qzone bind 手动绑定 Cookie。"
+        client = getattr(self, "_onebot_client", None)
+        if client is not None:
+            callers = iter_onebot_action_callers(client)
+            if callers:
+                return (
+                    "OneBot/Aiocqhttp action client was detected, but it did not return a usable Qzone Cookie; "
+                    "please confirm get_cookies/get_credentials is supported and the bot is logged in, or bind with /qzone bind."
+                )
+            return (
+                "The detected OneBot/Aiocqhttp object does not expose a callable action API; "
+                "please confirm the AstrBot aiocqhttp/NapCat/LLOneBot adapter is online, or bind with /qzone bind."
+            )
+        return (
+            "No usable OneBot/Aiocqhttp action client was found from AstrBot; "
+            "please confirm the protocol endpoint is connected, or bind with /qzone bind."
+        )
 
     async def _auto_bind_cookie(
         self,
@@ -4503,13 +4602,6 @@ class QzoneStablePlugin(Star):
         return await self._ensure_cookie_ready(event, force=True, source="onebot")
 
     @staticmethod
-    def _status_has_video_upload_credentials(status: dict[str, Any] | None) -> bool:
-        if not isinstance(status, dict):
-            return False
-        video_upload = status.get("video_upload")
-        return isinstance(video_upload, dict) and bool(video_upload.get("qq_upload_configured") or video_upload.get("configured"))
-
-    @staticmethod
     def _status_has_video_publish_ready(status: dict[str, Any] | None) -> bool:
         if not isinstance(status, dict):
             return False
@@ -4517,50 +4609,9 @@ class QzoneStablePlugin(Star):
         if not isinstance(video_upload, dict):
             return False
         return bool(
-            video_upload.get("qq_upload_configured")
-            or video_upload.get("configured")
-            or (
-                video_upload.get("h5_publish_supported")
-                and (video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
-            )
+            video_upload.get("h5_publish_supported")
+            and (video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
         )
-
-    async def _auto_bind_video_upload_credentials(
-        self,
-        event: AstrMessageEvent | None = None,
-        *,
-        force: bool = False,
-        source: str = "onebot",
-    ) -> dict[str, Any] | None:
-        async with self._get_video_upload_lock():
-            try:
-                status = await self.controller.get_status(probe_daemon=False)
-            except QzoneBridgeError:
-                status = {}
-            if not force and self._status_has_video_publish_ready(status):
-                return status
-
-            bot = self._capture_onebot_client(event)
-            if bot is None:
-                return status or None
-
-            probe = await probe_video_upload_credentials(bot, source=source)
-            self._last_video_upload_probe = probe.public_detail()
-            credentials = probe.credentials
-            if credentials is None:
-                return status or None
-
-            payload = await self.controller.bind_video_upload_credentials_local(**credentials.to_request_body())
-            logger.info("qzone video upload credentials bound from %s", credentials.source)
-            return payload
-
-    async def _maybe_bind_video_upload_credentials(self, event: AstrMessageEvent | None = None) -> None:
-        try:
-            await self._auto_bind_video_upload_credentials(event)
-        except QzoneBridgeError as exc:
-            logger.debug("qzone video upload credential bind skipped: %s", exc)
-        except Exception:
-            logger.debug("qzone video upload credential bind skipped unexpectedly", exc_info=True)
 
     async def _call_bootstrap_auto_bind(
         self,
@@ -4596,7 +4647,6 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
             return False
-        await self._maybe_bind_video_upload_credentials(event)
         await self._prewarm_daemon_if_cookie_ready(trigger)
         return True
 
@@ -5440,7 +5490,6 @@ class QzoneStablePlugin(Star):
                 "/qzone status",
                 "/qzone bind <cookie>",
                 "/qzone autobind",
-                "/qzone videoauth <login_data_b64> [login_key_b64] [token_type] [token_appid] [token_wt_appid]",
                 "/qzone autovideoauth",
                 "/qzone unbind",
                 "",
@@ -5500,7 +5549,6 @@ class QzoneStablePlugin(Star):
             return
         try:
             payload = await self._auto_bind_cookie(event, force=True, source="onebot")
-            await self._maybe_bind_video_upload_credentials(event)
         except QzoneBridgeError as exc:
             logger.warning("qzone autobind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
@@ -5523,121 +5571,25 @@ class QzoneStablePlugin(Star):
         token_appid: int = 0,
         token_wt_appid: int = 0,
     ):
-        """手动绑定 QQ upload 二进制登录材料，用于 daemon 原生视频直发。"""
+        """Deprecated compatibility command; A2/vLoginData is not used as a fallback."""
         if not self._is_admin(event):
-            yield self._command_result(event, "只有管理员可以绑定视频上传材料。")
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
             return
-        if not str(login_data_b64 or "").strip():
-            yield self._command_result(
-                event,
-                "用法：/qzone videoauth <login_data_b64> [login_key_b64] [token_type] [token_appid] [token_wt_appid]",
-            )
-            return
-        try:
-            await self.controller.bind_video_upload_credentials_local(
-                login_data_b64=login_data_b64,
-                login_key_b64=login_key_b64,
-                token_type=token_type,
-                token_appid=token_appid,
-                token_wt_appid=token_wt_appid,
-                source="manual",
-            )
-            payload = await self._status_with_recovery()
-        except QzoneBridgeError as exc:
-            logger.warning("qzone videoauth failed: %s", exc)
-            yield self._command_result(event, self._error_text(exc))
-            return
-        yield self._command_result(event, format_status(payload))
+        yield self._command_result(
+            event,
+            "Video publishing is fixed to the H5 chain: upload video/cover, create an only-self-visible video mood, "
+            "call the permission update API to make it public, then verify public feed/detail. "
+            "QQ upload A2/vLoginData fallback is disabled. Use /qzone autovideoauth to refresh Qzone Web Cookie/p_skey.",
+        )
 
     @qzone.command("autovideoauth")
     async def qzone_autovideoauth(self, event: AstrMessageEvent, probe_mode: str = ""):
-        """自动启用视频发布授权；优先使用 Cookie/H5 直发+权限修改，A2/vLoginData 可作为备用。"""
+        """Ensure H5 video publish readiness through Qzone Web Cookie/p_skey."""
         if not self._is_admin(event):
-            yield self._command_result(event, "只有管理员可以自动绑定视频上传材料。")
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
             return
-        cookie_bind_error: QzoneBridgeError | None = None
-        force_a2_probe = str(probe_mode or "").strip().lower() in {"a2", "qq", "probe", "force", "upload"}
-
-        def _video_upload_from_status(status_payload: dict[str, Any] | None) -> dict[str, Any]:
-            video_upload = status_payload.get("video_upload") if isinstance(status_payload, dict) else {}
-            return video_upload if isinstance(video_upload, dict) else {}
-
-        def _h5_ready(status_payload: dict[str, Any] | None) -> bool:
-            video_upload = _video_upload_from_status(status_payload)
-            return bool(
-                video_upload.get("h5_publish_supported")
-                and (video_upload.get("h5_upload_available") or video_upload.get("web_cookie_configured"))
-            )
-
-        def _h5_cookie_available(status_payload: dict[str, Any] | None) -> bool:
-            video_upload = _video_upload_from_status(status_payload)
-            return bool(video_upload.get("h5_upload_available") or video_upload.get("web_cookie_configured"))
-
         try:
-            try:
-                cookie_status = await self._ensure_cookie_ready_for_video_auth(event)
-            except QzoneBridgeError as exc:
-                cookie_bind_error = exc
-                cookie_status = {}
-            if not force_a2_probe:
-                try:
-                    status_payload = await self._status_with_recovery()
-                except QzoneBridgeError:
-                    status_payload = cookie_status if isinstance(cookie_status, dict) else {}
-                if self._status_has_video_publish_ready(status_payload):
-                    yield self._command_result(event, format_status(status_payload))
-                    return
-            payload = await self._auto_bind_video_upload_credentials(event, force=True, source="onebot")
-            if not self._status_has_video_upload_credentials(payload):
-                probe = getattr(self, "_last_video_upload_probe", {}) or {}
-                attempted = len(probe.get("attempted_actions") or [])
-                returned = ", ".join((probe.get("returned_actions") or [])[:5])
-                web_only = ", ".join((probe.get("web_credential_actions") or [])[:5])
-                client_key_only = ", ".join((probe.get("client_key_actions") or [])[:5])
-                suffix_parts = []
-                if attempted:
-                    suffix_parts.append(f"已尝试 {attempted} 个 OneBot action/参数组合")
-                if returned:
-                    suffix_parts.append(f"有返回的 action：{returned}")
-                if web_only:
-                    suffix_parts.append(f"其中仅返回 Cookie/CSRF 的 action：{web_only}")
-                if client_key_only:
-                    suffix_parts.append(f"其中仅返回 clientkey/keyIndex（Web 跳转登录材料，不是 A2）的 action：{client_key_only}")
-                empty_login_data = ", ".join((probe.get("empty_login_data_actions") or [])[:5])
-                if empty_login_data:
-                    suffix_parts.append(f"目标 A2/vLoginData action 有返回但未给出二进制材料：{empty_login_data}")
-                if cookie_bind_error is not None:
-                    suffix_parts.append(f"Cookie 自动绑定失败：{self._error_text(cookie_bind_error)}")
-                suffix = "；" + "；".join(suffix_parts) if suffix_parts else ""
-                try:
-                    status_payload = await self._status_with_recovery()
-                except QzoneBridgeError:
-                    status_payload = payload if isinstance(payload, dict) else {}
-                if self._status_has_video_publish_ready(status_payload):
-                    yield self._command_result(event, format_status(status_payload))
-                    return
-                h5_available = _h5_ready(status_payload)
-                cookie_available = _h5_cookie_available(status_payload)
-                if h5_available:
-                    h5_note = "当前 Web Cookie/p_skey 可用于 H5 视频直发；发布后会自动调用权限修改接口改为全部人可见，并做公开校验。"
-                    prefix = "OneBot 未返回 QQ upload A2/vLoginData。"
-                elif cookie_available:
-                    h5_note = (
-                        "当前 Web Cookie/p_skey 只能证明 H5 video+cover 上传接口可访问；"
-                        "该 daemon 版本尚未启用 H5 发布+权限修改路径，默认不会用于发布，以避免生成仅自己可见的视频动态。"
-                    )
-                    prefix = "OneBot 未返回 QQ upload A2/vLoginData，因此不能启用可保证全部人可见的 daemon 原生视频后台直发。"
-                else:
-                    h5_note = "当前 daemon 没有可用 Qzone Web Cookie/p_skey，且 OneBot 未返回 A2/vLoginData。"
-                    prefix = "OneBot 未返回 QQ upload A2/vLoginData，因此不能启用可保证全部人可见的 daemon 原生视频后台直发。"
-                yield self._command_result(
-                    event,
-                    f"{prefix}{h5_note}"
-                    "如需备用 Tencent upload 路径，可使用 `，qzone autovideoauth a2` 继续强制探测，或使用 `，qzone videoauth` 手动绑定 A2/vLoginData。"
-                    f"{suffix}",
-                )
-                return
-
+            await self._ensure_cookie_ready_for_video_auth(event)
             payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
             logger.warning("qzone autovideoauth failed: %s", exc)

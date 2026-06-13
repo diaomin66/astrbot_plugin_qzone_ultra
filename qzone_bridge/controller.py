@@ -19,17 +19,30 @@ import httpx
 from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import get_logger
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .h5_video import qzone_h5_video_upload_available
 from .media import is_video_media, sanitize_publish_content
-from .models import SessionState, VideoUploadCredentialState
+from .models import SessionState
 from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso
-from .tencent_upload import QzoneNativeVideoCredentialError, qzone_video_upload_credentials_from_base64
 
 log = get_logger(__name__)
 SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
-SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+SENSITIVE_URL_QUERY_KEYS = {
+    "g_tk",
+    "gtk",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "token",
+    "secret",
+    "rkey",
+    "rk",
+    "lvkey",
+}
 DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS = 300.0
 DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS = 7200.0
 
@@ -520,6 +533,30 @@ class QzoneDaemonController:
     def _status_from_state(self, state, *, daemon_state: str) -> dict[str, Any]:
         runtime = state.runtime
         needs_rebind = self._session_needs_rebind(state.session)
+        video_upload = state.video_upload.summary()
+        h5_ready = qzone_h5_video_upload_available(state.session)
+        state_qq_upload_ready = bool(video_upload.get("configured"))
+        ready = bool(h5_ready)
+        video_upload["qq_upload_configured"] = False
+        video_upload["qq_upload_state_configured"] = state_qq_upload_ready
+        video_upload["web_cookie_configured"] = h5_ready
+        video_upload["h5_upload_available"] = h5_ready
+        video_upload["h5_upload_diagnostic_available"] = h5_ready
+        video_upload["h5_publish_supported"] = h5_ready
+        video_upload["h5_publish_permission_update_required"] = h5_ready
+        video_upload["h5_publish_verified"] = h5_ready
+        video_upload["h5_publish_verification_required"] = h5_ready
+        video_upload["ready"] = ready
+        video_upload["verification_required"] = ready
+        video_upload["configured"] = False
+        if h5_ready:
+            video_upload["method"] = "h5_video_publish_update_visibility"
+            video_upload["stability"] = "private_create_then_permission_update_and_public_verification"
+            if not video_upload.get("updated_at"):
+                video_upload["updated_at"] = state.session.updated_at
+        else:
+            video_upload["method"] = ""
+            video_upload["requires"] = "qzone_web_cookie_p_skey"
         return {
             "daemon_state": daemon_state,
             "daemon_pid": runtime.daemon_pid,
@@ -535,7 +572,7 @@ class QzoneDaemonController:
             "needs_rebind": needs_rebind,
             "last_ok_at": state.session.last_ok_at,
             "last_error": state.session.last_error,
-            "video_upload": state.video_upload.summary(),
+            "video_upload": video_upload,
             "qzonetoken_hosts": sorted(int(k) for k in state.session.qzonetokens.keys() if str(k).isdigit()),
             "feed_cache_size": 0,
             "session_revision": state.session.revision,
@@ -806,77 +843,6 @@ class QzoneDaemonController:
             self.store.update(update)
             return await self.get_status()
 
-    async def bind_video_upload_credentials(
-        self,
-        *,
-        login_data_b64: str,
-        login_key_b64: str = "",
-        token_type: int = 2,
-        token_appid: int = 0,
-        token_wt_appid: int = 0,
-        source: str = "manual",
-    ) -> dict[str, Any]:
-        return await self._request(
-            "POST",
-            "/video-upload-auth",
-            json_body={
-                "login_data_b64": login_data_b64,
-                "login_key_b64": login_key_b64,
-                "token_type": token_type,
-                "token_appid": token_appid,
-                "token_wt_appid": token_wt_appid,
-                "source": source,
-            },
-        )
-
-    async def bind_video_upload_credentials_local(
-        self,
-        *,
-        login_data_b64: str,
-        login_key_b64: str = "",
-        token_type: int = 2,
-        token_appid: int = 0,
-        token_wt_appid: int = 0,
-        source: str = "manual",
-    ) -> dict[str, Any]:
-        try:
-            return await self.bind_video_upload_credentials(
-                login_data_b64=login_data_b64,
-                login_key_b64=login_key_b64,
-                token_type=token_type,
-                token_appid=token_appid,
-                token_wt_appid=token_wt_appid,
-                source=source,
-            )
-        except DaemonUnavailableError:
-            try:
-                qzone_video_upload_credentials_from_base64(
-                    login_data_b64=login_data_b64,
-                    login_key_b64=login_key_b64,
-                    token_type=token_type,
-                    token_appid=token_appid,
-                    token_wt_appid=token_wt_appid,
-                )
-            except QzoneNativeVideoCredentialError as exc:
-                raise QzoneParseError(str(exc)) from exc
-
-            def update(state):
-                ensure_state_secret(state)
-                if not state.runtime.daemon_port:
-                    state.runtime.daemon_port = self.default_port
-                state.video_upload = VideoUploadCredentialState(
-                    login_data_b64="".join(str(login_data_b64 or "").split()),
-                    login_key_b64="".join(str(login_key_b64 or "").split()),
-                    token_type=int(token_type or 2),
-                    token_appid=int(token_appid or 0),
-                    token_wt_appid=int(token_wt_appid or 0),
-                    source=str(source or "manual"),
-                    updated_at=now_iso(),
-                )
-
-            state = self.store.update(update)
-            return {"video_upload": state.video_upload.summary()}
-
     async def unbind(self) -> dict[str, Any]:
         return await self._request("POST", "/unbind", json_body={})
 
@@ -968,7 +934,7 @@ class QzoneDaemonController:
         *,
         vid: str,
         fid: str = "",
-        method: str = "onebot_protocol_video_publish",
+        method: str = "h5_video_publish_update_visibility",
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
