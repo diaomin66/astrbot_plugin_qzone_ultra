@@ -551,7 +551,7 @@ class QzoneDaemonController:
         video_upload["configured"] = False
         if h5_ready:
             video_upload["method"] = "h5_video_publish_update_visibility"
-            video_upload["stability"] = "private_create_then_permission_update_and_public_verification"
+            video_upload["stability"] = "public_create_without_pic_fakefeed_then_permission_repair_and_public_verification"
             if not video_upload.get("updated_at"):
                 video_upload["updated_at"] = state.session.updated_at
         else:

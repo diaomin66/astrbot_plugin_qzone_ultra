@@ -70,6 +70,8 @@ def format_status(status: dict) -> str:
         if ready:
             lines.append(f"- video_upload_method: {method}")
             lines.append(f"- video_upload_updated: {updated_at}")
+            if video_upload.get("stability"):
+                lines.append(f"- video_upload_stability: {video_upload.get('stability')}")
         if "h5_publish_supported" in video_upload:
             lines.append(f"- h5_video_publish_supported: {bool(video_upload.get('h5_publish_supported'))}")
     if status.get("daemon_port"):

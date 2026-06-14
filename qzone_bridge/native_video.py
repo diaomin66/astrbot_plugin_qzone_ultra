@@ -1,8 +1,8 @@
 """Daemon-side native QQ/Qzone video selection and metadata helpers.
 
 This module intentionally does not build or open QQ/QQNT client protocol
-handoff URIs. Video publishing is handled by the local daemon H5 private-create +
-permission-update + public-verification path; unsupported video inputs must be
+handoff URIs. Video publishing is handled by the local daemon H5 public-create +
+permission-repair + public-verification path; unsupported video inputs must be
 rejected instead of falling back to a cover-image publish that would falsely
 report video success.
 """

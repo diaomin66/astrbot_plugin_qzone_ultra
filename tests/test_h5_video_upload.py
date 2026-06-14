@@ -55,7 +55,7 @@ def test_h5_video_control_payload_uses_qzone_cookie_token() -> None:
     assert control["biz_req"]["extend_info"]["who"] == "1"
 
 
-def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> None:
+def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields_without_fake_feed() -> None:
     from qzone_bridge.h5_video import build_h5_video_cover_control_payload
 
     payload = build_h5_video_cover_control_payload(
@@ -85,7 +85,7 @@ def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> 
     assert control["check_type"] == 0
     assert control["file_len"] == 4567
     assert control["asy_upload"] == 0
-    assert biz_req["iNeedFeeds"] == 1
+    assert biz_req["iNeedFeeds"] == 0
     assert biz_req["sPicDesc"] == "hello"
     assert biz_req["iAlbumTypeID"] == 7
     assert biz_req["iUploadType"] == 2
@@ -94,7 +94,7 @@ def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> 
     assert biz_req["iPicWidth"] == 320
     assert biz_req["iPicHight"] == 180
     assert biz_req["iDistinctUse"] == 0x37DD
-    assert biz_req["mapExt"]["mobile_fakefeeds_clientkey"] == "3112333596_1780399990"
+    assert biz_req["mapExt"] == {}
     assert params["vid"] == "vid-h5"
     assert params["clientkey"] == "3112333596_1780399990"
     assert params["raw_width"] == "320"
@@ -103,11 +103,65 @@ def test_h5_video_cover_control_payload_links_vid_clientkey_and_mix_fields() -> 
     assert params["ugc_right"] == "1"
     assert params["who"] == "1"
     assert external["is_client_upload_cover"] == "1"
-    assert external["is_pic_video_mix_feeds"] == "1"
+    assert "is_pic_video_mix_feeds" not in external
     assert external["ugc_right"] == "1"
     assert external["who"] == "1"
     assert external["mix_videoSize"] == "123456"
     assert external["mix_time"] == "2345"
+
+
+def test_h5_video_cover_control_payload_can_opt_into_fake_feed_for_legacy_callers() -> None:
+    from qzone_bridge.h5_video import build_h5_video_cover_control_payload
+
+    payload = build_h5_video_cover_control_payload(
+        uin=3112333596,
+        p_skey="ps-key",
+        checksum="b" * 32,
+        file_size=4567,
+        vid="vid-h5",
+        client_key="3112333596_1780399990",
+        upload_time=1780399990,
+        need_feeds=1,
+    )
+
+    biz_req = payload["control_req"][0]["biz_req"]
+    assert biz_req["iNeedFeeds"] == 1
+    assert biz_req["mapExt"]["mobile_fakefeeds_clientkey"] == "3112333596_1780399990"
+    assert biz_req["stExternalMapExt"]["is_pic_video_mix_feeds"] == "1"
+
+
+def test_h5_video_cover_control_payload_binds_public_album_resource_layer() -> None:
+    from qzone_bridge.h5_video import build_h5_video_cover_control_payload
+
+    payload = build_h5_video_cover_control_payload(
+        uin=3112333596,
+        p_skey="ps-key",
+        checksum="b" * 32,
+        file_size=4567,
+        vid="vid-h5",
+        client_key="3112333596_1780399990",
+        upload_time=1780399990,
+        album_id="album-public",
+        album_name="QzoneVideoDirect",
+    )
+
+    biz_req = payload["control_req"][0]["biz_req"]
+    params = biz_req["stExtendInfo"]["mapParams"]
+    external = biz_req["stExternalMapExt"]
+    assert biz_req["sAlbumID"] == "album-public"
+    assert biz_req["sAlbumName"] == "QzoneVideoDirect"
+    assert biz_req["iAlbumTypeID"] == 0
+    assert params["albumid"] == "album-public"
+    assert params["album_id"] == "album-public"
+    assert params["topicId"] == "album-public"
+    assert params["priv"] == "1"
+    assert params["accessright"] == "1"
+    assert external["albumid"] == "album-public"
+    assert external["album_id"] == "album-public"
+    assert external["topicId"] == "album-public"
+    assert external["priv"] == "1"
+    assert external["accessright"] == "1"
+    assert "is_pic_video_mix_feeds" not in external
 
 
 def test_h5_video_slice_multipart_marks_blob_as_octet_stream_by_default() -> None:
@@ -264,14 +318,14 @@ def test_qzone_client_h5_video_cover_upload_posts_pic_qzone_control_and_slices(t
                 assert biz_req["stExtendInfo"]["mapParams"]["vid"] == "vid-h5"
                 assert biz_req["stExtendInfo"]["mapParams"]["clientkey"] == "3112333596_1780399990"
                 assert biz_req["stExternalMapExt"]["is_client_upload_cover"] == "1"
-                assert biz_req["stExternalMapExt"]["is_pic_video_mix_feeds"] == "1"
+                assert "is_pic_video_mix_feeds" not in biz_req["stExternalMapExt"]
                 assert biz_req["stExternalMapExt"]["ugc_right"] == "1"
                 assert biz_req["stExternalMapExt"]["who"] == "1"
                 assert biz_req["stExternalMapExt"]["mix_videoSize"] == "123456"
                 assert biz_req["stExternalMapExt"]["mix_time"] == "2345"
                 assert biz_req["stExtendInfo"]["mapParams"]["ugc_right"] == "1"
                 assert biz_req["stExtendInfo"]["mapParams"]["who"] == "1"
-                assert biz_req["iNeedFeeds"] == 1
+                assert biz_req["iNeedFeeds"] == 0
                 assert biz_req["iPicWidth"] == 4
                 assert biz_req["iPicHight"] == 2
                 return _response(method, url, {"ret": 0, "data": {"session": "cover-sess", "slice_size": 4096}})
@@ -320,7 +374,7 @@ def test_qzone_client_h5_video_cover_upload_posts_pic_qzone_control_and_slices(t
     assert all(call["params"]["g_tk"] == 12345 for call in calls)
 
 
-def test_qzone_client_publish_video_mood_posts_private_creation_payload() -> None:
+def test_qzone_client_publish_video_mood_posts_public_creation_payload() -> None:
     class _HTTP:
         async def request(self, method: str, url: str, **kwargs):
             assert method == "POST"
@@ -328,10 +382,10 @@ def test_qzone_client_publish_video_mood_posts_private_creation_payload() -> Non
             data = kwargs["data"]
             assert data["con"] == "hello"
             assert data["hostuin"] == 3112333596
-            assert data["ugc_right"] == 64
+            assert data["ugc_right"] == 1
             assert data["who"] == "1"
             assert data["richtype"] == "3"
-            assert data["subrichtype"] == "6"
+            assert data["subrichtype"] == "7"
             assert data["issyncweibo"] == 1
             assert "vid=vid-h5" in data["richval"]
             assert "cache.tv.qq.com" in data["richval"]
@@ -450,6 +504,52 @@ def test_qzone_client_video_get_data_uses_appid4_endpoint() -> None:
     assert len(calls) == 1
 
 
+def test_qzone_client_ensure_public_video_album_skips_locked_shuoshuo_album_and_reuses_public() -> None:
+    client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
+
+    async def fake_list_albums():
+        return [
+            {"id": "locked", "name": "说说和日志相册", "priv": 3, "handset": 7},
+            {"id": "private-normal", "name": "private", "priv": 3, "handset": 0},
+            {"id": "album-public", "name": "QzoneVideoDirect", "priv": 1, "handset": 0},
+        ]
+
+    async def fake_create_public_video_album(**_kwargs):
+        raise AssertionError("existing normal public album should be reused")
+
+    client.list_albums = fake_list_albums  # type: ignore[method-assign]
+    client.create_public_video_album = fake_create_public_video_album  # type: ignore[method-assign]
+
+    album = asyncio.run(client.ensure_public_video_album())
+
+    assert album["id"] == "album-public"
+    assert QzoneClient._album_is_locked_shuoshuo_album({"id": "locked", "name": "说说和日志相册", "priv": 3, "handset": 7})
+    assert not QzoneClient._album_is_public({"id": "locked", "name": "说说和日志相册", "priv": 3, "handset": 7})
+
+
+def test_qzone_client_ensure_public_video_album_creates_when_only_locked_album_exists() -> None:
+    calls: list[str] = []
+    client = QzoneClient(SessionState(uin=3112333596, cookies={"uin": "o3112333596", "p_skey": "ps-key"}))
+
+    async def fake_list_albums():
+        calls.append("list")
+        return [{"id": "locked", "name": "说说和日志相册", "priv": 3, "handset": 7}]
+
+    async def fake_create_public_video_album(**kwargs):
+        calls.append("create")
+        assert kwargs["name"] == "QzoneVideoDirect"
+        return {"code": 0, "data": {"albumid": "created-public", "albumname": "QzoneVideoDirect", "priv": 1}}
+
+    client.list_albums = fake_list_albums  # type: ignore[method-assign]
+    client.create_public_video_album = fake_create_public_video_album  # type: ignore[method-assign]
+
+    album = asyncio.run(client.ensure_public_video_album())
+
+    assert calls == ["list", "create"]
+    assert QzoneClient._album_id(album) == "created-public"
+    assert QzoneClient._album_name(album) == "QzoneVideoDirect"
+
+
 def test_qzone_client_publish_video_mood_requires_vid() -> None:
     from qzone_bridge.errors import QzoneParseError
 
@@ -481,6 +581,10 @@ def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
     calls: list[tuple[str, dict[str, object]]] = []
 
     class _Client:
+        async def ensure_public_video_album(self):
+            calls.append(("ensure_public_video_album", {}))
+            return {"id": "album-public", "name": "QzoneVideoDirect", "priv": 1, "handset": 0}
+
         async def upload_h5_video(self, path, **kwargs):
             calls.append(("upload_h5_video", {"path": path, **kwargs}))
             return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
@@ -532,12 +636,14 @@ def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
     assert payload["fid"] == "fid-video"
     assert payload["vid"] == "vid-h5"
     assert payload["operation_status"] == "verified_feed_video_public_after_permission_update"
+    assert payload["raw"]["public_album"]["id"] == "album-public"
     assert payload["raw"]["verified_mood_visibility"]["privacy_checks"] == {
         "ugc_right_public": True,
         "right_public": True,
         "secret_flag_clear": True,
     }
     assert [name for name, _ in calls] == [
+        "ensure_public_video_album",
         "upload_h5_video",
         "upload_h5_video_cover",
         "publish_video_mood",
@@ -545,8 +651,11 @@ def test_daemon_publish_post_uses_h5_video_publish_then_updates_visibility(
         "verify_mood_visibility",
         "verify",
     ]
-    assert calls[3][1]["fid"] == "fid-video"
-    assert calls[3][1]["vid"] == "vid-h5"
+    assert calls[2][1]["album_id"] == "album-public"
+    assert calls[2][1]["album_name"] == "QzoneVideoDirect"
+    assert calls[2][1]["album_type_id"] == 0
+    assert calls[4][1]["fid"] == "fid-video"
+    assert calls[4][1]["vid"] == "vid-h5"
 
 
 def test_daemon_publish_post_fails_when_h5_visibility_update_fails(
@@ -571,6 +680,9 @@ def test_daemon_publish_post_fails_when_h5_visibility_update_fails(
     monkeypatch.delenv("QZONE_UPLOAD_LOGIN_DATA_B64", raising=False)
 
     class _Client:
+        async def ensure_public_video_album(self):
+            return {"id": "album-public", "name": "QzoneVideoDirect", "priv": 1, "handset": 0}
+
         async def upload_h5_video(self, *_args, **_kwargs):
             return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
 
@@ -606,6 +718,7 @@ def test_daemon_publish_post_fails_when_h5_visibility_update_fails(
 
     assert "修改" in str(error.value) or "update" in str(error.value)
     assert error.value.detail["fid"] == "fid-video"
+    assert error.value.detail["public_album"]["id"] == "album-public"
     assert error.value.detail["permission_update_error"]["message"]
 
 
@@ -630,6 +743,9 @@ def test_daemon_publish_post_fails_when_mood_wrapper_visibility_stays_private(
     monkeypatch.setattr(daemon_mod, "video_cover_media", fake_video_cover_media)
 
     class _Client:
+        async def ensure_public_video_album(self):
+            return {"id": "album-public", "name": "QzoneVideoDirect", "priv": 1, "handset": 0}
+
         async def upload_h5_video(self, *_args, **_kwargs):
             return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
 
@@ -667,6 +783,7 @@ def test_daemon_publish_post_fails_when_mood_wrapper_visibility_stays_private(
         asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
     assert "appid=311" in str(error.value)
+    assert error.value.detail["public_album"]["id"] == "album-public"
     assert error.value.detail["permission_update_result"]["ugc_right"] == 1
     assert error.value.detail["mood_visibility"]["result"] in {"private_visibility", "not_verified"}
 
@@ -691,6 +808,9 @@ def test_daemon_publish_post_fails_when_visibility_update_reports_ok_but_feed_st
     monkeypatch.setattr(daemon_mod, "video_cover_media", fake_video_cover_media)
 
     class _Client:
+        async def ensure_public_video_album(self):
+            return {"id": "album-public", "name": "QzoneVideoDirect", "priv": 1, "handset": 0}
+
         async def upload_h5_video(self, *_args, **_kwargs):
             return QzoneH5VideoUploadResult(vid="vid-h5", checksum="a" * 40, uploaded_bytes=5)
 
@@ -742,6 +862,7 @@ def test_daemon_publish_post_fails_when_visibility_update_reports_ok_but_feed_st
         asyncio.run(service.publish_post(content="hello", media=[video.to_dict()], content_sanitized=True))
 
     assert "不是全部人可见" in str(error.value)
+    assert error.value.detail["public_album"]["id"] == "album-public"
     assert error.value.detail["permission_update_result"]["ugc_right"] == 1
     assert error.value.detail["verification"]["result"] == "private_visibility"
 
@@ -832,6 +953,12 @@ def test_daemon_video_verification_accepts_public_appid4_video_list(
     service.list_feeds = fake_list_feeds
     service.detail_feed = fake_detail_feed
 
+    async def fake_probe(self, item, *, raw=None):
+        assert "vid-public-appid4" in str(item)
+        return {"state": "success", "status_code": 206, "url": "https://photovideo.photo.qq.com/1075_public.f0.mp4"}
+
+    monkeypatch.setattr(QzoneDaemonService, "_probe_appid4_public_video_access", fake_probe)
+
     result = asyncio.run(service._wait_for_native_video_feed(vid="vid-public-appid4", fid="fid-wrapper"))
 
     assert result is not None
@@ -880,6 +1007,12 @@ def test_daemon_video_verification_accepts_public_appid4_feed_html(
     service.list_feeds = fake_list_feeds
     service.detail_feed = fake_detail_feed
 
+    async def fake_probe(self, item, *, raw=None):
+        assert "vid-public-feed" in str(item)
+        return {"state": "success", "status_code": 206, "url": "https://photovideo.photo.qq.com/1075_public.f0.mp4"}
+
+    monkeypatch.setattr(QzoneDaemonService, "_probe_appid4_public_video_access", fake_probe)
+
     result = asyncio.run(service._wait_for_native_video_feed(vid="vid-public-feed"))
 
     assert result is not None
@@ -889,6 +1022,110 @@ def test_daemon_video_verification_accepts_public_appid4_feed_html(
     diagnostics = service._last_native_video_verification_diagnostics
     assert diagnostics["result"] == "verified_feed"
     assert diagnostics["scopes"]["active"]["svid_hits"][0]["accepted_context"] is True
+    assert diagnostics["scopes"]["active"]["svid_hits"][0]["public_probe"]["state"] == "success"
+
+
+def test_daemon_video_verification_rejects_appid4_feed_html_when_public_probe_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+    service.client = types.SimpleNamespace()
+
+    album_item = {
+        "hostuin": 487231935,
+        "fid": "album-feed-denied",
+        "appid": 4,
+        "summary": "appid4 album feed",
+        "raw": {
+            "html": (
+                '<li data-accessright="3">'
+                '<div class="img-box f-video-wrap play" '
+                'url3="https://photovideo.photo.qq.com/1075_private.f0.mp4">'
+                "vid-probe-denied</div></li>"
+            )
+        },
+    }
+
+    async def fake_list_feeds(*, scope, **_kwargs):
+        if scope == "active":
+            return {"items": [dict(album_item)]}
+        return {"items": []}
+
+    async def fake_detail_feed(**_kwargs):
+        return {"entry": dict(album_item), "raw": dict(album_item["raw"])}
+
+    async def fake_probe(self, item, *, raw=None):
+        return {"state": "denied", "status_code": 403, "url": "https://photovideo.photo.qq.com/1075_private.f0.mp4"}
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+    monkeypatch.setattr(QzoneDaemonService, "_probe_appid4_public_video_access", fake_probe)
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-probe-denied"))
+
+    assert result is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "non_public_visibility"
+    assert diagnostics["non_public_visibility_hits"]
+    assert any(
+        marker["kind"] == "appid4_public_video_probe_denied"
+        for marker in diagnostics["non_public_visibility_hits"][0]["visibility_markers"]
+    )
+
+
+def test_daemon_video_verification_rejects_appid4_video_list_when_public_probe_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qzone_bridge import daemon as daemon_mod
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    monkeypatch.setattr(daemon_mod, "NATIVE_VIDEO_VERIFY_RETRY_DELAYS_SECONDS", (0,))
+    service = object.__new__(QzoneDaemonService)
+    service.state = types.SimpleNamespace(session=SessionState(uin=487231935, cookies={"p_skey": "ps-key"}))
+
+    class _Client:
+        async def video_get_data(self, *_args, **kwargs):
+            assert kwargs["get_method"] == 2
+            return {
+                "ret": 0,
+                "data": {
+                    "videos": [
+                        {
+                            "vid": "vid-public-denied",
+                            "priv": 0,
+                            "status": 2,
+                            "download_url": "https://photovideo.photo.qq.com/1075_public_denied.f0.mp4",
+                        }
+                    ]
+                },
+            }
+
+    async def fake_probe(self, item, *, raw=None):
+        return {"state": "denied", "status_code": 403, "url": "https://photovideo.photo.qq.com/1075_public_denied.f0.mp4"}
+
+    service.client = _Client()
+
+    async def fake_list_feeds(**_kwargs):
+        return {"items": []}
+
+    async def fake_detail_feed(**_kwargs):
+        return {"entry": {}, "raw": {}}
+
+    service.list_feeds = fake_list_feeds
+    service.detail_feed = fake_detail_feed
+    monkeypatch.setattr(QzoneDaemonService, "_probe_appid4_public_video_access", fake_probe)
+
+    result = asyncio.run(service._wait_for_native_video_feed(vid="vid-public-denied"))
+
+    assert result is None
+    diagnostics = service._last_native_video_verification_diagnostics
+    assert diagnostics["result"] == "non_public_visibility"
+    assert diagnostics["video_get_data"]["svid_hits"][0]["public_probe"]["state"] == "denied"
 
 
 def test_daemon_video_verification_accepts_profile_mood_video(

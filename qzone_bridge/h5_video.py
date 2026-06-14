@@ -31,7 +31,11 @@ QZONE_H5_DEFAULT_SLICE_SIZE = 256 * 1024
 QZONE_PUBLIC_UGC_RIGHT = 1
 QZONE_SELF_UGC_RIGHT = 64
 QZONE_PUBLIC_WHO = "1"
-QZONE_LOCAL_VIDEO_SUBRICHTYPE = "6"
+# Current Qzone Web's mood video model uses type=3 and subType=7 for uploaded
+# videos (see app/v8/models/mood/video/1.0 in the captured Qzone modules).
+# Using the older 6 variant can create an appid=4 album/video side effect that
+# is visible on phones but not editable as a normal public video mood.
+QZONE_LOCAL_VIDEO_SUBRICHTYPE = "7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,9 +136,8 @@ def build_h5_video_control_payload(
     video_extend = {str(key): str(value) for key, value in dict(extend_info or {}).items()}
     video_extend.setdefault("video_type", "3")
     video_extend.setdefault("qz_video_format", str(video_format or "mp4").lstrip(".") or "mp4")
-    # Keep the uploaded video resource public-capable.  The follow-up
-    # shuoshuo creation step below is what intentionally starts as
-    # only-self-visible; if the upload/cover metadata is also self-only,
+    # Keep the uploaded video resource public-capable.  The follow-up shuoshuo
+    # creation step is public too; if the upload/cover metadata is self-only,
     # emotion_cgi_update can flip the mood's ugc_right to 1 while the embedded
     # video remains access-denied (Qzone reports video_right=640).
     video_extend.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
@@ -207,9 +210,12 @@ def build_h5_video_cover_control_payload(
     upload_time: int | None = None,
     batch_id: int | None = None,
     is_original_video: int = 0,
-    need_feeds: int = 1,
+    need_feeds: int = 0,
     extra_map_ext: dict[str, str] | None = None,
     extra_params: dict[str, str] | None = None,
+    album_id: str = "",
+    album_name: str = "",
+    album_type_id: int | None = None,
 ) -> dict[str, Any]:
     upload_time = int(upload_time if upload_time is not None else time.time())
     batch_id = int(batch_id if batch_id is not None else upload_time)
@@ -224,16 +230,44 @@ def build_h5_video_cover_control_payload(
     params.setdefault("show_geo", "0")
     params.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
     params.setdefault("who", QZONE_PUBLIC_WHO)
+    album_id = str(album_id or "").strip()
+    album_name = str(album_name or "")
+    if album_id:
+        params.setdefault("albumid", album_id)
+        params.setdefault("album_id", album_id)
+        params.setdefault("topicId", album_id)
+        params.setdefault("priv", "1")
+        params.setdefault("privacy", "1")
+        params.setdefault("accessright", "1")
     external_map_ext = {str(key): str(value) for key, value in dict(extra_map_ext or {}).items()}
+    # This cover upload is only a resource-binding step for direct video
+    # shuoshuo publish.  If pic_qzone also creates a fake feed, Qzone can emit
+    # a separate appid=4 "说说和日志相册" item with privacy=3/data-accessright=3.
+    # That private album/video layer is what phones later show as not editable;
+    # emotion_cgi_update only repairs the appid=311 mood wrapper.  Therefore
+    # default to no fake feed and let publish_v6 create the single public mood.
     external_map_ext.setdefault("is_client_upload_cover", "1")
-    external_map_ext.setdefault("is_pic_video_mix_feeds", "1")
+    if int(need_feeds or 0):
+        external_map_ext.setdefault("is_pic_video_mix_feeds", "1")
+    else:
+        external_map_ext.pop("is_pic_video_mix_feeds", None)
     external_map_ext.setdefault("ugc_right", str(QZONE_PUBLIC_UGC_RIGHT))
     external_map_ext.setdefault("who", QZONE_PUBLIC_WHO)
+    if album_id:
+        external_map_ext.setdefault("albumid", album_id)
+        external_map_ext.setdefault("album_id", album_id)
+        external_map_ext.setdefault("topicId", album_id)
+        external_map_ext.setdefault("priv", "1")
+        external_map_ext.setdefault("privacy", "1")
+        external_map_ext.setdefault("accessright", "1")
     if int(video_size or 0) > 0:
         external_map_ext.setdefault("mix_videoSize", str(int(video_size)))
     external_map_ext.setdefault("mix_isOriginalVideo", str(int(is_original_video or 0)))
     if int(duration_ms or 0) > 0:
         external_map_ext.setdefault("mix_time", str(int(duration_ms)))
+    resolved_album_type_id = 7 if album_type_id is None else int(album_type_id)
+    if album_id and album_type_id is None:
+        resolved_album_type_id = 0
     return {
         "control_req": [
             {
@@ -255,9 +289,9 @@ def build_h5_video_cover_control_payload(
                 "biz_req": {
                     "sPicTitle": "",
                     "sPicDesc": str(desc or ""),
-                    "sAlbumName": "",
-                    "sAlbumID": "",
-                    "iAlbumTypeID": 7,
+                    "sAlbumName": album_name if album_id else "",
+                    "sAlbumID": album_id,
+                    "iAlbumTypeID": resolved_album_type_id,
                     "iBitmap": 0,
                     "iUploadType": 2,
                     "iUpPicType": 0,
@@ -269,7 +303,7 @@ def build_h5_video_cover_control_payload(
                     "iDistinctUse": 0x37DD,
                     "iNeedFeeds": int(need_feeds or 0),
                     "iUploadTime": upload_time,
-                    "mapExt": {"mobile_fakefeeds_clientkey": str(client_key or "")},
+                    "mapExt": {"mobile_fakefeeds_clientkey": str(client_key or "")} if int(need_feeds or 0) else {},
                     "stExtendInfo": {"mapParams": params},
                     "stExternalMapExt": external_map_ext,
                     "mutliPicInfo": {
@@ -507,10 +541,13 @@ def build_qzone_video_publish_payload(
 ) -> dict[str, Any]:
     """Build the old Web/H5 video-shuoshuo publish payload.
 
-    This endpoint is used only as the creation step. The daemon deliberately
-    creates the video mood as self-visible, then follows it with
-    emotion_cgi_update and verifies a public feed/detail before reporting
-    success.
+    This endpoint is used only as the creation step.  Publish it as public at
+    creation time: recent Qzone creates a mixed appid=311 mood + appid=4
+    video/album object, and making the creation request self-visible can leave
+    the embedded appid=4 video layer stuck in a private, phone-uneditable
+    state even when a later emotion_cgi_update flips the mood wrapper's
+    ugc_right to 1.  Callers still run emotion_cgi_update as an idempotent
+    public repair step and must verify the final public video feed.
     """
 
     uin_int = int(uin or 0)
@@ -521,7 +558,7 @@ def build_qzone_video_publish_payload(
         "con": str(content or ""),
         "feedversion": "1",
         "ver": "1",
-        "ugc_right": QZONE_SELF_UGC_RIGHT,
+        "ugc_right": QZONE_PUBLIC_UGC_RIGHT,
         "to_sign": 0,
         "hostuin": uin_int,
         "code_version": "1",

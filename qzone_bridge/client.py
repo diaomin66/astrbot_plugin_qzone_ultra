@@ -96,6 +96,11 @@ QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
 QZONE_UPDATE_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update"
 QZONE_VIDEO_GET_DATA_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/video_get_data"
+QZONE_ALBUM_LIST_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/cgi_list_album"
+QZONE_ALBUM_LIST_V3_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/fcg_list_album_v3"
+QZONE_ALBUM_CREATE_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/cgi_create_album"
+QZONE_ALBUM_ADD_V2_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2"
+QZONE_PUBLIC_VIDEO_ALBUM_NAME = "QzoneVideoDirect"
 QZONE_EMPTY_VIDEO_UPDATE_CONTENT = "\u200b"
 QZONE_EMPTY_VIDEO_UPDATE_CONTENT_FALLBACKS = (
     QZONE_EMPTY_VIDEO_UPDATE_CONTENT,
@@ -835,6 +840,267 @@ class QzoneClient:
             result = result.split(token, 1)[0]
         return unquote(result)
 
+    @staticmethod
+    def _album_text(value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        text = str(value).strip()
+        return text[:-2] if text.endswith(".0") else text
+
+    @staticmethod
+    def _album_id(item: dict[str, Any]) -> str:
+        return str(
+            item.get("id")
+            or item.get("topicId")
+            or item.get("topicid")
+            or item.get("albumId")
+            or item.get("albumid")
+            or item.get("aid")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _album_name(item: dict[str, Any]) -> str:
+        return str(item.get("name") or item.get("albumname") or item.get("albumName") or item.get("title") or "").strip()
+
+    @staticmethod
+    def _album_priv(item: dict[str, Any]) -> str:
+        return QzoneClient._album_text(
+            item.get("priv")
+            if item.get("priv") not in (None, "")
+            else item.get("privacy")
+            if item.get("privacy") not in (None, "")
+            else item.get("viewtype")
+            if item.get("viewtype") not in (None, "")
+            else item.get("right")
+        )
+
+    @staticmethod
+    def _album_handset(item: dict[str, Any]) -> str:
+        return QzoneClient._album_text(
+            item.get("handset")
+            if item.get("handset") not in (None, "")
+            else item.get("albumTypeID")
+            if item.get("albumTypeID") not in (None, "")
+            else item.get("albumtype")
+            if item.get("albumtype") not in (None, "")
+            else item.get("type")
+        )
+
+    @staticmethod
+    def _album_is_locked_shuoshuo_album(item: dict[str, Any]) -> bool:
+        # Current Qzone web hides permission editing for the special
+        # handset=7 + priv=3 "说说和日志相册".  Binding a video resource here
+        # leaves the appid=4 video layer private even after emotion_cgi_update
+        # succeeds on the appid=311 mood wrapper.
+        name = QzoneClient._album_name(item)
+        return bool(
+            (QzoneClient._album_handset(item) == "7" and QzoneClient._album_priv(item) == "3")
+            or "说说和日志相册" in name
+        )
+
+    @staticmethod
+    def _album_is_public(item: dict[str, Any]) -> bool:
+        if not QzoneClient._album_id(item):
+            return False
+        if QzoneClient._album_is_locked_shuoshuo_album(item):
+            return False
+        return QzoneClient._album_priv(item) == "1"
+
+    @staticmethod
+    def _collect_album_items(value: Any, *, depth: int = 0) -> list[dict[str, Any]]:
+        if depth > 8:
+            return []
+        albums: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            if QzoneClient._album_id(value) and (
+                "priv" in value
+                or "albumname" in value
+                or "albumName" in value
+                or "name" in value
+                or "topicId" in value
+                or "albumid" in value
+                or "albumId" in value
+            ):
+                albums.append(value)
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if "album" in key_text or key_text in {"data", "list", "items"}:
+                    albums.extend(QzoneClient._collect_album_items(item, depth=depth + 1))
+        elif isinstance(value, list):
+            for item in value:
+                albums.extend(QzoneClient._collect_album_items(item, depth=depth + 1))
+        return albums
+
+    @staticmethod
+    def _safe_album_detail(item: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        return {
+            "id": QzoneClient._album_id(item),
+            "name": QzoneClient._album_name(item),
+            "priv": QzoneClient._album_priv(item),
+            "handset": QzoneClient._album_handset(item),
+            "locked_shuoshuo_album": QzoneClient._album_is_locked_shuoshuo_album(item),
+        }
+
+    async def list_albums(self, uin: int | None = None) -> list[dict[str, Any]]:
+        target_uin = int(uin or self.login_uin or 0)
+        if not target_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法读取相册列表")
+        common_params = {
+            "uin": target_uin,
+            "hostUin": target_uin,
+            "appid": 4,
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+            "source": "qzone",
+            "plat": "qzone",
+            "notice": 0,
+        }
+        attempts = (
+            (
+                QZONE_ALBUM_LIST_URL,
+                {**common_params, "format": "json"},
+            ),
+            (
+                QZONE_ALBUM_LIST_V3_URL,
+                {**common_params, "format": "jsonp", "json_esc": 1},
+            ),
+        )
+        for url, params in attempts:
+            try:
+                payload = await self._request_json(
+                    "GET",
+                    url,
+                    params=params,
+                    referer=f"https://user.qzone.qq.com/{target_uin}/photo",
+                    origin="https://user.qzone.qq.com",
+                    hostuin=target_uin,
+                    attach_token=False,
+                    follow_qzone_redirects=True,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                log.debug("qzone album list endpoint failed url=%s error=%s", url, exc)
+                continue
+            albums = self._collect_album_items(payload)
+            if albums:
+                return albums
+        return []
+
+    async def create_public_video_album(self, name: str = QZONE_PUBLIC_VIDEO_ALBUM_NAME, desc: str = "") -> dict[str, Any]:
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法创建相册")
+        album_name = str(name or QZONE_PUBLIC_VIDEO_ALBUM_NAME)
+        base_data = {
+            "hostUin": self.login_uin,
+            "uin": self.login_uin,
+            "albumname": album_name,
+            "albumdesc": str(desc or ""),
+            "priv": "1",
+            "format": "json",
+            "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}/photo",
+        }
+        attempts = (
+            (
+                QZONE_ALBUM_CREATE_URL,
+                base_data,
+            ),
+            (
+                QZONE_ALBUM_ADD_V2_URL,
+                {
+                    **base_data,
+                    "album_type": "",
+                    "albumclass": "100",
+                    "question": "",
+                    "answer": "",
+                    "whiteList": "",
+                    "bitmap": "10000000",
+                    "appid": 4,
+                    "inCharset": "utf-8",
+                    "outCharset": "utf-8",
+                    "source": "qzone",
+                    "plat": "qzone",
+                    "notice": 0,
+                },
+            ),
+        )
+        last_error: Exception | None = None
+        for url, data in attempts:
+            try:
+                return await self._request_json(
+                    "POST",
+                    url,
+                    data=data,
+                    headers=self._pc_headers(referer=f"https://user.qzone.qq.com/{self.login_uin}/photo"),
+                    referer=f"https://user.qzone.qq.com/{self.login_uin}/photo",
+                    origin="https://user.qzone.qq.com",
+                    hostuin=self.login_uin,
+                    attach_token=False,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                last_error = exc
+                log.debug("qzone public album create endpoint failed url=%s error=%s", url, exc)
+                continue
+        if isinstance(last_error, QzoneRequestError):
+            raise last_error
+        if isinstance(last_error, QzoneParseError):
+            raise last_error
+        raise QzoneRequestError("QQ 空间公开相册创建失败", detail={"album_name": album_name})
+
+    async def ensure_public_video_album(self, name: str = QZONE_PUBLIC_VIDEO_ALBUM_NAME) -> dict[str, Any]:
+        albums = await self.list_albums()
+        public_albums = [item for item in albums if isinstance(item, dict) and self._album_is_public(item)]
+        for preferred_name in (name, QZONE_PUBLIC_VIDEO_ALBUM_NAME, "Qzone视频直发", "视频直发"):
+            for item in public_albums:
+                if self._album_name(item) == preferred_name:
+                    return item
+
+        create_error: Exception | None = None
+        try:
+            created = await self.create_public_video_album(name=name)
+        except (QzoneRequestError, QzoneParseError) as exc:
+            create_error = exc
+            if public_albums:
+                return public_albums[0]
+            raise
+        created_albums = self._collect_album_items(created)
+        for item in created_albums:
+            if self._album_id(item):
+                return item
+        album_id = str(
+            created.get("albumid")
+            or created.get("albumId")
+            or created.get("topicId")
+            or created.get("id")
+            or created.get("aid")
+            or ""
+        ).strip()
+        if album_id:
+            return {"id": album_id, "name": name, "priv": 1, "handset": 0, "raw": created}
+
+        # Some Qzone create-album responses only return ret/code=0.  Re-list
+        # and select the named public album before giving up.
+        albums_after_create = await self.list_albums()
+        for item in albums_after_create:
+            if self._album_is_public(item) and self._album_name(item) == name:
+                return item
+        if public_albums:
+            return public_albums[0]
+        raise QzoneRequestError(
+            "QQ 空间公开相册已请求创建，但未能确认可绑定的相册 ID",
+            detail={
+                "album_name": name,
+                "create_result": created,
+                "album_count_after_create": len(albums_after_create),
+                "create_error": str(create_error) if create_error is not None else "",
+            },
+        )
+
     async def _load_image_source(self, media: dict[str, Any]) -> tuple[bytes, str, str]:
         item = normalize_media_item(media, default_kind="image")
         if item is None or not item.source:
@@ -1204,9 +1470,12 @@ class QzoneClient:
         upload_time: int | None = None,
         width: int = 0,
         height: int = 0,
-        need_feeds: int = 1,
+        need_feeds: int = 0,
         extra_map_ext: dict[str, str] | None = None,
         extra_params: dict[str, str] | None = None,
+        album_id: str = "",
+        album_name: str = "",
+        album_type_id: int | None = None,
     ) -> QzoneH5VideoCoverUploadResult:
         path = Path(cover_path)
         if not path.is_file():
@@ -1243,6 +1512,9 @@ class QzoneClient:
             need_feeds=need_feeds,
             extra_map_ext=extra_map_ext,
             extra_params=extra_params,
+            album_id=album_id,
+            album_name=album_name,
+            album_type_id=album_type_id,
         )
         control_response = await self._request_json(
             "POST",

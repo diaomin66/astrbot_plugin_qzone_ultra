@@ -13,12 +13,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
+import httpx
 from aiohttp import web
 
 from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import configure_standalone_logging, get_logger
-from .client import QzoneClient
+from .client import QZONE_PUBLIC_VIDEO_ALBUM_NAME, QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .h5_video import qzone_h5_video_upload_available
 from .local_media import resolve_trusted_local_media_path
@@ -373,6 +375,8 @@ APPID4_PUBLIC_PRIV_VALUES = {"0"}
 APPID4_PUBLIC_ACCESSRIGHT_VALUES = {"3"}
 APPID4_READY_STATUS_VALUES = {"", "2"}
 APPID4_PUBLIC_VIDEO_URL_MARKERS = ("photovideo.photo.qq.com",)
+APPID4_PUBLIC_VIDEO_URL_STATUS_CODES = {200, 206}
+APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS = 3
 APPID4_VIDEO_URL_KEYS = {
     "downloadurl",
     "download_url",
@@ -410,6 +414,7 @@ HTML_DATA_ACCESSRIGHT_RE = re.compile(
     r"\bdata-accessright\s*=\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"']*)(?P=quote)|(?P<bare>[^\s\"'<>`]+))",
     re.I,
 )
+PUBLIC_VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
 def _visibility_right_text(value: Any) -> str:
     if isinstance(value, bool) or value is None:
         return ""
@@ -615,6 +620,59 @@ def _contains_public_video_url(value: Any) -> bool:
     return False
 
 
+def _extract_public_video_urls(value: Any, *, depth: int = 0) -> list[str]:
+    if depth > 8:
+        return []
+    urls: list[str] = []
+    if isinstance(value, str):
+        text = html_lib.unescape(value).replace("\\/", "/")
+        for match in PUBLIC_VIDEO_URL_RE.finditer(text):
+            candidate = str(match.group(0) or "").strip().rstrip(".,)")
+            if not candidate:
+                continue
+            parsed = urlparse(candidate)
+            scheme = (parsed.scheme or "").lower()
+            host = (parsed.hostname or "").lower()
+            if scheme not in {"http", "https"}:
+                continue
+            if not any(marker in host for marker in APPID4_PUBLIC_VIDEO_URL_MARKERS):
+                continue
+            if candidate not in urls:
+                urls.append(candidate)
+            if len(urls) >= APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS:
+                return urls[:APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS]
+        return urls
+    if isinstance(value, (bytes, bytearray)):
+        return _extract_public_video_urls(value.decode("utf-8", errors="replace"), depth=depth + 1)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = _normalized_key_text(key)
+            if key_norm in APPID4_VIDEO_URL_KEYS or isinstance(item, (dict, list, tuple, str, bytes, bytearray)):
+                for candidate in _extract_public_video_urls(item, depth=depth + 1):
+                    if candidate not in urls:
+                        urls.append(candidate)
+                    if len(urls) >= APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS:
+                        return urls[:APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS]
+        return urls
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            for candidate in _extract_public_video_urls(item, depth=depth + 1):
+                if candidate not in urls:
+                    urls.append(candidate)
+                if len(urls) >= APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS:
+                    return urls[:APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS]
+    return urls
+
+
+def _safe_public_video_url_text(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.netloc or parsed.hostname or ""
+    path = parsed.path or ""
+    if not host:
+        return ""
+    return f"{parsed.scheme or 'https'}://{host}{path}"
+
+
 def _html_accessright_markers(value: Any, *, path: str = "raw") -> list[dict[str, Any]]:
     markers: list[dict[str, Any]] = []
     if isinstance(value, str):
@@ -653,19 +711,8 @@ def _appid4_video_public_markers(value: Any, *, raw: Any = None) -> list[dict[st
                 item_path = f"{path}.{key}" if path else str(key)
                 if key_norm == "priv" and item_text in APPID4_PUBLIC_PRIV_VALUES:
                     markers.append({"path": item_path, "kind": "appid4_public_priv", "value": item_text})
-                elif key_norm == "dataaccessright" and item_text in APPID4_PUBLIC_ACCESSRIGHT_VALUES:
-                    markers.append({"path": item_path, "kind": "appid4_accessright", "value": item_text})
-                elif key_norm == "accessright" and item_text in APPID4_PUBLIC_ACCESSRIGHT_VALUES:
-                    markers.append({"path": item_path, "kind": "appid4_accessright", "value": item_text})
                 if len(markers) >= 5:
                     return markers[:5]
-        markers.extend(
-            marker
-            for marker in _html_accessright_markers(root, path=root_path or "html")
-            if str(marker.get("value") or "") in APPID4_PUBLIC_ACCESSRIGHT_VALUES
-        )
-        if len(markers) >= 5:
-            return markers[:5]
     return markers[:5]
 
 
@@ -682,18 +729,62 @@ def _appid4_video_non_public_markers(value: Any, *, raw: Any = None) -> list[dic
                 item_path = f"{path}.{key}" if path else str(key)
                 if key_norm == "priv" and item_text and item_text not in APPID4_PUBLIC_PRIV_VALUES:
                     markers.append({"path": item_path, "kind": "appid4_non_public_priv", "value": item_text})
-                elif key_norm in {"dataaccessright", "accessright"} and item_text and item_text not in APPID4_PUBLIC_ACCESSRIGHT_VALUES:
-                    markers.append({"path": item_path, "kind": "appid4_non_public_accessright", "value": item_text})
                 if len(markers) >= 5:
                     return markers[:5]
-        markers.extend(
-            marker
-            for marker in _html_accessright_markers(root, path=root_path or "html")
-            if str(marker.get("value") or "") and str(marker.get("value") or "") not in APPID4_PUBLIC_ACCESSRIGHT_VALUES
-        )
-        if len(markers) >= 5:
-            return markers[:5]
     return markers[:5]
+
+
+def _merge_appid4_public_probe_visibility(
+    visibility: dict[str, Any],
+    probe: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(visibility, dict) or not isinstance(probe, dict):
+        return visibility
+    state = str(probe.get("state") or "")
+    if state == "success":
+        marker = {
+            "path": str(probe.get("path") or "raw"),
+            "kind": "appid4_public_video_probe",
+            "value": str(probe.get("status_code") or "200"),
+        }
+        public_markers = [marker, *list(visibility.get("public_markers") or [])][:5]
+        return {
+            "public": True,
+            "private": False,
+            "non_public": False,
+            "visibility_markers": [],
+            "public_markers": public_markers,
+            "private_markers": [],
+        }
+    if state == "denied":
+        marker = {
+            "path": str(probe.get("path") or "raw"),
+            "kind": "appid4_public_video_probe_denied",
+            "value": str(probe.get("status_code") or probe.get("reason") or "denied"),
+        }
+        visibility_markers = [*list(visibility.get("visibility_markers") or []), marker][:5]
+        private_markers = [marker] if "private" in str(marker.get("kind") or "") else []
+        return {
+            "public": False,
+            "private": bool(private_markers),
+            "non_public": True,
+            "visibility_markers": visibility_markers,
+            "public_markers": list(visibility.get("public_markers") or [])[:5],
+            "private_markers": private_markers[:5],
+        }
+    return visibility
+
+
+def _safe_appid4_public_probe_result(probe: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(probe, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in ("state", "status_code", "content_type", "reason", "url_count", "tested_url_count"):
+        if key in probe and probe.get(key) not in (None, ""):
+            safe[key] = probe.get(key)
+    if probe.get("url"):
+        safe["url"] = _safe_public_video_url_text(str(probe.get("url") or ""))
+    return safe
 
 
 def _native_video_public_upload_result(value: Any) -> dict[str, Any]:
@@ -1087,7 +1178,7 @@ class QzoneDaemonService:
         summary["configured"] = state_qq_upload_ready
         if h5_ready:
             summary["method"] = "h5_video_publish_update_visibility"
-            summary["stability"] = "private_create_then_permission_update_and_public_verification"
+            summary["stability"] = "public_create_without_pic_fakefeed_then_permission_repair_and_public_verification"
             if not summary.get("updated_at"):
                 summary["updated_at"] = self.state.session.updated_at
         else:
@@ -1513,6 +1604,106 @@ class QzoneDaemonService:
             return items[:100]
         return []
 
+    async def _probe_public_video_url(self, url: str) -> dict[str, Any]:
+        target = str(url or "").strip()
+        if not target:
+            return {"state": "missing_url", "reason": "empty_url"}
+        parsed = urlparse(target)
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        if scheme not in {"http", "https"} or not any(marker in host for marker in APPID4_PUBLIC_VIDEO_URL_MARKERS):
+            return {"state": "missing_url", "reason": "unsupported_url", "url": _safe_public_video_url_text(target)}
+        timeout = max(5.0, min(float(getattr(self, "request_timeout", 15.0) or 15.0), 15.0))
+        headers = {
+            "User-Agent": str(getattr(self, "user_agent", "") or "Mozilla/5.0"),
+            "Accept": "video/*,*/*;q=0.8",
+            "Range": "bytes=0-2047",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as probe_client:
+                response = await probe_client.get(target, headers=headers)
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as exc:
+            return {
+                "state": "error",
+                "reason": type(exc).__name__,
+                "url": _safe_public_video_url_text(target),
+            }
+        content_type = str(response.headers.get("content-type") or "").strip().lower()
+        payload: dict[str, Any] = {
+            "url": _safe_public_video_url_text(target),
+            "status_code": int(response.status_code or 0),
+            "content_type": content_type,
+        }
+        if response.status_code in APPID4_PUBLIC_VIDEO_URL_STATUS_CODES and (
+            not content_type or "video" in content_type or "octet-stream" in content_type
+        ):
+            payload["state"] = "success"
+            return payload
+        if response.status_code in {301, 302, 303, 307, 308, 401, 403, 404, 410}:
+            payload["state"] = "denied"
+            return payload
+        if response.status_code >= 400:
+            payload["state"] = "denied"
+            return payload
+        payload["state"] = "error"
+        payload["reason"] = "unexpected_response"
+        return payload
+
+    async def _probe_appid4_public_video_access(self, item: dict[str, Any], *, raw: Any = None) -> dict[str, Any]:
+        urls: list[str] = []
+        for value in (item, raw):
+            if value in (None, "", [], {}):
+                continue
+            for candidate in _extract_public_video_urls(value):
+                if candidate not in urls:
+                    urls.append(candidate)
+                if len(urls) >= APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS:
+                    break
+            if len(urls) >= APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS:
+                break
+        if not urls:
+            return {"state": "missing_url", "url_count": 0, "tested_url_count": 0}
+        first_error: dict[str, Any] | None = None
+        first_denied: dict[str, Any] | None = None
+        tested = 0
+        for url in urls[:APPID4_PUBLIC_VIDEO_PROBE_MAX_URLS]:
+            tested += 1
+            result = await self._probe_public_video_url(url)
+            result = dict(result) if isinstance(result, dict) else {"state": "error", "reason": "invalid_result"}
+            result.setdefault("url_count", len(urls))
+            result.setdefault("tested_url_count", tested)
+            if result.get("state") == "success":
+                return result
+            if result.get("state") == "denied" and first_denied is None:
+                first_denied = result
+            elif result.get("state") == "error" and first_error is None:
+                first_error = result
+        if first_denied is not None:
+            first_denied.setdefault("url_count", len(urls))
+            first_denied.setdefault("tested_url_count", tested)
+            return first_denied
+        if first_error is not None:
+            first_error.setdefault("url_count", len(urls))
+            first_error.setdefault("tested_url_count", tested)
+            return first_error
+        return {"state": "missing_url", "url_count": len(urls), "tested_url_count": tested}
+
+    async def _verified_native_video_visibility(
+        self,
+        item: dict[str, Any],
+        *,
+        raw: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        visibility = _native_video_visibility_diagnostic(item, raw=raw)
+        try:
+            appid = int(item.get("appid") or 0)
+        except (TypeError, ValueError):
+            appid = 0
+        if appid != 4:
+            return visibility, None
+        probe = await self._probe_appid4_public_video_access(item, raw=raw)
+        return _merge_appid4_public_probe_visibility(visibility, probe), probe
+
     async def _verify_appid4_video_get_data(
         self,
         *,
@@ -1563,7 +1754,7 @@ class QzoneDaemonService:
                 "hostuin": login_uin,
                 **item,
             }
-            visibility = _native_video_visibility_diagnostic(item_with_context, raw=item)
+            visibility, probe = await self._verified_native_video_visibility(item_with_context, raw=item)
             hit = {
                 "appid": 4,
                 "hostuin": login_uin,
@@ -1571,6 +1762,9 @@ class QzoneDaemonService:
                 "has_public_video_url": _contains_public_video_url(item),
                 "visibility": visibility,
             }
+            safe_probe = _safe_appid4_public_probe_result(probe)
+            if safe_probe:
+                hit["public_probe"] = safe_probe
             _append_diagnostic_sample(video_diag["svid_hits"], hit)
             if not _verified_native_video_feed_item(item_with_context, vid=vid, login_uin=login_uin, raw=item):
                 continue
@@ -1580,6 +1774,8 @@ class QzoneDaemonService:
             verified.setdefault("verification_source", "video_get_data")
             verified.setdefault("visibility", visibility)
             verified.setdefault("raw", item)
+            if safe_probe:
+                verified.setdefault("public_probe", safe_probe)
             diagnostics["result"] = "verified_video_get_data"
             diagnostics["verified_source"] = "video_get_data"
             return verified
@@ -1839,11 +2035,19 @@ class QzoneDaemonService:
                         )
                     raw = item.get("raw")
                     if _verified_native_video_feed_item(item, vid=vid, login_uin=login_uin, raw=raw):
-                        visibility = _native_video_visibility_diagnostic(item, raw=raw)
+                        visibility, probe = await self._verified_native_video_visibility(item, raw=raw)
+                        safe_probe = _safe_appid4_public_probe_result(probe)
+                        if safe_probe and scope_diag.get("svid_hits"):
+                            try:
+                                scope_diag["svid_hits"][-1]["public_probe"] = safe_probe
+                            except Exception:
+                                pass
                         if not _native_video_visibility_public(visibility, diagnostics):
                             continue
                         item.setdefault("verification_source", f"{scope}_feed")
                         item.setdefault("visibility", visibility)
+                        if safe_probe:
+                            item.setdefault("public_probe", safe_probe)
                         diagnostics["result"] = "verified_feed"
                         diagnostics["verified_source"] = f"{scope}_feed"
                         return item
@@ -1897,7 +2101,8 @@ class QzoneDaemonService:
                         login_uin=login_uin,
                         raw=raw,
                     ):
-                        visibility = _native_video_visibility_diagnostic(entry_with_context, raw=raw)
+                        visibility, probe = await self._verified_native_video_visibility(entry_with_context, raw=raw)
+                        safe_probe = _safe_appid4_public_probe_result(probe)
                         if not _native_video_visibility_public(visibility, diagnostics):
                             continue
                         verified = dict(entry) if isinstance(entry, dict) else dict(item)
@@ -1907,6 +2112,8 @@ class QzoneDaemonService:
                         verified.setdefault("raw", detail.get("raw") if isinstance(detail, dict) else detail)
                         verified.setdefault("verification_source", f"{scope}_detail")
                         verified.setdefault("visibility", visibility)
+                        if safe_probe:
+                            verified.setdefault("public_probe", safe_probe)
                         diagnostics["result"] = "verified_detail"
                         diagnostics["verified_source"] = f"{scope}_detail"
                         return verified
@@ -2058,6 +2265,26 @@ class QzoneDaemonService:
                     "daemon H5 视频直发无法生成可读取的视频封面，已停止发布",
                     detail={"name": video.name or path.name},
                 )
+            public_album = await self.client.ensure_public_video_album()
+            album_id = str(
+                public_album.get("id")
+                or public_album.get("topicId")
+                or public_album.get("albumId")
+                or public_album.get("albumid")
+                or public_album.get("aid")
+                or ""
+            ).strip()
+            album_name = str(
+                public_album.get("name")
+                or public_album.get("albumname")
+                or public_album.get("albumName")
+                or QZONE_PUBLIC_VIDEO_ALBUM_NAME
+            ).strip()
+            if not album_id:
+                raise QzoneRequestError(
+                    "QQ 空间 H5 公开视频相册未返回可绑定的相册 ID",
+                    detail={"public_album": _json_safe_detail(public_album)},
+                )
             result = await self.client.upload_h5_video(
                 path,
                 title=video.name or path.name,
@@ -2075,6 +2302,9 @@ class QzoneDaemonService:
                 video_size=file_size,
                 duration_ms=duration_ms,
                 desc=content,
+                album_id=album_id,
+                album_name=album_name,
+                album_type_id=0,
             )
         except FileNotFoundError as exc:
             raise QzoneParseError("视频文件不存在，无法进行 Qzone H5 原生视频上传", detail={"path": str(path)}) from exc
@@ -2112,6 +2342,7 @@ class QzoneDaemonService:
             detail: dict[str, Any] = {
                 "vid": result.vid,
                 "client_key": client_key,
+                "public_album": _json_safe_detail(public_album),
                 "upload_result": _native_video_public_upload_result(result),
                 "cover_upload": _native_video_public_cover_result(cover_result),
                 "publish_result": _json_safe_detail(publish_result),
@@ -2140,6 +2371,7 @@ class QzoneDaemonService:
                     "vid": result.vid,
                     "fid": publish_fid,
                     "client_key": client_key,
+                    "public_album": _json_safe_detail(public_album),
                     "publish_result": _json_safe_detail(publish_result),
                     "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
                     "permission_update_error": _safe_error_diagnostic(exc),
@@ -2159,6 +2391,7 @@ class QzoneDaemonService:
                     "vid": result.vid,
                     "fid": publish_fid,
                     "client_key": client_key,
+                    "public_album": _json_safe_detail(public_album),
                     "publish_result": _json_safe_detail(publish_result),
                     "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
                     "permission_update_result": _json_safe_detail(visibility_update_result),
@@ -2188,6 +2421,7 @@ class QzoneDaemonService:
                     "vid": result.vid,
                     "fid": publish_fid,
                     "client_key": client_key,
+                    "public_album": _json_safe_detail(public_album),
                     "publish_result": _json_safe_detail(publish_result),
                     "publish_error": _safe_error_diagnostic(publish_error) if publish_error is not None else None,
                     "permission_update_result": _json_safe_detail(visibility_update_result),
@@ -2207,6 +2441,7 @@ class QzoneDaemonService:
             "photo_count": 1,
             "raw": {
                 "method": "h5_video_publish_update_visibility",
+                "public_album": _json_safe_detail(public_album),
                 "upload_result": _native_video_public_upload_result(result),
                 "cover_upload_result": _native_video_public_cover_result(cover_result),
                 "publish_result": _json_safe_detail(publish_result),
@@ -2260,8 +2495,8 @@ class QzoneDaemonService:
             )
 
         raise QzoneParseError(
-            "daemon 原生视频直发固定使用 H5 私密创建 + 权限修改 + 公开校验链路；当前缺少 Qzone Web Cookie/p_skey，"
-            "无法创建仅自己可见的视频说说并调用权限接口改为全部人可见，已阻止视频封面替代发布。"
+            "daemon 原生视频直发固定使用 H5 公开创建 + 权限修复 + 公开校验链路；当前缺少 Qzone Web Cookie/p_skey，"
+            "无法公开创建视频说说并调用权限接口修复为全部人可见，已阻止视频封面替代发布。"
             "请先使用 /qzone autobind 绑定 Qzone Cookie。",
             detail={
                 "name": video.name or path.name,
@@ -2343,7 +2578,7 @@ class QzoneDaemonService:
         if _contains_video_media(normalized_media):
             raise QzoneParseError(
                 "daemon 原生视频后台直发仅支持单个本地视频，已阻止视频封面替代发布；"
-                "请只附带一个视频，并确保已绑定 Qzone Web Cookie/p_skey，以使用 H5 私密创建 + 权限修改 + 公开校验链路",
+                "请只附带一个视频，并确保已绑定 Qzone Web Cookie/p_skey，以使用 H5 公开创建 + 权限修复 + 公开校验链路",
                 detail={
                     "media_count": len(normalized_media),
                     "media": _media_rejection_summary(normalized_media),
