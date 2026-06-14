@@ -597,6 +597,19 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "news_max_post_length",
                 "news_trust_env",
                 "native_video_publish",
+                "life_publish_enabled",
+                "life_publish_use_life_context",
+                "life_publish_use_llm_image_prompt",
+                "life_publish_use_omnidraw_selfie",
+                "life_publish_auto_caption",
+                "life_publish_mode",
+                "life_publish_failure_policy",
+                "life_publish_aspect_ratio",
+                "life_publish_size",
+                "life_publish_extra_params",
+                "life_publish_static_caption",
+                "life_publish_image_prompt_template",
+                "life_publish_caption_prompt",
             )
         },
     }
@@ -974,6 +987,13 @@ class QzoneStablePlugin(Star):
         self._context = context
         raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
         self.settings = PluginSettings.from_mapping(raw_config)
+        logger.info(
+            "qzone settings loaded publish_cron=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+            self.settings.publish_cron,
+            getattr(self.settings, "life_publish_enabled", False),
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+        )
         self.root = Path(__file__).resolve().parent
         self.plugin_name = _read_plugin_name(self.root)
         self.data_dir = _standard_data_dir(self.root)
@@ -4274,13 +4294,19 @@ class QzoneStablePlugin(Star):
                 await self._send_admin_outgoing(bot, outgoing)
         return draft
 
-    async def _publish_or_draft_scheduled_post(self, post: PostPayload) -> dict[str, Any]:
+    async def _publish_or_draft_scheduled_post(
+        self,
+        post: PostPayload,
+        *,
+        event: AstrMessageEvent | None = None,
+        force_publish: bool = False,
+    ) -> dict[str, Any]:
         mode = str(getattr(self.settings, "life_publish_mode", "publish") or "publish").lower()
-        if mode == "draft":
+        if mode == "draft" and not force_publish:
             draft = await self._create_scheduled_draft(post, message="定时生活说说已生成草稿")
             logger.info("qzone scheduled life publish created draft id=%s text_length=%s", draft.id, len(post.content))
             return {"draft_id": draft.id, "mode": "draft", "message": "created draft"}
-        await self._ensure_cookie_ready()
+        await self._ensure_cookie_ready(event)
         await self._ensure_daemon()
         payload = await self.controller.publish_post(
             content=post.content,
@@ -4296,8 +4322,23 @@ class QzoneStablePlugin(Star):
         await self._notify_admin_publish_result(post, payload, "定时生活说说自动发布完成")
         return payload
 
-    async def _auto_life_publish_once(self) -> None:
-        logger.info("qzone scheduled life publish started")
+    async def _auto_life_publish_once(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_publish: bool = False,
+    ) -> dict[str, Any] | None:
+        logger.info(
+            "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s",
+            bool(event),
+            force_publish,
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+            getattr(self.settings, "life_publish_use_life_context", True),
+            getattr(self.settings, "life_publish_use_llm_image_prompt", True),
+            getattr(self.settings, "life_publish_use_omnidraw_selfie", True),
+            getattr(self.settings, "life_publish_auto_caption", True),
+        )
         life_data: dict[str, Any] = {}
         try:
             life_data, life_context = await self._get_life_context()
@@ -4313,22 +4354,22 @@ class QzoneStablePlugin(Star):
         omnidraw_result: dict[str, Any] = {"success": False, "images": []}
         image_flow_failed = False
         try:
-            image_prompt = await self._generate_life_image_prompt(None, life_context)
+            image_prompt = await self._generate_life_image_prompt(event, life_context)
             if not image_prompt.strip():
                 raise RuntimeError("LLM 未生成自拍提示词")
-            media, omnidraw_result = await self._generate_life_selfie_media(None, image_prompt)
+            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
             if not media:
                 raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
         except Exception as exc:
             image_flow_failed = True
-            logger.warning("qzone scheduled life publish image flow failed: %s", exc)
+            logger.warning("qzone scheduled life publish image flow failed: %s", exc, exc_info=True)
             if self.settings.life_publish_failure_policy != "text_only":
                 return
 
         try:
-            caption = await self._generate_life_caption(None, life_context=life_context, image_prompt=image_prompt)
+            caption = await self._generate_life_caption(event, life_context=life_context, image_prompt=image_prompt)
         except Exception as exc:
-            logger.warning("qzone scheduled life publish caption failed: %s", exc)
+            logger.warning("qzone scheduled life publish caption failed: %s", exc, exc_info=True)
             if self.settings.life_publish_failure_policy != "text_only":
                 return
             caption = str(getattr(self.settings, "life_publish_static_caption", "") or "")
@@ -4338,10 +4379,10 @@ class QzoneStablePlugin(Star):
         if not content:
             content = "今日份生活碎片。"
         post = PostPayload(content=content, media=media)
-        payload = await self._publish_or_draft_scheduled_post(post)
+        payload = await self._publish_or_draft_scheduled_post(post, event=event, force_publish=force_publish)
         logger.info(
             "qzone scheduled life publish finished mode=%s media_count=%s life_keys=%s omnidraw_success=%s",
-            getattr(self.settings, "life_publish_mode", "publish"),
+            "publish" if force_publish else getattr(self.settings, "life_publish_mode", "publish"),
             len(media),
             ",".join(sorted(life_data.keys())) if isinstance(life_data, dict) else "",
             bool(omnidraw_result.get("success")),
@@ -4380,6 +4421,14 @@ class QzoneStablePlugin(Star):
     def _start_scheduled_tasks(self) -> None:
         self._scheduled_tasks = [task for task in self._scheduled_tasks if not task.done()]
         if self.settings.publish_cron:
+            logger.info(
+                "qzone scheduled publish configured cron=%s offset=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+                self.settings.publish_cron,
+                self.settings.publish_offset,
+                getattr(self.settings, "life_publish_enabled", False),
+                getattr(self.settings, "life_publish_mode", "publish"),
+                getattr(self.settings, "life_publish_failure_policy", "skip"),
+            )
             self._create_scheduled_task(
                 "publish",
                 self.settings.publish_cron,
@@ -4419,8 +4468,10 @@ class QzoneStablePlugin(Star):
                 logger.warning("qzone scheduled %s failed: %s", name, exc)
 
     async def _auto_publish_once(self) -> None:
-        logger.info("qzone scheduled publish started")
-        if getattr(self.settings, "life_publish_enabled", False):
+        life_enabled = getattr(self.settings, "life_publish_enabled", False)
+        logger.info("qzone scheduled publish started life_publish_enabled=%s", life_enabled)
+        if life_enabled:
+            logger.info("qzone scheduled publish routed to life flow")
             await self._auto_life_publish_once()
             return
         fake_event = None
@@ -5384,6 +5435,28 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, self._error_text(exc))
             return
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发日常说说全自动完整发布")
+    async def publish_life_feed_auto(self, event: AstrMessageEvent):
+        """立即执行“日程上下文 -> LLM 自拍提示词 -> OmniDraw 自拍 -> QQ 空间发布”的完整链路。"""
+        self._stop_event(event)
+        try:
+            payload = await self._auto_life_publish_once(event, force_publish=True)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        except Exception as exc:
+            logger.warning("qzone manual life publish failed: %s", exc, exc_info=True)
+            yield self._command_result(event, f"日常说说全自动完整发布失败：{exc}")
+            return
+        if not payload:
+            yield self._command_result(
+                event,
+                "日常说说全自动完整发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
+            )
+            return
+        yield self._command_result(event, format_action_result("日常说说发布结果", payload))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("写说说", alias={"写稿"})

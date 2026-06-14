@@ -256,7 +256,11 @@ def test_main_import_recovers_from_stale_llm_without_news_generator(monkeypatch:
         sys.modules.pop("main", None)
 
 
-def test_main_import_recovers_from_stale_settings_without_news_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("missing_field", ["news_cron", "life_publish_enabled"])
+def test_main_import_recovers_from_stale_settings_without_required_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+) -> None:
     saved_modules = {
         name: module
         for name, module in sys.modules.items()
@@ -264,8 +268,38 @@ def test_main_import_recovers_from_stale_settings_without_news_fields(monkeypatc
     }
     import qzone_bridge.settings as settings_module
 
+    fields = {
+        "news_cron",
+        "news_offset",
+        "news_provider_id",
+        "news_prompt",
+        "news_scopes",
+        "news_keywords",
+        "news_custom_rss_urls",
+        "news_max_candidates",
+        "news_recency_hours",
+        "news_once_per_day",
+        "news_max_post_length",
+        "news_trust_env",
+        "native_video_publish",
+        "life_publish_enabled",
+        "life_publish_use_life_context",
+        "life_publish_use_llm_image_prompt",
+        "life_publish_use_omnidraw_selfie",
+        "life_publish_auto_caption",
+        "life_publish_mode",
+        "life_publish_failure_policy",
+        "life_publish_aspect_ratio",
+        "life_publish_size",
+        "life_publish_extra_params",
+        "life_publish_static_caption",
+        "life_publish_image_prompt_template",
+        "life_publish_caption_prompt",
+    }
+    fields.discard(missing_field)
+
     class _OldPluginSettings:
-        __dataclass_fields__ = {"publish_cron": object(), "comment_cron": object()}
+        __dataclass_fields__ = {field: object() for field in fields}
 
         @classmethod
         def from_mapping(cls, config):
@@ -278,6 +312,7 @@ def test_main_import_recovers_from_stale_settings_without_news_fields(monkeypatc
 
         assert main.PluginSettings is not _OldPluginSettings
         assert "news_cron" in getattr(main.PluginSettings, "__dataclass_fields__", {})
+        assert "life_publish_enabled" in getattr(main.PluginSettings, "__dataclass_fields__", {})
     finally:
         for name in list(sys.modules):
             if name == "qzone_bridge" or name.startswith("qzone_bridge."):
@@ -7238,6 +7273,149 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
     assert publish["media"][0]["source"] == str(tmp_path / "selfie.png")
     assert publish["media"][0]["kind"] == "image"
     assert captured["notify"][0].media[0].source == str(tmp_path / "selfie.png")
+
+
+def test_auto_life_publish_accepts_manual_event_and_force_publishes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"publish": None, "selfie_calls": []}
+
+    class _Event:
+        unified_msg_origin = "aiocqhttp:group:654"
+        message_str = "发日常说说全自动完整发布"
+
+        def get_sender_id(self):
+            return 987654
+
+        def get_group_id(self):
+            return 654
+
+        def get_message_type(self):
+            return "group"
+
+        def get_session_id(self):
+            return self.unified_msg_origin
+
+    class _LifePlugin:
+        async def get_life_context(self):
+            return {"outfit": "浅色卫衣", "schedule": "傍晚散步"}
+
+    class _OmniDrawPlugin:
+        async def tool_generate_selfie(self, event, action: str, **kwargs):
+            captured["selfie_calls"].append((event, action, kwargs))
+            return {"success": True, "images": [{"file_path": str(tmp_path / "manual-selfie.png")}]}
+
+    class _Metadata:
+        def __init__(self, star_cls):
+            self.star_cls = star_cls
+
+    class _Context:
+        def __init__(self):
+            self.life = _LifePlugin()
+            self.omnidraw = _OmniDrawPlugin()
+
+        def get_registered_star(self, name):
+            if name == "astrbot_plugin_life_scheduler":
+                return _Metadata(self.life)
+            if name == "astrbot_plugin_omnidraw":
+                return _Metadata(self.omnidraw)
+            return None
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish"] = kwargs
+            return {"fid": "fid-life-manual"}
+
+    async def fake_ready(*args, **kwargs):
+        captured["ready_args"] = args
+        return None
+
+    async def fake_daemon(*args, **kwargs):
+        return None
+
+    async def fake_generate_prompt(event, life_context):
+        captured["prompt_event"] = event
+        captured["life_context"] = life_context
+        return "傍晚散步时的自然手机自拍"
+
+    async def fake_caption(event, *, life_context, image_prompt):
+        captured["caption_event"] = event
+        return "晚风刚刚好。"
+
+    async def fake_notify(post, payload, message):
+        captured["notify"] = (post, payload, message)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping(
+        {
+            "life_publish": {
+                "enabled": True,
+                "mode": "draft",
+            }
+        }
+    )
+    plugin.data_dir = tmp_path
+    plugin._context = _Context()
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_daemon
+    plugin._generate_life_image_prompt = fake_generate_prompt
+    plugin._generate_life_caption = fake_caption
+    plugin._notify_admin_publish_result = fake_notify
+
+    event = _Event()
+    payload = asyncio.run(plugin._auto_life_publish_once(event, force_publish=True))
+
+    assert payload["fid"] == "fid-life-manual"
+    assert captured["prompt_event"] is event
+    assert captured["caption_event"] is event
+    selfie_event, action, kwargs = captured["selfie_calls"][0]
+    assert selfie_event is event
+    assert action == "傍晚散步时的自然手机自拍"
+    assert kwargs["return_result"] is True
+    assert captured["ready_args"][0] is event
+    publish = captured["publish"]
+    assert publish["content"] == "晚风刚刚好。"
+    assert publish["media"][0]["source"] == str(tmp_path / "manual-selfie.png")
+
+
+def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _Event:
+        stopped = False
+
+        def stop_event(self):
+            self.stopped = True
+
+        def plain_result(self, text: str):
+            return {"type": "plain", "text": text}
+
+    async def fake_auto_life(event, *, force_publish=False):
+        captured["event"] = event
+        captured["force_publish"] = force_publish
+        return {"fid": "fid-command"}
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin._auto_life_publish_once = fake_auto_life
+
+    event = _Event()
+
+    async def collect_results():
+        return [item async for item in plugin.publish_life_feed_auto(event)]
+
+    results = asyncio.run(collect_results())
+
+    assert captured["event"] is event
+    assert captured["force_publish"] is True
+    assert event.stopped is True
+    assert results[0]["type"] == "plain"
+    assert "fid-command" in results[0]["text"]
+
 
 def test_life_selfie_media_prefers_generate_selfie_return_result_method(
     monkeypatch: pytest.MonkeyPatch,
