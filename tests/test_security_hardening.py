@@ -7284,7 +7284,7 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
 
     class _Event:
         unified_msg_origin = "aiocqhttp:group:654"
-        message_str = "发日常说说全自动完整发布"
+        message_str = "发日常说说"
 
         def get_sender_id(self):
             return 987654
@@ -7380,6 +7380,7 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     publish = captured["publish"]
     assert publish["content"] == "晚风刚刚好。"
     assert publish["media"][0]["source"] == str(tmp_path / "manual-selfie.png")
+    assert captured["notify"][2] == "日常说说发布完成"
 
 
 def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7395,9 +7396,10 @@ def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pyte
         def plain_result(self, text: str):
             return {"type": "plain", "text": text}
 
-    async def fake_auto_life(event, *, force_publish=False):
+    async def fake_auto_life(event, *, force_publish=False, notify_admin=True):
         captured["event"] = event
         captured["force_publish"] = force_publish
+        captured["notify_admin"] = notify_admin
         return {"fid": "fid-command"}
 
     plugin = object.__new__(main.QzoneStablePlugin)
@@ -7412,9 +7414,48 @@ def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pyte
 
     assert captured["event"] is event
     assert captured["force_publish"] is True
+    assert captured["notify_admin"] is False
     assert event.stopped is True
     assert results[0]["type"] == "plain"
-    assert "fid-command" in results[0]["text"]
+    assert results[0]["text"] == "日常说说发布完成"
+    assert "fid-command" not in results[0]["text"]
+
+
+def test_manual_life_publish_command_name_is_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    source = inspect.getsource(main.QzoneStablePlugin.publish_life_feed_auto)
+
+    assert '@filter.command("发日常说说")' in source
+    assert "发日常说说全自动完整发布" not in source
+
+
+def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _LLM:
+        async def generate_text(self, event, prompt, **kwargs):
+            captured["event"] = event
+            captured["prompt"] = prompt
+            return ""
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping(
+        {
+            "life_publish": {
+                "image_prompt_template": "根据日程生成自拍：\n{life_context}",
+            }
+        }
+    )
+    plugin._llm_adapter = lambda: _LLM()
+
+    prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今日穿搭：浅色卫衣\n今日日程：傍晚散步"))
+
+    assert "真实手机自拍" in prompt
+    assert "浅色卫衣" in prompt
+    assert "傍晚散步" in prompt
+    assert captured["prompt"].startswith("根据日程生成自拍")
 
 
 def test_life_selfie_media_prefers_generate_selfie_return_result_method(

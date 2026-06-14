@@ -4101,11 +4101,19 @@ class QzoneStablePlugin(Star):
         )
         return cleaned.strip()
 
+    @staticmethod
+    def _fallback_life_image_prompt(life_context: str) -> str:
+        context = QzoneStablePlugin._clean_life_publish_text(life_context) or "今日份日常生活"
+        return f"真实手机自拍，{context}，自然光线，生活感场景，构图自然，画面清晰。"
+
     async def _generate_life_image_prompt(self, event: AstrMessageEvent | None, life_context: str) -> str:
         template = str(getattr(self.settings, "life_publish_image_prompt_template", "") or "").strip()
-        prompt = self._format_life_prompt_template(template, life_context=life_context)
+        prompt = self._format_life_prompt_template(template, life_context=life_context).strip()
+        fallback_prompt = self._fallback_life_image_prompt(life_context)
+        if not prompt:
+            prompt = fallback_prompt
         if not getattr(self.settings, "life_publish_use_llm_image_prompt", True):
-            return self._clean_life_publish_text(prompt, fallback=life_context) or life_context
+            return self._clean_life_publish_text(prompt, fallback=fallback_prompt) or fallback_prompt
         system_prompt = (
             "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手。"
             "只输出最终提示词，不要输出 JSON、解释、标题或编号。"
@@ -4118,7 +4126,12 @@ class QzoneStablePlugin(Star):
             system_prompt=system_prompt,
             prefer_current_provider=True,
         )
-        return self._clean_life_publish_text(text, fallback=prompt)
+        cleaned = self._clean_life_publish_text(text)
+        if cleaned:
+            return cleaned
+        fallback = self._clean_life_publish_text(fallback_prompt, fallback=fallback_prompt) or fallback_prompt
+        logger.warning("qzone life publish image prompt LLM returned empty; using fallback prompt")
+        return fallback
 
     async def _generate_life_caption(
         self,
@@ -4300,6 +4313,7 @@ class QzoneStablePlugin(Star):
         *,
         event: AstrMessageEvent | None = None,
         force_publish: bool = False,
+        notify_admin: bool = True,
     ) -> dict[str, Any]:
         mode = str(getattr(self.settings, "life_publish_mode", "publish") or "publish").lower()
         if mode == "draft" and not force_publish:
@@ -4319,7 +4333,8 @@ class QzoneStablePlugin(Star):
             len(post.content),
             len(post.media),
         )
-        await self._notify_admin_publish_result(post, payload, "定时生活说说自动发布完成")
+        if notify_admin:
+            await self._notify_admin_publish_result(post, payload, "日常说说发布完成")
         return payload
 
     async def _auto_life_publish_once(
@@ -4327,6 +4342,7 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None = None,
         *,
         force_publish: bool = False,
+        notify_admin: bool = True,
     ) -> dict[str, Any] | None:
         logger.info(
             "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s",
@@ -4379,7 +4395,12 @@ class QzoneStablePlugin(Star):
         if not content:
             content = "今日份生活碎片。"
         post = PostPayload(content=content, media=media)
-        payload = await self._publish_or_draft_scheduled_post(post, event=event, force_publish=force_publish)
+        payload = await self._publish_or_draft_scheduled_post(
+            post,
+            event=event,
+            force_publish=force_publish,
+            notify_admin=notify_admin,
+        )
         logger.info(
             "qzone scheduled life publish finished mode=%s media_count=%s life_keys=%s omnidraw_success=%s",
             "publish" if force_publish else getattr(self.settings, "life_publish_mode", "publish"),
@@ -5437,26 +5458,26 @@ class QzoneStablePlugin(Star):
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("发日常说说全自动完整发布")
+    @filter.command("发日常说说")
     async def publish_life_feed_auto(self, event: AstrMessageEvent):
         """立即执行“日程上下文 -> LLM 自拍提示词 -> OmniDraw 自拍 -> QQ 空间发布”的完整链路。"""
         self._stop_event(event)
         try:
-            payload = await self._auto_life_publish_once(event, force_publish=True)
+            payload = await self._auto_life_publish_once(event, force_publish=True, notify_admin=False)
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
         except Exception as exc:
             logger.warning("qzone manual life publish failed: %s", exc, exc_info=True)
-            yield self._command_result(event, f"日常说说全自动完整发布失败：{exc}")
+            yield self._command_result(event, f"日常说说发布失败：{exc}")
             return
         if not payload:
             yield self._command_result(
                 event,
-                "日常说说全自动完整发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
+                "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
             )
             return
-        yield self._command_result(event, format_action_result("日常说说发布结果", payload))
+        yield self._command_result(event, "日常说说发布完成")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("写说说", alias={"写稿"})
