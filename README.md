@@ -184,3 +184,29 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - 图片/视频发布失败：确认图片或引用的视频可被 AstrBot 正常读取；视频会优先使用 OneBot 返回的 `url/download_url/file_url/path/file_id`，再尝试 `get_file`、群/私聊文件直链和 base64 兜底；封面提取依赖系统 `ffmpeg` 或 `imageio-ffmpeg`。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。
 - 点赞成功但提示校验不确定：通常是 QQ 空间读回延迟，可稍后再查看目标说说。
+
+
+## 定时生活说说联动（Life Scheduler + OmniDraw）
+
+开启后，`trigger.publish_cron` 触发时会先走这条链路：
+
+1. 调用 `astrbot_plugin_life_scheduler.get_life_context()` 获取今日日程
+2. 把日程交给 LLM 生成适合 OmniDraw 自拍模式的提示词
+3. 调用 OmniDraw 的 `generate_selfie(return_result=true)` 获取返回式图片
+4. 自动配文并发说说，或按配置写入草稿
+
+推荐配置：
+
+- `life_publish.enabled=true`
+- `life_publish.use_life_context=true`
+- `life_publish.use_llm_image_prompt=true`
+- `life_publish.use_omnidraw_selfie=true`
+- `life_publish.auto_caption=true`
+- `life_publish.mode=publish` 或 `draft`
+- `life_publish.failure_policy=skip` 或 `text_only`
+
+说明：
+
+- 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
+- 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
+- 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。

@@ -234,6 +234,90 @@
       }
     }
   },
+  "life_publish": {
+    "description": "Life Scheduler + OmniDraw 定时生活说说",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用生活日程自拍说说",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，trigger.publish_cron 触发时会读取 Life Scheduler 日程、让 LLM 写自拍提示词、调用 OmniDraw generate_selfie(return_result=true) 取图，再发说说或存草稿。关闭时沿用原纯文本定时发说说。"
+      },
+      "use_life_context": {
+        "description": "读取 Life Scheduler 日程",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后调用 astrbot_plugin_life_scheduler 的 get_life_context()。关闭时用空日程上下文生成。"
+      },
+      "use_llm_image_prompt": {
+        "description": "由 LLM 生成自拍提示词",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后把日程上下文交给 LLM 写 OmniDraw 自拍 action；关闭时直接使用 image_prompt_template 渲染后的文本。"
+      },
+      "use_omnidraw_selfie": {
+        "description": "调用 OmniDraw 自拍生图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只调用 OmniDraw generate_selfie/tool_generate_selfie 并传 return_result=true 获取图片；关闭时不生图，可配合 failure_policy=text_only 发文字。"
+      },
+      "auto_caption": {
+        "description": "由 LLM 自动配文",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后根据日程和自拍提示词生成 QQ 空间说说文案；关闭时使用 static_caption。"
+      },
+      "mode": {
+        "description": "发布模式",
+        "type": "string",
+        "default": "publish",
+        "hint": "publish=直接发说说；draft=只生成待审核草稿。"
+      },
+      "failure_policy": {
+        "description": "失败策略",
+        "type": "string",
+        "default": "skip",
+        "hint": "skip=日程/提示词/生图失败则跳过；text_only=生图失败时允许只发文字/存文字草稿。"
+      },
+      "aspect_ratio": {
+        "description": "OmniDraw 自拍宽高比",
+        "type": "string",
+        "default": "1:1",
+        "hint": "传给 generate_selfie(return_result=true) 的 aspect_ratio，例如 1:1、3:4、9:16。"
+      },
+      "size": {
+        "description": "OmniDraw 自拍尺寸",
+        "type": "string",
+        "default": "",
+        "hint": "可选，传给 generate_selfie 的 size，例如 1024x1024；留空使用 OmniDraw 默认。"
+      },
+      "extra_params": {
+        "description": "OmniDraw 额外参数",
+        "type": "text",
+        "default": "",
+        "hint": "透传给 generate_selfie 的 extra_params，例如 --model xxx。"
+      },
+      "static_caption": {
+        "description": "固定配文",
+        "type": "text",
+        "default": "今日份生活碎片。",
+        "hint": "auto_caption=false 或 LLM 配文为空时使用。"
+      },
+      "image_prompt_template": {
+        "description": "自拍提示词模板",
+        "type": "text",
+        "default": "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\\n\\n{life_context}",
+        "hint": "支持 {life_context} 占位符。"
+      },
+      "caption_prompt": {
+        "description": "配文提示词模板",
+        "type": "text",
+        "default": "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
+        "hint": "支持 {life_context} 和 {image_prompt} 占位符。"
+      }
+    }
+  },
   "news": {
     "description": "谷歌新闻 RSS 新闻说说配置",
     "type": "object",

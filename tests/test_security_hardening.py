@@ -7136,6 +7136,290 @@ def test_generate_original_news_post_text_retries_copy_like_output(
     assert responses == []
 
 
+def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"publish": None, "selfie_calls": []}
+
+    class _LifePlugin:
+        async def get_life_context(self):
+            return {
+                "outfit": "白色毛衣和牛仔裙",
+                "schedule": "上午整理房间，下午去咖啡厅看书",
+                "meta": {"style": "清新日常"},
+            }
+
+    class _OmniDrawPlugin:
+        async def tool_generate_selfie(self, event, action: str, **kwargs):
+            captured["selfie_calls"].append((event, action, kwargs))
+            return {
+                "success": True,
+                "message": "ok",
+                "images": [
+                    {
+                        "file_path": str(tmp_path / "selfie.png"),
+                        "url": "https://example.invalid/fallback.png",
+                    }
+                ],
+            }
+
+    class _Metadata:
+        def __init__(self, star_cls):
+            self.star_cls = star_cls
+
+    class _Context:
+        def __init__(self):
+            self.life = _LifePlugin()
+            self.omnidraw = _OmniDrawPlugin()
+
+        def get_registered_star(self, name):
+            if name == "astrbot_plugin_life_scheduler":
+                return _Metadata(self.life)
+            if name == "astrbot_plugin_omnidraw":
+                return _Metadata(self.omnidraw)
+            return None
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["publish"] = kwargs
+            return {"fid": "fid-life", "photo_count": len(kwargs.get("media") or [])}
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_generate_prompt(event, life_context):
+        captured["life_context"] = life_context
+        return "坐在咖啡厅窗边看书，白色毛衣和牛仔裙，手机自拍"
+
+    async def fake_caption(event, *, life_context, image_prompt):
+        captured["caption_args"] = (life_context, image_prompt)
+        return "下午在咖啡香里偷一点安静。"
+
+    async def fake_notify(post, payload, message):
+        captured["notify"] = (post, payload, message)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping(
+        {
+            "admin_uins": "123456",
+            "life_publish": {
+                "enabled": True,
+                "aspect_ratio": "3:4",
+                "size": "1024x1365",
+                "extra_params": "--style selfie",
+            },
+        }
+    )
+    plugin.data_dir = tmp_path
+    plugin._context = _Context()
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._generate_life_image_prompt = fake_generate_prompt
+    plugin._generate_life_caption = fake_caption
+    plugin._notify_admin_publish_result = fake_notify
+
+    asyncio.run(plugin._auto_publish_once())
+
+    selfie_event, action, kwargs = captured["selfie_calls"][0]
+    assert action == "坐在咖啡厅窗边看书，白色毛衣和牛仔裙，手机自拍"
+    assert kwargs["return_result"] is True
+    assert kwargs["aspect_ratio"] == "3:4"
+    assert kwargs["size"] == "1024x1365"
+    assert kwargs["extra_params"] == "--style selfie"
+    assert kwargs["refs"] == ""
+    assert selfie_event.get_sender_id() == 123456
+    publish = captured["publish"]
+    assert publish["content"] == "下午在咖啡香里偷一点安静。"
+    assert publish["content_sanitized"] is True
+    assert publish["media"][0]["source"] == str(tmp_path / "selfie.png")
+    assert publish["media"][0]["kind"] == "image"
+    assert captured["notify"][0].media[0].source == str(tmp_path / "selfie.png")
+
+def test_life_selfie_media_prefers_generate_selfie_return_result_method(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {}
+
+    class _OmniDrawPlugin:
+        async def generate_selfie(self, *, action: str, return_result: bool = False, **kwargs):
+            captured["generate_selfie"] = {"action": action, "return_result": return_result, **kwargs}
+            return {
+                "success": True,
+                "images": [
+                    {
+                        "url": "https://example.invalid/selfie.png",
+                        "file_path": str(tmp_path / "preferred.png"),
+                    }
+                ],
+            }
+
+        async def tool_generate_selfie(self, *args, **kwargs):
+            captured["tool_generate_selfie"] = True
+            return {"success": False, "images": []}
+
+    class _Metadata:
+        def __init__(self, star_cls):
+            self.star_cls = star_cls
+
+    class _Context:
+        def get_registered_star(self, name):
+            if name == "astrbot_plugin_omnidraw":
+                return _Metadata(_OmniDrawPlugin())
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping(
+        {
+            "admin_uins": "123456",
+            "life_publish": {
+                "aspect_ratio": "9:16",
+                "size": "1024x1792",
+                "extra_params": "--quality high",
+            },
+        }
+    )
+    plugin._context = _Context()
+
+    media, result = asyncio.run(plugin._generate_life_selfie_media(None, "雨天窗边自拍"))
+
+    assert result["success"] is True
+    assert captured["generate_selfie"]["action"] == "雨天窗边自拍"
+    assert captured["generate_selfie"]["return_result"] is True
+    assert captured["generate_selfie"]["aspect_ratio"] == "9:16"
+    assert captured["generate_selfie"]["size"] == "1024x1792"
+    assert captured["generate_selfie"]["extra_params"] == "--quality high"
+    assert "tool_generate_selfie" not in captured
+    assert media[0].source == str(tmp_path / "preferred.png")
+
+def test_auto_life_publish_skip_policy_does_not_publish_when_omnidraw_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"published": False}
+
+    class _LifePlugin:
+        async def get_life_context(self):
+            return {"outfit": "休闲装", "schedule": "在家看书"}
+
+    class _Metadata:
+        def __init__(self, star_cls):
+            self.star_cls = star_cls
+
+    class _Context:
+        def get_registered_star(self, name):
+            if name == "astrbot_plugin_life_scheduler":
+                return _Metadata(_LifePlugin())
+            return None
+
+    class _Controller:
+        async def publish_post(self, **kwargs):
+            captured["published"] = True
+            return {"fid": "should-not-publish"}
+
+    async def fake_ready(*args, **kwargs):
+        return None
+
+    async def fake_generate_prompt(event, life_context):
+        return "在家看书的自拍"
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"enabled": True}})
+    plugin.data_dir = tmp_path
+    plugin._context = _Context()
+    plugin.controller = _Controller()
+    plugin._onebot_client = None
+    plugin._ensure_cookie_ready = fake_ready
+    plugin._ensure_daemon = fake_ready
+    plugin._generate_life_image_prompt = fake_generate_prompt
+
+    asyncio.run(plugin._auto_publish_once())
+
+    assert captured["published"] is False
+
+def test_auto_life_publish_text_only_policy_creates_draft_without_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping(
+        {
+            "life_publish": {
+                "enabled": True,
+                "mode": "draft",
+                "failure_policy": "text_only",
+                "auto_caption": False,
+                "static_caption": "今天只写文字。",
+            }
+        }
+    )
+    plugin.data_dir = tmp_path
+    plugin.drafts = main.DraftStore(tmp_path / "drafts.json")
+    plugin._context = types.SimpleNamespace(get_registered_star=lambda name: None)
+    plugin._onebot_client = None
+    plugin._capture_onebot_client = lambda event=None: None
+    plugin._render_markdown_image = lambda *args, **kwargs: None
+
+    async def fake_prompt(event, life_context):
+        return "无法生图但有提示词"
+
+    plugin._generate_life_image_prompt = fake_prompt
+
+    asyncio.run(plugin._auto_publish_once())
+
+    draft = asyncio.run(plugin.drafts.latest_pending_async())
+    assert draft is not None
+    assert draft.content == "今天只写文字。"
+    assert draft.media == []
+
+def test_life_publish_settings_are_loaded_from_config() -> None:
+    settings = PluginSettings.from_mapping(
+        {
+            "life_publish": {
+                "enabled": True,
+                "mode": "draft",
+                "failure_policy": "text_only",
+                "aspect_ratio": "9:16",
+                "size": "1024x1792",
+                "extra_params": "--seed 1",
+                "static_caption": "今天也有好好生活。",
+                "use_life_context": False,
+                "use_llm_image_prompt": False,
+                "use_omnidraw_selfie": False,
+                "auto_caption": False,
+            }
+        }
+    )
+
+    assert settings.life_publish_enabled is True
+    assert settings.life_publish_mode == "draft"
+    assert settings.life_publish_failure_policy == "text_only"
+    assert settings.life_publish_aspect_ratio == "9:16"
+    assert settings.life_publish_size == "1024x1792"
+    assert settings.life_publish_extra_params == "--seed 1"
+    assert settings.life_publish_static_caption == "今天也有好好生活。"
+    assert settings.life_publish_use_life_context is False
+    assert settings.life_publish_use_llm_image_prompt is False
+    assert settings.life_publish_use_omnidraw_selfie is False
+    assert settings.life_publish_auto_caption is False
+
+def test_life_publish_settings_reject_unknown_choices() -> None:
+    settings = PluginSettings.from_mapping(
+        {"life_publish": {"mode": "send_now", "failure_policy": "unknown"}}
+    )
+
+    assert settings.life_publish_mode == "publish"
+    assert settings.life_publish_failure_policy == "skip"
+
+
 def test_notify_admin_publish_result_sends_rendered_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
