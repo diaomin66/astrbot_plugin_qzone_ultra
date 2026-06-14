@@ -15,7 +15,7 @@
     "description": "优先使用 daemon 原生视频后台直发",
     "type": "bool",
     "default": true,
-    "hint": "Enabled: a single local video is sent through the local daemon H5 native video publisher. It requires Qzone Web Cookie/p_skey, uploads via video_qzone + pic_qzone, creates the video mood as only-self-visible first, calls the permission update CGI to set ugc_right=1/who=1, then verifies public/all-visible feed/detail before reporting success. No QQ upload A2/vLoginData, OneBot protocol-end publish action, or cover/rendered image fallback is used. Disabling this option rejects video posts instead of reporting a cover/rendered image as success."
+    "hint": "开启后，单个本地视频会交给本地 daemon 的 H5 视频发布链路：要求 QQ 空间 Web Cookie/p_skey，经 video_qzone + pic_qzone 上传并绑定公开相册，创建 appid=311 视频说说后调用权限更新接口写入 ugc_right=1/who=1，最终确认 feed/detail 全部人可见才报告成功。不再使用 QQ upload A2/vLoginData、OneBot 协议端发布 action 或封面/渲染图回退；关闭后会直接拒绝视频发布，避免把封面图误报为成功。"
   },
   "llm": {
     "description": "大模型配置",
@@ -217,7 +217,7 @@
       "read_prob": {
         "description": "消息触发读说说概率",
         "type": "float",
-        "default": 0.0,
+        "default": 0,
         "hint": "收到 OneBot 消息时，按概率查看发送者空间并自动评论；0 表示关闭。"
       },
       "send_admin": {
@@ -314,7 +314,7 @@
   "timeout": {
     "description": "QQ 空间请求超时",
     "type": "float",
-    "default": 15.0,
+    "default": 15,
     "hint": "兼容旧版超时配置；会映射到请求超时时间。"
   },
   "show_name": {
@@ -338,13 +338,13 @@
   "request_timeout": {
     "description": "请求超时时间",
     "type": "float",
-    "default": 15.0,
+    "default": 15,
     "hint": "向 QQ 空间和本地守护进程发请求的超时时间。"
   },
   "start_timeout": {
     "description": "本地守护进程启动等待时间",
     "type": "float",
-    "default": 20.0,
+    "default": 20,
     "hint": "等待本地守护进程启动成功的最长时间。"
   },
   "public_feed_limit": {

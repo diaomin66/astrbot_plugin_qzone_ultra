@@ -4720,8 +4720,9 @@ def test_autovideoauth_binds_web_cookie_without_a2_probe(
     results = asyncio.run(collect_results())
 
     assert len(results) == 1
-    assert "- h5_video_upload: diagnostic_only" in results[0]
-    assert "- h5_video_publish_supported: False" in results[0]
+    assert "- 账号：12345（已绑定，4 个 Cookie）" in results[0]
+    assert "- 视频直发：不可用（仅上传诊断可用）" in results[0]
+    assert "h5_video_publish_supported" not in results[0]
     assert captured["cookie_client"] is bot
     assert captured["bound_uin"] == 12345
     assert captured["bound_source"] == "onebot"
@@ -4788,19 +4789,20 @@ def test_autovideoauth_accepts_h5_publish_ready_without_a2_probe(
     results = asyncio.run(collect_results())
 
     assert len(results) == 1
-    assert "- video_upload: ready" in results[0]
-    assert "- h5_video_upload: ready" in results[0]
-    assert "- video_upload_method: h5_video_publish_update_visibility" in results[0]
-    assert "- h5_video_publish_supported: True" in results[0]
+    assert "- 账号：12345（已绑定，4 个 Cookie）" in results[0]
+    assert "- 视频直发：可用（公开视频校验）" in results[0]
+    assert "video_upload_method" not in results[0]
+    assert "h5_video_publish_supported" not in results[0]
 
 
-def test_status_renderer_reports_cookie_h5_path_as_missing_without_experimental_publish() -> None:
+def test_status_renderer_summarizes_cookie_h5_path_without_raw_internal_fields() -> None:
     from qzone_bridge.render import format_status
 
     rendered = format_status(
         {
             "daemon_state": "ready",
             "login_uin": 12345,
+            "cookie_count": 4,
             "needs_rebind": False,
             "video_upload": {
                 "configured": False,
@@ -4818,12 +4820,17 @@ def test_status_renderer_reports_cookie_h5_path_as_missing_without_experimental_
         }
     )
 
-    assert "- video_upload: missing" in rendered
-    assert "- qq_upload_configured: False" in rendered
-    assert "- web_cookie_configured: True" in rendered
-    assert "- video_upload_verification_required: False" in rendered
-    assert "- h5_video_publish_supported: False" in rendered
-    assert "- video_upload_method:" not in rendered
+    assert rendered.splitlines() == [
+        "QQ 空间状态",
+        "- 服务：正常",
+        "- 账号：12345（已绑定，4 个 Cookie）",
+        "- 视频直发：不可用（仅上传诊断可用）",
+    ]
+    assert "qq_upload_configured" not in rendered
+    assert "web_cookie_configured" not in rendered
+    assert "video_upload_verification_required" not in rendered
+    assert "h5_video_publish_supported" not in rendered
+    assert "video_upload_method" not in rendered
 
 
 def test_onebot_video_upload_credentials_ignore_web_cookie_tokens() -> None:

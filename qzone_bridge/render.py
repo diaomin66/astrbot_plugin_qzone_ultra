@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 from .models import FeedEntry
 from .utils import to_local_time_text, truncate
@@ -32,65 +33,112 @@ def cookie_summary(cookies: dict[str, str]) -> str:
 
 
 def format_status(status: dict) -> str:
+    """Render `/qzone status` as a compact Chinese summary.
+
+    The controller keeps many diagnostic fields for logs, tests and local APIs.
+    Chat commands should not dump those internals directly; administrators only
+    need to know whether the service, login state and video publishing path are
+    usable, plus one actionable hint when something is wrong.
+    """
+
+    needs_rebind = bool(status.get("needs_rebind"))
     lines = [
         "QQ 空间状态",
-        f"- daemon: {status.get('daemon_state', 'unknown')}",
-        f"- login: {status.get('login_uin') or '-'}",
-        f"- source: {status.get('session_source') or '-'}",
-        f"- cookie: {status.get('cookie_summary', '-')}",
-        f"- needs_rebind: {status.get('needs_rebind', False)}",
-        f"- last_ok: {status.get('last_ok_at') or '-'}",
-        f"- last_error: {status.get('last_error', '-')}",
+        f"- 服务：{_format_daemon_status(status)}",
+        f"- 账号：{_format_account_status(status, needs_rebind=needs_rebind)}",
+        f"- 视频直发：{_format_video_status(status, needs_rebind=needs_rebind)}",
     ]
-    video_upload = status.get("video_upload")
-    if isinstance(video_upload, dict):
-        source = video_upload.get("source") or "-"
-        updated_at = video_upload.get("updated_at") or "-"
-        method = video_upload.get("method") or "-"
-        qq_upload_ready = bool(video_upload.get("qq_upload_configured"))
-        web_cookie_ready = bool(video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
-        h5_diagnostic_ready = bool(video_upload.get("h5_upload_diagnostic_available") or web_cookie_ready)
-        h5_publish_ready = bool(video_upload.get("h5_publish_supported") and web_cookie_ready)
-        ready = bool(h5_publish_ready)
-        verification_required = bool(video_upload.get("verification_required"))
-        if ready:
-            upload_state = "ready"
-        else:
-            upload_state = "missing"
-        lines.append(f"- video_upload: {upload_state}")
-        lines.append(f"- qq_upload_configured: {qq_upload_ready}")
-        lines.append(f"- web_cookie_configured: {web_cookie_ready}")
-        lines.append(f"- video_upload_verification_required: {verification_required}")
-        if h5_publish_ready:
-            lines.append("- h5_video_upload: ready")
-        elif h5_diagnostic_ready:
-            lines.append("- h5_video_upload: diagnostic_only")
-        if ready and source != "-":
-            lines.append(f"- video_upload_source: {source}")
-        if ready:
-            lines.append(f"- video_upload_method: {method}")
-            lines.append(f"- video_upload_updated: {updated_at}")
-            if video_upload.get("stability"):
-                lines.append(f"- video_upload_stability: {video_upload.get('stability')}")
-        if "h5_publish_supported" in video_upload:
-            lines.append(f"- h5_video_publish_supported: {bool(video_upload.get('h5_publish_supported'))}")
-    if status.get("daemon_port"):
-        lines.append(f"- endpoint: 127.0.0.1:{status['daemon_port']}")
-    if status.get("daemon_pid"):
-        lines.append(f"- pid: {status['daemon_pid']}")
-    start_error = status.get("daemon_start_error")
-    if isinstance(start_error, dict):
-        message = start_error.get("message") or "daemon 启动失败"
-        lines.append(f"- daemon_error: {message}")
-        detail = start_error.get("detail")
-        if isinstance(detail, dict):
-            if detail.get("returncode") is not None:
-                lines.append(f"- daemon_returncode: {detail['returncode']}")
-            if detail.get("log_path"):
-                lines.append(f"- daemon_log: {detail['log_path']}")
-            if detail.get("log_tail"):
-                lines.append(f"- daemon_log_tail: {truncate(str(detail['log_tail']), 300)}")
+    hint = _status_hint(status, needs_rebind=needs_rebind)
+    if hint:
+        lines.append(f"- 提示：{hint}")
     return "\n".join(lines)
+
+
+def _format_daemon_status(status: dict[str, Any]) -> str:
+    state = str(status.get("daemon_state") or "unknown").strip().lower()
+    port = _to_int(status.get("daemon_port"), 0)
+    state_text = {
+        "ready": "正常",
+        "needs_rebind": "正常",
+        "starting": "启动中",
+        "stopped": "未运行",
+        "degraded": "异常",
+        "unknown": "未知",
+    }.get(state, state or "未知")
+    if port > 0:
+        return f"{state_text}（127.0.0.1:{port}）"
+    return state_text
+
+
+def _format_account_status(status: dict[str, Any], *, needs_rebind: bool) -> str:
+    login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
+    count = _cookie_count(status)
+    if login_uin <= 0:
+        return "未绑定"
+    if needs_rebind:
+        if count > 0:
+            return f"{login_uin}（需重新绑定，{count} 个 Cookie）"
+        return f"{login_uin}（需重新绑定）"
+    if count > 0:
+        return f"{login_uin}（已绑定，{count} 个 Cookie）"
+    summary = str(status.get("cookie_summary") or "").strip()
+    if summary and summary not in {"-", "无 Cookie"}:
+        return f"{login_uin}（已绑定）"
+    return str(login_uin)
+
+
+def _format_video_status(status: dict[str, Any], *, needs_rebind: bool) -> str:
+    video_upload = status.get("video_upload")
+    if needs_rebind:
+        return "不可用（请先绑定登录态）"
+    if not isinstance(video_upload, dict):
+        return "不可用"
+
+    web_cookie_ready = bool(video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
+    h5_publish_ready = bool(video_upload.get("h5_publish_supported") and web_cookie_ready)
+    ready = h5_publish_ready or bool(video_upload.get("ready") and web_cookie_ready)
+    if ready:
+        return "可用（公开视频校验）"
+    if web_cookie_ready or video_upload.get("h5_upload_diagnostic_available"):
+        return "不可用（仅上传诊断可用）"
+    return "不可用"
+
+
+def _status_hint(status: dict[str, Any], *, needs_rebind: bool) -> str:
+    if needs_rebind:
+        return "发送 /qzone autobind 自动绑定，或使用 /qzone bind <cookie> 手动绑定。"
+    start_error = status.get("daemon_start_error")
+    message = ""
+    if isinstance(start_error, dict):
+        message = str(start_error.get("message") or "").strip()
+    elif start_error:
+        message = str(start_error).strip()
+    if not message:
+        last_error = status.get("last_error")
+        if isinstance(last_error, dict):
+            message = str(last_error.get("message") or last_error.get("error") or "").strip()
+        elif last_error:
+            message = str(last_error).strip()
+    return truncate(message, 120) if message else ""
+
+
+def _cookie_count(status: dict[str, Any]) -> int:
+    count = _to_int(status.get("cookie_count"), -1)
+    if count >= 0:
+        return count
+    summary = str(status.get("cookie_summary") or "")
+    for part in summary.split():
+        value = _to_int(part, -1)
+        if value >= 0:
+            return value
+    return 0
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def format_feed_entry(entry: FeedEntry, index: int | None = None, *, include_internal: bool = True) -> str:

@@ -1,6 +1,6 @@
 # OneBot 原生 QQ 空间视频发布契约
 
-日期：2026-06-06
+日期：2026-06-14
 
 本文档定义 AstrBot 插件与 OneBot 协议端之间的稳定边界，用于后台 daemon 视频说说直发，并确保最终动态是全部人可见。它不是标准 OneBot v11 action，而是 NapCat、LLOneBot/LLBot、Shamrock 或其它协议端可以实现的扩展 action 契约。
 
@@ -26,7 +26,7 @@ publish_qzone_video_mood
 _publish_qzone_video_mood
 ```
 
-Only `publish_qzone_video_mood` is canonical. `_publish_qzone_video_mood` is accepted as a OneBot extension-name compatibility form. Other publish/upload aliases were removed from the plugin probing list to avoid duplicate publishing after a partially successful protocol-end invocation.
+`publish_qzone_video_mood` 是唯一规范 action；`_publish_qzone_video_mood` 仅作为 OneBot 扩展命名兼容形式保留。其它发布/上传别名已从插件探测列表移除，避免协议端已经局部成功后又触发第二个发布 action 造成重复发布。
 
 ## 请求参数
 

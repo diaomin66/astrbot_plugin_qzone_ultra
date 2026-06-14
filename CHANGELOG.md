@@ -1,34 +1,16 @@
 # Changelog
 
-## Unreleased
-
-- fix: keep Qzone Web Cookie/p_skey H5 video upload diagnostic-only when OneBot does not return QQ upload A2/vLoginData.
-- fix: report `video_upload: ready` only when QQ upload A2/vLoginData is configured and keep H5 publish disabled for public video posts.
-- fix: accept more OneBot protocol-end A2/vLoginData shapes, including hex/base64 alias fields, targeted NTQQ raw binary strings, and LLOneBot `llonebot_debug` PMHQ `httpSend` login-misc forwarding.
-- fix: block video posts when `native_video_publish` is disabled so video attachments can no longer be reported as successful cover/rendered-image publishes.
-- fix: support generic OneBot protocol dispatchers for video auth probing, including `send_api`/`send_action`/`request_api`/`api_call`, nested protocol client wrappers, single `{"action": "...", "params": {...}}` envelopes, and the `llbot` platform alias.
-- fix: generalize OneBot video auth probing beyond aiocqhttp/NapCat by defaulting the source to `onebot`, trying leading-underscore extension actions, and supporting `request`/`call` wrappers with `params`/`data`/`payload`.
-
 ## 未发布
-- 修复：视频封面 `pic_qzone` 上传现在和 Android 一样携带同一份 `iBusiNessType=1` / `vBusiNessData=publishmood`，避免只在 `video_qzone` 阶段带发布体导致封面 fake feed 不能触发真实视频动态。
-- 修复：解析 Tencent upload 返回的 `operation_publishmood_rsp`，记录 `tid/msg/verifyurl`；当 `ret` 非 0 时直接报出服务端发布失败，当返回 `tid` 时优先用该 fid 做详情验证，加快真实视频 feed 确认。
-- 修复：daemon 原生视频发布的 `publishmood` 业务体对齐 Android 录制视频路径，默认写入 `mediatype=1`、`mediabittype=1` 和 `extend_info["has_video"]="1"`，避免只拿到 `sVid` 但 feed 不按视频动态落库。
-- 修复：OneBot 客户端调用不再只识别 `call_action`，同时兼容 `call_api`、`call_action(action, params)`、`call_action(action=..., params=...)`，并从 AstrBot 上下文按通用 OneBot 平台别名获取客户端，NapCat/LLOneBot/LLBot 只是重点适配实现而不是唯一目标。
-- 修复：引用视频发布会按 OneBot `get_msg` 的 `message_id/id`、字符串/整数参数变体依次获取原消息，并兼容 `bot.api.call_action` 与平台 `get_client()` 暴露的客户端，避免只回复视频时 payload 为空而报“说说内容或图片/视频不能为空”。
 
-- 修复：引用视频或 Pages 上传视频落到无扩展名临时文件时仍按视频保留，避免媒体被丢弃后误报“说说内容或图片不能为空”。
-- 修复：Pages 发布入口支持视频上传、视频预览和视频-only 发布，上传按钮与提示从图片扩展为图片/视频。
-- 变更：H5 `sliceUpload/FileUploadVideo` 保留为 Cookie/`p_skey` 上传可达性诊断历史，不再作为 daemon 公共视频说说发布路径。
-- 变更：`video_upload: ready` 重新收紧为 QQ upload A2/vLoginData 已配置；仅有 Qzone Cookie/`p_skey` 时不会绕过 OneBot 未返回 A2 材料的阻断。
-- 变更：稳定公共视频路径仍要求 Tencent upload SDK A2/vLoginData，或协议端原生视频发布 action 返回 `sVid` 后由 daemon 验证 `appid=311`、同一 `sVid`、全部人可见。
-- 新增：daemon 原生视频直发补齐 Android 双腿上传链路：`video_qzone` 上传视频取得 `sVid` 后，继续用 `pic_qzone` 上传视频封面，并携带 `vid/clientkey/mobile_fakefeeds_clientkey/mix_*` 字段触发真实视频动态。
-- 新增：daemon 原生视频发布成功前会轮询最近动态并验证同一 `sVid`；只拿到上传响应但没有生成 feed 时会报错，不再宣称发布成功。
-- 修复：单个视频在缺少 QQ upload 登录材料时不再静默提取封面并按图片说说发布；daemon 会阻止视频帧替代发布并提示绑定 `/qzone videoauth` 或 `/qzone autovideoauth`。
-- 修复：Linux CI 上 `.3gp` 被 `mimetypes` 识别为 `audio/3gpp` 时仍归一化为 QQ 空间视频媒体。
-- 变更：完全移除运行时 QQ/QQNT 客户端视频发布 handoff；单个本地视频只交给 daemon 后台发布链路处理，缺少 QQ upload 登录材料时阻止发布并提示绑定。
-- 新增：`/qzone videoauth` 与 `/qzone autovideoauth` 可把 QQ upload 二进制登录材料写入 daemon 状态，发布前也会尝试从 OneBot 自动获取并绑定。
-- 修复：`/qzone autovideoauth` 改为面向通用 OneBot 协议端探测视频上传材料，新增 `get_login_misc_data key=a2/vLoginData` 等通用扩展 action，并兼容 LLOneBot `llonebot_debug -> nodeIKernelLoginService/getLoginMiscData`；NapCat/LLOneBot/LLBot/其他 OneBot 实现返回的 Cookie/CSRF 或 `clientkey/keyIndex` 仍会被拒绝当作 A2。
-- 测试：新增客户端 handoff 移除、daemon 原始视频接收、OneBot 上传材料自动绑定回归用例。
+## v0.7.0 - 2026-06-14
+
+- 新增：完成 QQ 空间 H5 原生视频直发稳定化，统一采用 Cookie/`p_skey` + `video_qzone`/`pic_qzone` + `emotion_cgi_publish_v6` + `emotion_cgi_update` 的公开修复链路。
+- 新增：daemon 会在视频发布前确保封面绑定真实公开相册，并在发布后保留/发现 `tid/fid`，再校验同一 `sVid`、`appid=311` 和全部人可见。
+- 修复：不再把视频封面图、OneBot 协议端发布 action、QQ upload A2/vLoginData 或只回显 `richval` 的响应当成视频发布成功。
+- 修复：`/qzone autovideoauth` 改为确保 QQ 空间 Cookie/`p_skey` 可用；状态中的“视频直发：可用（公开视频校验）”表示 Cookie/H5 公开创建 + 权限修复 + 公开校验链路可用。
+- 优化：`/qzone status` 改为中文摘要，只保留服务、账号、登录态、视频直发和必要提示，不再把内部诊断字段原样堆给管理员。
+- 文档：README、配置说明、OneBot 视频发布契约和 daemon 逆向记录已统一补充中文说明，明确缺少 Cookie、权限更新失败或公开视频校验失败时必须拒绝成功。
+- 测试：补充并保留 H5 视频上传、公开相册绑定、权限更新、公开校验和失败阻断相关回归用例。
 
 ## v0.6.8 - 2026-06-01
 

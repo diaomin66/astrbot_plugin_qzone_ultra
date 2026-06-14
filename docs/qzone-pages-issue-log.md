@@ -2,7 +2,7 @@
 
 这个文件记录 WebUI Pages 功能实施和验证时遇到的问题、根因、修复方式和回归用例，后续维护同类功能时先看这里。
 
-## 2026-06-04 原生视频直发逆向
+## 2026-06-14 原生视频直发逆向整理
 
 ### H5 视频实际产生动态但返回“链接无效”且非公开
 
@@ -15,20 +15,20 @@
 
 - 症状：daemon 返回 `published_native_video` 且渲染图里有视频卡片，但 QQ 空间最近动态和详情里看不到新视频。
 - 根因：H5 `FileUploadVideo` 能返回 `sVid`，但后续 `emotion_cgi_publish_v6` 的 `richtype=3/subrichtype=7/richval` 响应可能只是回显提交的 `vid/richval`，不代表生成了可见视频动态；旧 Web 官方本地视频流程实际是先通过 `qzupvideo` 或移动 `video_qzone` 上传拿到可发布视频，再作为视频附件发布。
-- Fix: daemon does not use H5 publish responses as success. With Qzone Web Cookie/`p_skey`, stable H5 public video publishing now requires upload + cover upload + `emotion_cgi_publish_v6`/feed discovery + `emotion_cgi_update` public permission change + final daemon verification; QQ upload A2/vLoginData and protocol-end native actions remain supported alternatives.
-- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待权限修改后的 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时应显示 `video_upload: ready` 且 `method=h5_video_publish_update_visibility`，不允许退回视频封面图或打开 QQ/QQNT 客户端。
+- 修复：daemon 不再把 H5 发布接口回显当作成功依据。使用 QQ 空间 Web Cookie/`p_skey` 时，稳定的 H5 公开视频发布必须完成视频上传、封面上传、`emotion_cgi_publish_v6`/feed 发现、`emotion_cgi_update` 公开权限修改和最终 daemon 校验。QQ upload A2/vLoginData 与协议端原生 action 只作为历史逆向和兼容边界记录。
+- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待权限修改后的 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时，命令侧应显示“视频直发：可用（公开视频校验）”，内部 method 仍为 `h5_video_publish_update_visibility`，不允许退回视频封面图或打开 QQ/QQNT 客户端。
 
-### OneBot protocol-end native video publish must still be verified
+### OneBot 协议端原生视频发布仍必须校验
 
-- Symptom: NapCat/LLBot can reliably provide Qzone Web Cookie/clientKey, but QQ upload A2/vLoginData may be empty or not exposed through default OneBot actions.
-- Root cause: the more stable boundary is to let the protocol end use its own NTQQ session internally, then return a publish result to the plugin. The plugin must not treat the protocol response alone as final proof.
-- Fix: the plugin now calls the canonical OneBot extension action `publish_qzone_video_mood` for a single trusted local video; `_publish_qzone_video_mood` is accepted only if the canonical action is unavailable. The request carries `who=1`, `ugc_right=1`, and public visibility fields. After the protocol end returns `sVid`, the daemon verifies `appid=311`, the same `sVid`, and positive public visibility through `/native-video/verify`.
-- Regression cases: success without `sVid`, success without a public marker, private/friend-only markers, daemon verification failure, and action timeout after invocation all fail; the plugin must not try another publish action after an unsafe invocation and must not fall back to a cover image.
+- 症状：NapCat/LLBot 可以稳定提供 QQ 空间 Web Cookie/clientKey，但 QQ upload A2/vLoginData 可能为空，或默认 OneBot action 不会暴露。
+- 根因：更稳定的边界是让协议端在内部使用自己的 NTQQ 会话完成发布，再把结果返回插件；插件不能只把协议端响应当成最终证明。
+- 修复：插件只把 `publish_qzone_video_mood` 作为规范 OneBot 扩展 action，`_publish_qzone_video_mood` 仅作为规范 action 不可用时的兼容形式。请求会携带 `who=1`、`ugc_right=1` 和公开可见字段。协议端返回 `sVid` 后，daemon 必须通过 `/native-video/verify` 验证 `appid=311`、同一 `sVid` 和正向公开视频标记。
+- 回归用例：没有 `sVid` 的成功响应、没有公开视频标记的成功响应、私密/好友可见标记、daemon 校验失败，以及 action 调用后超时都必须失败；不安全调用之后插件不能再尝试另一个发布 action，也不能回退成封面图。
 
-### 2026-06-08 native video contract hardening
+### 2026-06-08 原生视频契约加固
 
-- Fix: daemon video verification now requires positive public proof (`ugc_right=1`, `visibility=public`, `visible=all`, `right=public`, or `public=true`). A feed/detail item that merely lacks private markers is no longer accepted as public.
-- Fix update: `QzoneClient.publish_video_mood()` again sends the Web video `richval`, but it is only an intermediate creation step. `QzoneClient.update_mood_visibility_public()` then calls `emotion_cgi_update`, and final success requires explicit public feed/detail verification.
+- 修复：daemon 视频校验现在要求正向公开证明（`ugc_right=1`、`visibility=public`、`visible=all`、`right=public` 或 `public=true`）。仅仅缺少私密标记的 feed/detail 不再被接受为公开。
+- 修复补充：`QzoneClient.publish_video_mood()` 继续发送 Web 视频 `richval`，但它只是中间创建步骤。随后 `QzoneClient.update_mood_visibility_public()` 调用 `emotion_cgi_update`，最终成功必须依赖明确公开的 feed/detail 校验。
 
 ## 2026-05-27 实施阶段
 
