@@ -6086,6 +6086,7 @@ class QzoneStablePlugin(Star):
         Args:
             content (string): 说说内容。
             sync_weibo (boolean): 是否同步到微博。
+            media (list[string]): 可选的图片或视频 URL 列表。支持 HTTP/HTTPS URL、本地文件路径或 data:image/... 格式的 Data URL。
         """
         if not self._is_admin(event):
             text = await self._ask_llm_tool_reply(
