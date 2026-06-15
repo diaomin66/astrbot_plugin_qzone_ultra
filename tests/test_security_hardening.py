@@ -7683,6 +7683,63 @@ def test_life_selfie_media_retries_empty_omnidraw_result_with_return_result(
     assert len(captured["sleeps"]) == 2
 
 
+def test_life_selfie_media_zero_retry_calls_omnidraw_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    captured: dict[str, object] = {"calls": []}
+
+    class _OmniDrawPlugin:
+        async def tool_generate_selfie(
+            self,
+            event,
+            action: str,
+            count: int = 1,
+            aspect_ratio: str = "",
+            size: str = "",
+            extra_params: str = "",
+            return_result: bool = False,
+            refs: str = "",
+        ):
+            captured["calls"].append(
+                {
+                    "event": event,
+                    "action": action,
+                    "count": count,
+                    "aspect_ratio": aspect_ratio,
+                    "return_result": return_result,
+                    "refs": refs,
+                }
+            )
+            return {"success": False, "message": "temporary empty", "images": []}
+
+    class _Metadata:
+        def __init__(self, star_cls):
+            self.star_cls = star_cls
+
+    class _Context:
+        def __init__(self):
+            self.omnidraw = _OmniDrawPlugin()
+
+        def get_registered_star(self, name):
+            if name == "astrbot_plugin_omnidraw":
+                return _Metadata(self.omnidraw)
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"image_retry_count": 0, "aspect_ratio": "9:16"}})
+    plugin._context = _Context()
+
+    media, result = asyncio.run(plugin._generate_life_selfie_media(None, "雨天窗边自拍"))
+
+    assert media == []
+    assert result["message"] == "temporary empty"
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["action"] == "雨天窗边自拍"
+    assert captured["calls"][0]["aspect_ratio"] == "9:16"
+    assert captured["calls"][0]["return_result"] is True
+
+
 def test_life_selfie_media_does_not_retry_after_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

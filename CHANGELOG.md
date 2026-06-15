@@ -2,6 +2,18 @@
 
 ## 未发布
 
+## v0.8.0 - 2026-06-15
+
+- 新增：接入 Life Scheduler + OmniDraw 的日常自拍说说链路，支持定时自动从日程生成自拍提示词、调用 `generate_selfie(return_result=true)` 取回图片、自动配文并发布或入草稿。
+- 新增：管理员可使用 `发日常说说` 立即执行日程、LLM、OmniDraw 自拍和 QQ 空间发布的完整链路，成功后只反馈“日常说说发布完成”和渲染图片，不再输出 fid、媒体数量等内部字段。
+- 新增：`life_publish.image_retry_count` 支持配置 OmniDraw 自拍失败后的额外重试次数，默认 1，0 表示不重试，最大 5。
+- 修复：`life_publish.image_retry_count=0` 时，OmniDraw 自拍不会再因为兼容签名探测而重复触发生图调用；现在会先按方法签名只组织一次调用，再由重试次数决定是否重试。
+- 修复：热加载或模块缓存复用旧版 `qzone_bridge.settings` 时，定时日常自拍说说开关可能失效并退回原纯文字定时发布；现在会校验 Life Scheduler 相关设置字段并强制刷新桥接模块。
+- 修复：定时链路中 LLM 自拍提示词返回空内容时不再报警式刷日志，而是使用安全的生活自拍兜底提示词继续生成图片。
+- 优化：手动 `发日常说说` 反馈优先直接通过 OneBot 发送“完成文本 + 渲染图片”，平台不支持时再回退到 AstrBot 单条图文结果，反馈更稳定。
+- 优化：日常自拍说说的启动、跳过、成功、失败和 OmniDraw 重试日志更清晰，便于排查日程、LLM、OmniDraw 和配文链路。
+- 文档：补充 Life Scheduler + OmniDraw 联动说明、手动命令说明、重试配置说明和相关回归测试。
+
 ## v0.7.0 - 2026-06-14
 
 - 新增：完成 QQ 空间 H5 原生视频直发稳定化，统一采用 Cookie/`p_skey` + `video_qzone`/`pic_qzone` + `emotion_cgi_publish_v6` + `emotion_cgi_update` 的公开修复链路。

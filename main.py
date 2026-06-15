@@ -4317,22 +4317,33 @@ class QzoneStablePlugin(Star):
         image_prompt: str,
         kwargs: dict[str, Any],
     ) -> Any:
-        attempts = (
-            ((call_event,), kwargs),
-            ((call_event, image_prompt), {key: value for key, value in kwargs.items() if key != "action"}),
-            ((), kwargs),
-            ((image_prompt,), {key: value for key, value in kwargs.items() if key != "action"}),
-        )
-        last_type_error: TypeError | None = None
-        for args, call_kwargs in attempts:
-            try:
-                return await self._maybe_await(method(*args, **call_kwargs))
-            except TypeError as exc:
-                last_type_error = exc
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        parameters = signature.parameters if signature is not None else {}
+        accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+        accepts_var_positional = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters.values())
+        call_args: list[Any] = []
+        call_kwargs: dict[str, Any] = {}
+
+        if "event" in parameters or accepts_var_kwargs:
+            call_kwargs["event"] = call_event
+
+        if "action" in parameters or accepts_var_kwargs:
+            call_kwargs["action"] = image_prompt
+        elif "prompt" in parameters:
+            call_kwargs["prompt"] = image_prompt
+        elif accepts_var_positional:
+            call_args.append(image_prompt)
+
+        for key, value in kwargs.items():
+            if key in {"event", "action", "prompt"}:
                 continue
-        if last_type_error is not None:
-            raise last_type_error
-        raise RuntimeError("OmniDraw 自拍接口调用失败")
+            if key in parameters or accepts_var_kwargs:
+                call_kwargs[key] = value
+
+        return await self._maybe_await(method(*call_args, **call_kwargs))
 
     async def _generate_life_selfie_media(
         self,
