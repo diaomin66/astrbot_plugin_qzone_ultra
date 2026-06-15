@@ -298,6 +298,12 @@
         "default": "",
         "hint": "透传给 generate_selfie 的 extra_params，例如 --model xxx。"
       },
+      "image_retry_count": {
+        "description": "OmniDraw 生图失败重试次数",
+        "type": "int",
+        "default": 1,
+        "hint": "自动/手动日常说说调用 generate_selfie(return_result=true) 未返回图片或抛错时的额外重试次数，0=不重试，最大 5。"
+      },
       "static_caption": {
         "description": "固定配文",
         "type": "text",

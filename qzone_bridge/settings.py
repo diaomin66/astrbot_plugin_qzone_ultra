@@ -12,6 +12,7 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
 
 
 def _as_mapping(config: Any) -> dict[str, Any]:
@@ -86,6 +87,13 @@ def _choice(value: Any, default: str, allowed: set[str]) -> str:
     return text if text in allowed else default
 
 
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(slots=True)
 class PluginSettings:
     daemon_port: int = 18999
@@ -146,6 +154,7 @@ class PluginSettings:
     life_publish_aspect_ratio: str = "1:1"
     life_publish_size: str = ""
     life_publish_extra_params: str = ""
+    life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
     life_publish_static_caption: str = "今日份生活碎片。"
     life_publish_image_prompt_template: str = (
         "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。"
@@ -289,6 +298,21 @@ class PluginSettings:
             life_publish_aspect_ratio=str(_nested(mapping, "life_publish", "aspect_ratio", "1:1") or "1:1"),
             life_publish_size=str(_nested(mapping, "life_publish", "size", "") or ""),
             life_publish_extra_params=str(_nested(mapping, "life_publish", "extra_params", "") or ""),
+            life_publish_image_retry_count=max(
+                0,
+                min(
+                    5,
+                    _as_int(
+                        _nested(
+                            mapping,
+                            "life_publish",
+                            "image_retry_count",
+                            DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                        ),
+                        DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                    ),
+                ),
+            ),
             life_publish_static_caption=str(
                 _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
                 or cls.life_publish_static_caption

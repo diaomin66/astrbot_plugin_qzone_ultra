@@ -205,10 +205,12 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - `life_publish.auto_caption=true`
 - `life_publish.mode=publish` 或 `draft`
 - `life_publish.failure_policy=skip` 或 `text_only`
+- `life_publish.image_retry_count=1`（生图失败后的额外重试次数，0=不重试，最大 5）
 
 说明：
 
 - 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
 - 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
+- OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。
 - 管理员可发送 `发日常说说` 立即跑完整链路并直接发布；该指令会沿用各项日程/LLM/OmniDraw 开关，但会强制发布，不受 `life_publish.mode=draft` 影响。

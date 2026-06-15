@@ -1565,11 +1565,9 @@ class QzoneStablePlugin(Star):
         payload: dict[str, Any],
         message: str,
     ) -> list[Any]:
-        results = [self._command_result(event, message)]
-        image_result = getattr(event, "image_result", None)
         settings = getattr(self, "settings", SimpleNamespace())
-        if not getattr(settings, "render_publish_result", True) or not callable(image_result):
-            return results
+        if not getattr(settings, "render_publish_result", True):
+            return [self._command_result(event, message)]
         try:
             profile = await self._publisher_render_profile(event, allow_network=False)
         except Exception:
@@ -1587,10 +1585,37 @@ class QzoneStablePlugin(Star):
             )
         except Exception as exc:
             logger.exception("qzone manual publish result render failed: %s", exc)
-            return results
+            return [self._command_result(event, message)]
+        outgoing = [
+            {"type": "text", "data": {"text": f"{message}\n"}},
+            {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+        ]
+        try:
+            bot = self._capture_onebot_sender(event)
+        except Exception as exc:
+            logger.debug("qzone manual publish direct feedback sender lookup failed: %s", exc)
+            bot = None
+        if bot is not None:
+            sent = await self._send_event_outgoing(bot, event, outgoing)
+            if sent:
+                self._stop_event(event)
+                return []
+
+        make_result = getattr(event, "make_result", None)
+        if callable(make_result):
+            try:
+                result = make_result().message(message).file_image(str(image_path))
+                self._stop_event(event)
+                return [result]
+            except Exception as exc:
+                logger.debug("qzone manual publish chain image feedback failed: %s", exc)
+
+        image_result = getattr(event, "image_result", None)
+        if callable(image_result):
+            self._stop_event(event)
+            return [self._command_result(event, message), image_result(str(image_path))]
         self._stop_event(event)
-        results.append(image_result(str(image_path)))
-        return results
+        return [event.plain_result(f"{message}\n图片路径: {image_path}")]
 
     def _post_render_limit(self) -> int:
         limit = int(getattr(self.settings, "render_feed_card_limit", 5) or 5)
@@ -4277,6 +4302,38 @@ class QzoneStablePlugin(Star):
                 sources.append(source)
         return normalize_media_list(sources, default_kind="image", trusted_local=True)
 
+    @staticmethod
+    def _life_publish_image_retry_count(settings: Any) -> int:
+        try:
+            retry_count = int(getattr(settings, "life_publish_image_retry_count", 1) or 0)
+        except (TypeError, ValueError):
+            retry_count = 1
+        return max(0, min(retry_count, 5))
+
+    async def _call_omnidraw_selfie_return_result(
+        self,
+        method: Any,
+        call_event: Any,
+        image_prompt: str,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        attempts = (
+            ((call_event,), kwargs),
+            ((call_event, image_prompt), {key: value for key, value in kwargs.items() if key != "action"}),
+            ((), kwargs),
+            ((image_prompt,), {key: value for key, value in kwargs.items() if key != "action"}),
+        )
+        last_type_error: TypeError | None = None
+        for args, call_kwargs in attempts:
+            try:
+                return await self._maybe_await(method(*args, **call_kwargs))
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
+        raise RuntimeError("OmniDraw 自拍接口调用失败")
+
     async def _generate_life_selfie_media(
         self,
         event: AstrMessageEvent | None,
@@ -4302,30 +4359,48 @@ class QzoneStablePlugin(Star):
             "return_result": True,
             "refs": "",
         }
-        attempts = (
-            ((call_event,), kwargs),
-            ((call_event, image_prompt), {key: value for key, value in kwargs.items() if key != "action"}),
-            ((), kwargs),
-            ((image_prompt,), {key: value for key, value in kwargs.items() if key != "action"}),
-        )
-        last_type_error: TypeError | None = None
-        for args, call_kwargs in attempts:
+        max_retries = self._life_publish_image_retry_count(self.settings)
+        total_attempts = max_retries + 1
+        last_result: dict[str, Any] = {"success": False, "message": "", "images": []}
+        last_exception: Exception | None = None
+        for attempt_index in range(1, total_attempts + 1):
             try:
-                raw_result = await self._maybe_await(method(*args, **call_kwargs))
-                break
-            except TypeError as exc:
-                last_type_error = exc
-                continue
-        else:
-            if last_type_error is not None:
-                raise last_type_error
-            raise RuntimeError("OmniDraw 自拍接口调用失败")
-        result = self._parse_omnidraw_result(raw_result)
-        media = self._omnidraw_images_to_media(result)
-        if not media:
-            message = str(result.get("message") or "OmniDraw 未返回可发布图片").strip()
-            result.setdefault("message", message)
-        return media, result
+                raw_result = await self._call_omnidraw_selfie_return_result(method, call_event, image_prompt, kwargs)
+                result = self._parse_omnidraw_result(raw_result)
+                media = self._omnidraw_images_to_media(result)
+                if media:
+                    if attempt_index > 1:
+                        logger.info(
+                            "qzone life publish OmniDraw selfie succeeded after retry attempt=%s/%s",
+                            attempt_index,
+                            total_attempts,
+                        )
+                    return media, result
+                message = str(result.get("message") or "OmniDraw 未返回可发布图片").strip()
+                result.setdefault("message", message)
+                last_result = result
+                if attempt_index < total_attempts:
+                    logger.warning(
+                        "qzone life publish OmniDraw selfie returned no image attempt=%s/%s; retrying: %s",
+                        attempt_index,
+                        total_attempts,
+                        message,
+                    )
+            except Exception as exc:
+                last_exception = exc
+                if attempt_index >= total_attempts:
+                    raise
+                logger.warning(
+                    "qzone life publish OmniDraw selfie failed attempt=%s/%s; retrying: %s",
+                    attempt_index,
+                    total_attempts,
+                    exc,
+                )
+            if attempt_index < total_attempts:
+                await asyncio.sleep(min(0.5, 0.1 * attempt_index))
+        if last_exception is not None:
+            raise last_exception
+        return [], last_result
 
     async def _create_scheduled_draft(self, post: PostPayload, *, message: str) -> DraftPost:
         draft = await self.drafts.add_async(
@@ -4388,7 +4463,7 @@ class QzoneStablePlugin(Star):
         notify_admin: bool = True,
     ) -> dict[str, Any] | None:
         logger.info(
-            "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s",
+            "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s image_retry_count=%s",
             bool(event),
             force_publish,
             getattr(self.settings, "life_publish_mode", "publish"),
@@ -4397,6 +4472,7 @@ class QzoneStablePlugin(Star):
             getattr(self.settings, "life_publish_use_llm_image_prompt", True),
             getattr(self.settings, "life_publish_use_omnidraw_selfie", True),
             getattr(self.settings, "life_publish_auto_caption", True),
+            self._life_publish_image_retry_count(self.settings),
         )
         life_data: dict[str, Any] = {}
         try:
