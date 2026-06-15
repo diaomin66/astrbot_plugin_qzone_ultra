@@ -785,6 +785,14 @@ import qzone_bridge.social as _social
 from qzone_bridge.utils import truncate
 
 
+class LifePublishResult(dict):
+    """Publish payload with the rendered source post attached for command feedback."""
+
+    def __init__(self, payload: dict[str, Any], post: PostPayload):
+        super().__init__(payload)
+        self.post = post
+
+
 class _CompatRenderProfile:
     def __init__(self, nickname: str = "", user_id: str = "", avatar_source: str = "", time_text: str = ""):
         self.nickname = nickname
@@ -1549,6 +1557,40 @@ class QzoneStablePlugin(Star):
             return image_result(str(image_path))
         self._stop_event(event)
         return event.plain_result(f"{text}\n图片路径: {image_path}")
+
+    async def _manual_publish_completion_results(
+        self,
+        event: AstrMessageEvent,
+        post: PostPayload,
+        payload: dict[str, Any],
+        message: str,
+    ) -> list[Any]:
+        results = [self._command_result(event, message)]
+        image_result = getattr(event, "image_result", None)
+        settings = getattr(self, "settings", SimpleNamespace())
+        if not getattr(settings, "render_publish_result", True) or not callable(image_result):
+            return results
+        try:
+            profile = await self._publisher_render_profile(event, allow_network=False)
+        except Exception:
+            profile = profile_from_event(event)
+        render_post = getattr(payload, "post", None) or post
+        try:
+            image_path = await asyncio.to_thread(
+                _render_publish_result_image,
+                render_post,
+                self.data_dir / "rendered_posts",
+                profile=profile,
+                result=payload,
+                width=int(getattr(settings, "render_result_width", 900) or 900),
+                remote_timeout=float(getattr(settings, "render_remote_timeout", 0.35) or 0.35),
+            )
+        except Exception as exc:
+            logger.exception("qzone manual publish result render failed: %s", exc)
+            return results
+        self._stop_event(event)
+        results.append(image_result(str(image_path)))
+        return results
 
     def _post_render_limit(self) -> int:
         limit = int(getattr(self.settings, "render_feed_card_limit", 5) or 5)
@@ -4119,8 +4161,9 @@ class QzoneStablePlugin(Star):
             "只输出最终提示词，不要输出 JSON、解释、标题或编号。"
             "提示词要适合 generate_selfie：包含动作、场景、穿搭、光线、构图和生活氛围。"
         )
+        call_event = event or self._scheduled_plugin_event(prompt=prompt)
         text = await self._llm_adapter().generate_text(
-            event,
+            call_event,
             prompt,
             provider_id=self.settings.post_provider_id,
             system_prompt=system_prompt,
@@ -4130,7 +4173,7 @@ class QzoneStablePlugin(Star):
         if cleaned:
             return cleaned
         fallback = self._clean_life_publish_text(fallback_prompt, fallback=fallback_prompt) or fallback_prompt
-        logger.warning("qzone life publish image prompt LLM returned empty; using fallback prompt")
+        logger.debug("qzone life publish image prompt fell back to template prompt")
         return fallback
 
     async def _generate_life_caption(
@@ -4314,12 +4357,12 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None = None,
         force_publish: bool = False,
         notify_admin: bool = True,
-    ) -> dict[str, Any]:
+    ) -> LifePublishResult:
         mode = str(getattr(self.settings, "life_publish_mode", "publish") or "publish").lower()
         if mode == "draft" and not force_publish:
             draft = await self._create_scheduled_draft(post, message="定时生活说说已生成草稿")
             logger.info("qzone scheduled life publish created draft id=%s text_length=%s", draft.id, len(post.content))
-            return {"draft_id": draft.id, "mode": "draft", "message": "created draft"}
+            return LifePublishResult({"draft_id": draft.id, "mode": "draft", "message": "created draft"}, post)
         await self._ensure_cookie_ready(event)
         await self._ensure_daemon()
         payload = await self.controller.publish_post(
@@ -4335,7 +4378,7 @@ class QzoneStablePlugin(Star):
         )
         if notify_admin:
             await self._notify_admin_publish_result(post, payload, "日常说说发布完成")
-        return payload
+        return LifePublishResult(payload, post)
 
     async def _auto_life_publish_once(
         self,
@@ -5477,7 +5520,11 @@ class QzoneStablePlugin(Star):
                 "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
             )
             return
-        yield self._command_result(event, "日常说说发布完成")
+        post = getattr(payload, "post", None)
+        if not isinstance(post, PostPayload):
+            post = PostPayload(content="", media=[])
+        for result in await self._manual_publish_completion_results(event, post, payload, "日常说说发布完成"):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("写说说", alias={"写稿"})

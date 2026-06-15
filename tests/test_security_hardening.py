@@ -7383,7 +7383,10 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     assert captured["notify"][2] == "日常说说发布完成"
 
 
-def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manual_life_publish_command_invokes_full_publish_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     main = _import_main_with_stubs(monkeypatch)
     captured: dict[str, object] = {}
 
@@ -7396,14 +7399,35 @@ def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pyte
         def plain_result(self, text: str):
             return {"type": "plain", "text": text}
 
+        def image_result(self, path: str):
+            return {"type": "image", "path": path}
+
     async def fake_auto_life(event, *, force_publish=False, notify_admin=True):
         captured["event"] = event
         captured["force_publish"] = force_publish
         captured["notify_admin"] = notify_admin
-        return {"fid": "fid-command"}
+        post = main.PostPayload(content="晚风刚刚好。", media=[])
+        return main.LifePublishResult({"fid": "fid-command"}, post)
+
+    async def fake_profile(event=None, **kwargs):
+        captured["profile_event"] = event
+        return main.RenderProfile(nickname="发布者", user_id="123", avatar_source="", time_text="20:30")
+
+    def fake_render(post, output_dir, *, profile=None, result=None, width=900, remote_timeout=0.35, fixed_width=False):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "manual-life-result.png"
+        path.write_bytes(b"png")
+        captured["render_post"] = post
+        captured["render_result"] = result
+        captured["render_width"] = width
+        return path
 
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin._auto_life_publish_once = fake_auto_life
+    plugin._publisher_render_profile = fake_profile
+    plugin.settings = types.SimpleNamespace(render_publish_result=True, render_result_width=720, render_remote_timeout=0.01)
+    plugin.data_dir = tmp_path
+    monkeypatch.setattr(main, "_render_publish_result_image", fake_render)
 
     event = _Event()
 
@@ -7419,6 +7443,11 @@ def test_manual_life_publish_command_invokes_full_publish_flow(monkeypatch: pyte
     assert results[0]["type"] == "plain"
     assert results[0]["text"] == "日常说说发布完成"
     assert "fid-command" not in results[0]["text"]
+    assert results[1]["type"] == "image"
+    assert results[1]["path"].endswith("manual-life-result.png")
+    assert captured["render_post"].content == "晚风刚刚好。"
+    assert captured["render_result"]["fid"] == "fid-command"
+    assert captured["render_width"] == 720
 
 
 def test_manual_life_publish_command_name_is_short(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7432,7 +7461,17 @@ def test_manual_life_publish_command_name_is_short(monkeypatch: pytest.MonkeyPat
 
 def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     main = _import_main_with_stubs(monkeypatch)
-    captured: dict[str, object] = {}
+    captured: dict[str, object] = {"warnings": []}
+
+    class _Logger:
+        def debug(self, *args, **kwargs): ...
+
+        def info(self, *args, **kwargs): ...
+
+        def warning(self, message, *args, **kwargs):
+            captured["warnings"].append(message % args if args else str(message))
+
+        def exception(self, *args, **kwargs): ...
 
     class _LLM:
         async def generate_text(self, event, prompt, **kwargs):
@@ -7449,6 +7488,7 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
         }
     )
     plugin._llm_adapter = lambda: _LLM()
+    monkeypatch.setattr(main, "logger", _Logger())
 
     prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今日穿搭：浅色卫衣\n今日日程：傍晚散步"))
 
@@ -7456,6 +7496,8 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
     assert "浅色卫衣" in prompt
     assert "傍晚散步" in prompt
     assert captured["prompt"].startswith("根据日程生成自拍")
+    assert captured["event"] is not None
+    assert captured["warnings"] == []
 
 
 def test_life_selfie_media_prefers_generate_selfie_return_result_method(
