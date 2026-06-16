@@ -2,6 +2,10 @@
 
 ## 未发布
 
+- 安全：限制远程图片下载体积，优先使用 Content-Length 拦截超大文件，并在流式下载超限时立即中止，避免异常媒体占用过多内存。
+- 稳定：OneBot Cookie 自动获取增加单次 action 超时，避免协议端无响应时阻塞自动绑定流程。
+- 维护：CI 增加 Ruff 静态检查，并清理当前主线中的失效导入。
+
 ## v0.7.0 - 2026-06-14
 
 - 新增：完成 QQ 空间 H5 原生视频直发稳定化，统一采用 Cookie/`p_skey` + `video_qzone`/`pic_qzone` + `emotion_cgi_publish_v6` + `emotion_cgi_update` 的公开修复链路。

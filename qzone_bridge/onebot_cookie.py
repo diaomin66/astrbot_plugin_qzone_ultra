@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -56,6 +57,7 @@ COOKIE_VALUE_KEYS = (
     "payload",
     "response",
 )
+COOKIE_ACTION_TIMEOUT_SECONDS = 5.0
 COOKIE_NAME_ALLOWLIST = {
     "uin",
     "p_uin",
@@ -203,7 +205,10 @@ def _extract_uin_from_payload(payload: Any, *, _depth: int = 0, _seen: set[int] 
 async def fetch_login_uin(bot: Any) -> int:
     for action in LOGIN_INFO_ACTIONS:
         try:
-            payload = await call_onebot_action(bot, action)
+            payload = await asyncio.wait_for(
+                call_onebot_action(bot, action),
+                timeout=COOKIE_ACTION_TIMEOUT_SECONDS,
+            )
         except Exception:
             continue
         uin = _extract_uin_from_payload(payload)
@@ -475,7 +480,10 @@ async def fetch_cookie_text(bot: Any, *, domain: str) -> str:
         for candidate_domain in iter_cookie_domains(domain):
             for call_kwargs in ({"domain": candidate_domain}, {}):
                 try:
-                    payload = await call_onebot_action(bot, action, **call_kwargs)
+                    payload = await asyncio.wait_for(
+                        call_onebot_action(bot, action, **call_kwargs),
+                        timeout=COOKIE_ACTION_TIMEOUT_SECONDS,
+                    )
                 except Exception:
                     continue
                 cookie_text = extract_cookie_text(payload)
