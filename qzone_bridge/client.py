@@ -14,8 +14,8 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlun
 
 import httpx
 
-from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .astrbot_logging import get_logger
+from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .h5_video import (
     QzoneH5VideoCoverUploadResult,
     QzoneH5VideoUploadResult,
@@ -113,6 +113,7 @@ IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
 IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
 IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+REMOTE_IMAGE_DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -221,6 +222,28 @@ class QzoneClient:
         except Exception as exc:
             raise QzoneParseError(f"{label}解码失败") from exc
         return data
+
+    @staticmethod
+    def _remote_image_too_large_error(url: str, *, limit: int | None = None) -> QzoneParseError:
+        limit = REMOTE_IMAGE_DOWNLOAD_MAX_BYTES if limit is None else int(limit)
+        return QzoneParseError(
+            f"图片文件过大，超过 {limit // 1024 // 1024}MB 限制",
+            detail={"url": url, "max_bytes": limit},
+        )
+
+    @staticmethod
+    def _content_length_exceeds(headers: httpx.Headers | dict[str, str], limit: int) -> bool:
+        value = ""
+        try:
+            value = str(headers.get("content-length") or "")
+        except Exception:
+            return False
+        if not value:
+            return False
+        try:
+            return int(value) > limit
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def _payload_ret_code(payload: Any) -> int:
@@ -1158,10 +1181,16 @@ class QzoneClient:
                                 status_code=response.status_code,
                                 detail={"url": current_url, "text": text[:500]},
                             )
+                        if self._content_length_exceeds(response.headers, REMOTE_IMAGE_DOWNLOAD_MAX_BYTES):
+                            raise self._remote_image_too_large_error(current_url)
                         chunks: list[bytes] = []
+                        total_bytes = 0
                         async for chunk in response.aiter_bytes():
                             if not chunk:
                                 continue
+                            total_bytes += len(chunk)
+                            if total_bytes > REMOTE_IMAGE_DOWNLOAD_MAX_BYTES:
+                                raise self._remote_image_too_large_error(current_url)
                             chunks.append(chunk)
                         content_type = response.headers.get("content-type", "").split(";", 1)[0]
                         data = b"".join(chunks)

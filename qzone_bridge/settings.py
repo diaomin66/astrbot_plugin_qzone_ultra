@@ -87,11 +87,37 @@ def _choice(value: Any, default: str, allowed: set[str]) -> str:
     return text if text in allowed else default
 
 
-def _as_int(value: Any, default: int) -> int:
+def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+        if isinstance(value, bool):
+            number = int(value)
+        elif isinstance(value, (int, float)):
+            number = int(value)
+        else:
+            text = str(value).strip()
+            number = int(float(text)) if "." in text else int(text)
+    except (TypeError, ValueError, OverflowError):
+        number = int(default)
+    if minimum is not None:
+        number = max(int(minimum), number)
+    if maximum is not None:
+        number = min(int(maximum), number)
+    return number
+
+
+def _as_float(value: Any, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        if isinstance(value, bool):
+            number = float(value)
+        else:
+            number = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        number = float(default)
+    if minimum is not None:
+        number = max(float(minimum), number)
+    if maximum is not None:
+        number = min(float(maximum), number)
+    return number
 
 
 @dataclass(slots=True)
@@ -190,12 +216,16 @@ class PluginSettings:
             admin_uins = []
         timeout = _pick(mapping, "timeout", None)
         return cls(
-            daemon_port=int(_pick(mapping, "daemon_port", 18999) or 18999),
-            keepalive_interval=int(_pick(mapping, "keepalive_interval", 120) or 120),
-            request_timeout=float(_pick(mapping, "request_timeout", timeout if timeout is not None else 15.0) or 15.0),
-            start_timeout=float(_pick(mapping, "start_timeout", 20.0) or 20.0),
-            public_feed_limit=int(_pick(mapping, "public_feed_limit", 5) or 5),
-            max_feed_limit=int(_pick(mapping, "max_feed_limit", 20) or 20),
+            daemon_port=_as_int(_pick(mapping, "daemon_port", 18999), 18999, minimum=1, maximum=65535),
+            keepalive_interval=_as_int(_pick(mapping, "keepalive_interval", 120), 120, minimum=1),
+            request_timeout=_as_float(
+                _pick(mapping, "request_timeout", timeout if timeout is not None else 15.0),
+                15.0,
+                minimum=0.1,
+            ),
+            start_timeout=_as_float(_pick(mapping, "start_timeout", 20.0), 20.0, minimum=0.1),
+            public_feed_limit=_as_int(_pick(mapping, "public_feed_limit", 5), 5, minimum=1),
+            max_feed_limit=_as_int(_pick(mapping, "max_feed_limit", 20), 20, minimum=1),
             auto_start_daemon=_as_bool(_pick(mapping, "auto_start_daemon", True), True),
             auto_bind_cookie=_as_bool(_pick(mapping, "auto_bind_cookie", True), True),
             cookie_domain=str(_pick(mapping, "cookie_domain", "user.qzone.qq.com") or "user.qzone.qq.com").strip()
@@ -203,11 +233,11 @@ class PluginSettings:
             admin_uins=[int(v) for v in admin_uins if str(v).isdigit()],
             user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
             render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
-            render_result_width=int(_pick(mapping, "render_result_width", 900) or 900),
-            render_feed_card_limit=int(_pick(mapping, "render_feed_card_limit", 5) or 5),
-            render_remote_timeout=float(_pick(mapping, "render_remote_timeout", 0.35) or 0.35),
+            render_result_width=_as_int(_pick(mapping, "render_result_width", 900), 900, minimum=320, maximum=2400),
+            render_feed_card_limit=_as_int(_pick(mapping, "render_feed_card_limit", 5), 5, minimum=1),
+            render_remote_timeout=_as_float(_pick(mapping, "render_remote_timeout", 0.35), 0.35, minimum=0.05),
             native_video_publish=_as_bool(_pick(mapping, "native_video_publish", True), True),
-            manage_group=int(_pick(mapping, "manage_group", 0) or 0),
+            manage_group=_as_int(_pick(mapping, "manage_group", 0), 0, minimum=0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
             post_prompt=str(_nested(mapping, "llm", "post_prompt", cls.post_prompt) or cls.post_prompt),
@@ -218,7 +248,7 @@ class PluginSettings:
             comment_reasoning_provider_id=str(_nested(mapping, "llm", "comment_reasoning_provider_id", "") or ""),
             comment_execution_provider_id=str(_nested(mapping, "llm", "comment_execution_provider_id", "") or ""),
             comment_skip_checkins=_as_bool(_nested(mapping, "llm", "comment_skip_checkins", True), True),
-            comment_max_length=int(_nested(mapping, "llm", "comment_max_length", 60) or 60),
+            comment_max_length=_as_int(_nested(mapping, "llm", "comment_max_length", 60), 60, minimum=1),
             reply_provider_id=str(_nested(mapping, "llm", "reply_provider_id", "") or ""),
             reply_prompt=str(_nested(mapping, "llm", "reply_prompt", cls.reply_prompt) or cls.reply_prompt),
             news_provider_id=str(
@@ -233,39 +263,42 @@ class PluginSettings:
             news_prompt=str(_nested(mapping, "llm", "news_prompt", cls.news_prompt) or cls.news_prompt),
             ignore_groups=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_groups", []))],
             ignore_users=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_users", []))],
-            post_max_msg=int(_nested(mapping, "source", "post_max_msg", 500) or 500),
+            post_max_msg=_as_int(_nested(mapping, "source", "post_max_msg", 500), 500, minimum=1),
             publish_cron=str(_nested(mapping, "trigger", "publish_cron", "") or ""),
-            publish_offset=int(
+            publish_offset=_as_int(
                 _nested(
                     mapping,
                     "trigger",
                     "publish_offset",
                     _nested(mapping, "trigger", "publish_offset_minutes", 0),
-                )
-                or 0
+                ),
+                0,
+                minimum=0,
             ),
             news_cron=str(_nested(mapping, "trigger", "news_cron", "") or ""),
-            news_offset=int(
+            news_offset=_as_int(
                 _nested(
                     mapping,
                     "trigger",
                     "news_offset",
                     _nested(mapping, "trigger", "news_offset_minutes", 0),
-                )
-                or 0
+                ),
+                0,
+                minimum=0,
             ),
             comment_cron=str(_nested(mapping, "trigger", "comment_cron", "") or ""),
-            comment_offset=int(
+            comment_offset=_as_int(
                 _nested(
                     mapping,
                     "trigger",
                     "comment_offset",
                     _nested(mapping, "trigger", "comment_offset_minutes", 0),
-                )
-                or 0
+                ),
+                0,
+                minimum=0,
             ),
-            comment_latest_count=int(_nested(mapping, "trigger", "comment_latest_count", 1) or 1),
-            read_prob=float(_nested(mapping, "trigger", "read_prob", 0.0) or 0.0),
+            comment_latest_count=_as_int(_nested(mapping, "trigger", "comment_latest_count", 1), 1, minimum=1),
+            read_prob=_as_float(_nested(mapping, "trigger", "read_prob", 0.0), 0.0, minimum=0.0, maximum=1.0),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
             life_publish_enabled=_as_bool(_nested(mapping, "life_publish", "enabled", False), False),
@@ -298,20 +331,16 @@ class PluginSettings:
             life_publish_aspect_ratio=str(_nested(mapping, "life_publish", "aspect_ratio", "1:1") or "1:1"),
             life_publish_size=str(_nested(mapping, "life_publish", "size", "") or ""),
             life_publish_extra_params=str(_nested(mapping, "life_publish", "extra_params", "") or ""),
-            life_publish_image_retry_count=max(
-                0,
-                min(
-                    5,
-                    _as_int(
-                        _nested(
-                            mapping,
-                            "life_publish",
-                            "image_retry_count",
-                            DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
-                        ),
-                        DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
-                    ),
+            life_publish_image_retry_count=_as_int(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_retry_count",
+                    DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
                 ),
+                DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                minimum=0,
+                maximum=5,
             ),
             life_publish_static_caption=str(
                 _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
@@ -335,10 +364,10 @@ class PluginSettings:
             news_custom_rss_urls=[
                 str(item).strip() for item in _as_list(_nested(mapping, "news", "custom_rss_urls", [])) if str(item).strip()
             ],
-            news_max_candidates=max(1, int(_nested(mapping, "news", "max_candidates", 12) or 12)),
-            news_recency_hours=max(0, int(_nested(mapping, "news", "recency_hours", 36) or 36)),
+            news_max_candidates=_as_int(_nested(mapping, "news", "max_candidates", 12), 12, minimum=1),
+            news_recency_hours=_as_int(_nested(mapping, "news", "recency_hours", 36), 36, minimum=0),
             news_once_per_day=_as_bool(_nested(mapping, "news", "once_per_day", True), True),
-            news_max_post_length=max(40, int(_nested(mapping, "news", "max_post_length", 180) or 180)),
+            news_max_post_length=_as_int(_nested(mapping, "news", "max_post_length", 180), 180, minimum=40),
             news_trust_env=_as_bool(_nested(mapping, "news", "trust_env", True), True),
             cookies_str=str(_pick(mapping, "cookies_str", "") or ""),
             show_name=_as_bool(_pick(mapping, "show_name", True), True),

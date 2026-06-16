@@ -14,7 +14,8 @@ import types
 import httpx
 import pytest
 
-from qzone_bridge.client import QzoneClient
+import qzone_bridge.client as qzone_client_module
+from qzone_bridge.client import QzoneClient, REMOTE_IMAGE_DOWNLOAD_MAX_BYTES
 from qzone_bridge.auto_comment import (
     AutoCommentPipeline,
     AutoCommentPipelineConfig,
@@ -1026,6 +1027,64 @@ def test_remote_media_response_cookies_do_not_pollute_qzone_session(monkeypatch:
         assert client.session.cookies["uin"] == "o12345"
         assert client.session.cookies["p_skey"] == "secret"
         assert "evil" not in client.session.cookies
+    finally:
+        asyncio.run(client.close())
+
+
+def test_remote_media_download_rejects_oversized_content_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Response:
+        status_code = 200
+        headers = {
+            "content-type": "image/png",
+            "content-length": str(REMOTE_IMAGE_DOWNLOAD_MAX_BYTES + 1),
+        }
+
+        async def aiter_bytes(self):
+            yield b"abc"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
+    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": "https://example.test/huge.png"}))
+        assert error.value.detail["max_bytes"] == REMOTE_IMAGE_DOWNLOAD_MAX_BYTES
+    finally:
+        asyncio.run(client.close())
+
+
+def test_remote_media_download_rejects_stream_that_exceeds_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(qzone_client_module, "REMOTE_IMAGE_DOWNLOAD_MAX_BYTES", 8)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"x" * 5
+            yield b"y" * 5
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
+    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": "https://example.test/huge.png"}))
+        assert error.value.detail["max_bytes"] == 8
     finally:
         asyncio.run(client.close())
 
@@ -5664,6 +5723,22 @@ def test_onebot_call_action_supports_nested_api() -> None:
     assert calls == [("get_msg", {"id": "123456"})]
 
 
+def test_fetch_cookie_text_skips_slow_onebot_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge.onebot_cookie as cookie_module
+    from qzone_bridge.onebot_cookie import fetch_cookie_text
+
+    monkeypatch.setattr(cookie_module, "COOKIE_ACTIONS", ("get_cookies",))
+    monkeypatch.setattr(cookie_module, "COOKIE_DOMAIN_FALLBACKS", ())
+    monkeypatch.setattr(cookie_module, "COOKIE_ACTION_TIMEOUT_SECONDS", 0.001)
+
+    class _Bot:
+        async def get_cookies(self, **params):
+            await asyncio.sleep(1)
+            return {"cookies": "uin=o12345; p_skey=secret; skey=secret"}
+
+    assert asyncio.run(fetch_cookie_text(_Bot(), domain="qzone.qq.com")) == ""
+
+
 def test_onebot_call_action_supports_protocol_client_positional_params() -> None:
     from qzone_bridge.onebot_cookie import call_onebot_action
 
@@ -8333,6 +8408,34 @@ def test_page_status_profile_fetch_is_independent_from_publish_rendering(
 def test_comment_latest_count_is_loaded_from_trigger_config() -> None:
     settings = PluginSettings.from_mapping({"trigger": {"comment_latest_count": 3}})
     assert settings.comment_latest_count == 3
+
+
+def test_settings_invalid_numbers_fall_back_without_crashing() -> None:
+    settings = PluginSettings.from_mapping(
+        {
+            "daemon_port": "not-a-port",
+            "request_timeout": "slow",
+            "render_result_width": "-1",
+            "trigger": {
+                "comment_latest_count": "many",
+                "read_prob": "2",
+                "news_offset": "-10",
+            },
+            "news": {
+                "max_candidates": "lots",
+                "max_post_length": "1",
+            },
+        }
+    )
+
+    assert settings.daemon_port == 18999
+    assert settings.request_timeout == 15.0
+    assert settings.render_result_width == 320
+    assert settings.comment_latest_count == 1
+    assert settings.read_prob == 1.0
+    assert settings.news_offset == 0
+    assert settings.news_max_candidates == 12
+    assert settings.news_max_post_length == 40
 
 
 def test_auto_comment_pipeline_config_is_loaded_from_webui_schema_mapping() -> None:
