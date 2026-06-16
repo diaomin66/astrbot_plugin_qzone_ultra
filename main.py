@@ -719,7 +719,6 @@ from qzone_bridge.errors import (
     QzoneCookieAcquireError,
     QzoneNeedsRebind,
     QzoneParseError,
-    QzoneRequestError,
 )
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.local_media import resolve_trusted_local_media_path

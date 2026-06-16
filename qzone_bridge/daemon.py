@@ -42,7 +42,7 @@ from .media import (
 )
 from .native_video import _probe_video_duration_ms, native_video_candidate
 from .video import materialize_video_cover_list, materialize_video_source_list, video_cover_media
-from .models import FeedEntry, SessionState, VideoUploadCredentialState
+from .models import FeedEntry, SessionState
 from .parser import (
     compute_unikey,
     extract_feed_page,
