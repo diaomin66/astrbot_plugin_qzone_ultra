@@ -7644,6 +7644,34 @@ def test_comment_latest_count_is_loaded_from_trigger_config() -> None:
     assert settings.comment_latest_count == 3
 
 
+def test_settings_invalid_numbers_fall_back_without_crashing() -> None:
+    settings = PluginSettings.from_mapping(
+        {
+            "daemon_port": "not-a-port",
+            "request_timeout": "slow",
+            "render_result_width": "-1",
+            "trigger": {
+                "comment_latest_count": "many",
+                "read_prob": "2",
+                "news_offset": "-10",
+            },
+            "news": {
+                "max_candidates": "lots",
+                "max_post_length": "1",
+            },
+        }
+    )
+
+    assert settings.daemon_port == 18999
+    assert settings.request_timeout == 15.0
+    assert settings.render_result_width == 320
+    assert settings.comment_latest_count == 1
+    assert settings.read_prob == 1.0
+    assert settings.news_offset == 0
+    assert settings.news_max_candidates == 12
+    assert settings.news_max_post_length == 40
+
+
 def test_auto_comment_pipeline_config_is_loaded_from_webui_schema_mapping() -> None:
     settings = PluginSettings.from_mapping(
         {
