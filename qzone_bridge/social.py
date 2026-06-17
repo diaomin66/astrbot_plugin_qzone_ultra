@@ -241,6 +241,85 @@ def clean_qzone_text(value: Any) -> str:
     return unescape(text).strip()
 
 
+def normalize_image_source(value: Any) -> str:
+    source = unescape(str(value or "")).strip().strip("\"'")
+    source = source.replace("\\/", "/")
+    if not source:
+        return ""
+    if source.startswith("//"):
+        source = f"https:{source}"
+    if any(char in source for char in "\r\n\t<>"):
+        return ""
+    parsed = urlparse(source)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if "qlogo" in host or host in {"thirdqq.qlogo.cn", "q.qlogo.cn"}:
+        return ""
+    if "/headimg" in path or "/headimg_dl" in path:
+        return ""
+    if "qzone" in host and re.search(r"/qzone/\d+/\d+/50(?:[/?]|$)", path):
+        return ""
+    source = re.sub(r"/(?:a|m|s)(?=&)", "/b", source)
+    source = re.sub(r"([?&])(?:w|h)=\d+(?=&|$)", "", source)
+    source = source.replace("?&", "?").rstrip("?&")
+    return source
+
+
+def _normalized_qzone_psc_payload(value: str) -> str:
+    payload = unescape(str(value or "")).replace("\\/", "/").strip()
+    if not payload:
+        return ""
+    payload = re.sub(r"/(?:a|m|s)(?=&|$)", "/b", payload)
+    payload = re.sub(r"&(?:bo|w|h)=[^&]*", "", payload, flags=re.I)
+    return payload.rstrip("!&?")
+
+
+def image_source_key(source: str) -> str:
+    parsed = urlparse(source)
+    host = parsed.netloc.lower()
+    path = parsed.path.strip("/")
+    query = parsed.query.strip()
+    if "qzone.qq.com" in host and "/photo/" in parsed.path:
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            index = parts.index("photo")
+        except ValueError:
+            index = -1
+        if index >= 0 and len(parts) > index + 2:
+            return f"qzone-photo:{parts[index + 1]}:{parts[index + 2].split('_', 1)[0]}"
+    if path.lower() == "psc" and query.startswith("/"):
+        psc_payload = _normalized_qzone_psc_payload(query)
+        if psc_payload:
+            return f"qzone-psc:{psc_payload}"
+    if path.lower().startswith("psc/"):
+        psc_payload = _normalized_qzone_psc_payload("/" + path.split("/", 1)[1])
+        if psc_payload:
+            return f"qzone-psc:{psc_payload}"
+    return f"url:{host}{parsed.path}?{parsed.query}"
+
+
+def dedupe_image_sources(sources: Iterable[Any]) -> list[str]:
+    images: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        raw_value = str(source or "").strip()
+        value = normalize_image_source(source)
+        if value:
+            key = image_source_key(value)
+        elif raw_value.startswith(("data:", "base64://", "blob:")):
+            value = raw_value
+            key = f"inline:{raw_value}"
+        else:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        images.append(value)
+    return images
+
+
 def _first_mapping(*values: Any) -> dict[str, Any]:
     for value in values:
         if isinstance(value, dict):
@@ -530,55 +609,12 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
     target_fid = str(fid or "").strip()
     target_hostuin = _to_int(hostuin)
 
-    def valid_image_source(value: str) -> str:
-        source = unescape(str(value or "")).strip().strip("\"'")
-        source = source.replace("\\/", "/")
-        if not source:
-            return ""
-        if source.startswith("//"):
-            source = f"https:{source}"
-        if any(char in source for char in "\r\n\t<>"):
-            return ""
-        parsed = urlparse(source)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-            return ""
-        host = parsed.netloc.lower()
-        path = parsed.path.lower()
-        if "qlogo" in host or host in {"thirdqq.qlogo.cn", "q.qlogo.cn"}:
-            return ""
-        if "/headimg" in path or "/headimg_dl" in path:
-            return ""
-        if "qzone" in host and re.search(r"/qzone/\d+/\d+/50(?:[/?]|$)", path):
-            return ""
-        source = re.sub(r"/(?:a|m|s)(?=&)", "/b", source)
-        source = re.sub(r"([?&])(?:w|h)=\d+(?=&|$)", "", source)
-        source = source.replace("?&", "?").rstrip("?&")
-        return source
-
-    def image_url_key(source: str) -> str:
-        parsed = urlparse(source)
-        host = parsed.netloc.lower()
-        path = parsed.path.strip("/")
-        if "qzone.qq.com" in host and "/photo/" in parsed.path:
-            parts = [part for part in parsed.path.split("/") if part]
-            try:
-                index = parts.index("photo")
-            except ValueError:
-                index = -1
-            if index >= 0 and len(parts) > index + 2:
-                return f"qzone-photo:{parts[index + 1]}:{parts[index + 2].split('_', 1)[0]}"
-        if path.startswith("psc"):
-            bits = [part for part in path.split("/") if part]
-            if len(bits) >= 3:
-                return f"qzone-psc:{bits[1]}:{bits[2].rstrip('!')}"
-        return f"url:{parsed.scheme.lower()}://{host}{parsed.path}?{parsed.query}"
-
     def add(value: Any, *, identity: str = "") -> None:
         if isinstance(value, str):
-            value = valid_image_source(value)
+            value = normalize_image_source(value)
             if not value:
                 return
-            key = identity or image_url_key(value)
+            key = identity or image_source_key(value)
             if key in seen_image_keys:
                 return
             seen_image_keys.add(key)
@@ -596,8 +632,12 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
     def photo_identity(value: dict[str, Any]) -> str:
         albumid = str(value.get("albumid") or value.get("albumId") or "").strip()
         lloc = str(value.get("lloc") or value.get("realLloc") or value.get("picid") or value.get("picId") or "").strip()
+        pic_id_value = value.get("pic_id") or value.get("picId")
+        pic_id_source = normalize_image_source(pic_id_value)
+        if pic_id_source:
+            return image_source_key(pic_id_source)
         if not lloc:
-            parsed_album, parsed_lloc = _photo_id_from_pic_id(value.get("pic_id") or value.get("picId"))
+            parsed_album, parsed_lloc = _photo_id_from_pic_id(pic_id_value)
             albumid = albumid or parsed_album
             lloc = parsed_lloc
         if lloc:
@@ -613,18 +653,18 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
         for key in ("1", "0", "14", "11", "2", "3"):
             item = value.get(key)
             if isinstance(item, dict):
-                source = valid_image_source(item.get("url"))
+                source = normalize_image_source(item.get("url"))
                 if source:
                     return source
             else:
-                source = valid_image_source(item)
+                source = normalize_image_source(item)
                 if source:
                     return source
         ranked: list[tuple[int, int, str]] = []
         for item in value.values():
             if not isinstance(item, dict):
                 continue
-            source = valid_image_source(item.get("url"))
+            source = normalize_image_source(item.get("url"))
             if not source:
                 continue
             width = _to_int(item.get("width"))
@@ -640,7 +680,7 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
         if source:
             return source
         for key in IMAGE_ALIAS_PRIORITY_KEYS:
-            source = valid_image_source(value.get(key))
+            source = normalize_image_source(value.get(key))
             if source:
                 return source
         return ""

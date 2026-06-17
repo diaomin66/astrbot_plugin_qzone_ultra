@@ -133,6 +133,10 @@ class Element {
   querySelector(selector) {
     return find(this, selector);
   }
+
+  querySelectorAll(selector) {
+    return findAll(this, selector);
+  }
 }
 
 function matches(element, selector) {
@@ -155,6 +159,19 @@ function find(root, selector) {
     if (nested) return nested;
   }
   return null;
+}
+
+function findAll(root, selector) {
+  if (selector.includes(" ")) {
+    const [head, ...tail] = selector.split(/\s+/);
+    return findAll(root, head).flatMap((parent) => findAll(parent, tail.join(" ")));
+  }
+  const result = [];
+  for (const child of root.children) {
+    if (matches(child, selector)) result.push(child);
+    if (child instanceof Element) result.push(...findAll(child, selector));
+  }
+  return result;
 }
 
 function byText(root, value) {
@@ -425,6 +442,10 @@ detailResolve({
   post: {
     ...feedPost,
     stats: { likes: 3, comments: 1 },
+    images: [
+      "http://qzone.example.test/photo.jpg?w=120",
+      "https://qzone.example.test/photo.jpg?h=240",
+    ],
     comments: [...feedPost.comments],
   },
 });
@@ -432,6 +453,10 @@ await new Promise((resolve) => setTimeout(resolve, 30));
 
 if (!byText(elements.get("detailContent"), "回复 Friend：谢谢")) {
   throw new Error("stale detail response overwrote the local reply");
+}
+const dedupedDetailImages = elements.get("detailContent").querySelectorAll(".detail-media img");
+if (dedupedDetailImages.length !== 1) {
+  throw new Error(`detail image variants were rendered more than once: ${dedupedDetailImages.length}`);
 }
 
 const mediaInput = elements.get("mediaInput");

@@ -33,7 +33,7 @@ from .media import (
     looks_like_supported_image_bytes,
 )
 from .models import FeedEntry
-from .social import QzoneComment, QzonePost, post_from_entry
+from .social import QzoneComment, QzonePost, dedupe_image_sources, post_from_entry
 from .utils import truncate
 
 
@@ -430,7 +430,7 @@ class QzonePageApi:
                 "comments": post.comment_count,
             },
             "liked": bool(post.liked),
-            "images": list(post.images[:9]),
+            "images": dedupe_image_sources(post.images)[:9],
             "can_comment": bool(post.fid and post.hostuin),
             "can_like": bool(post.fid and post.hostuin),
             "can_delete": bool(login_uin and post.hostuin == login_uin),

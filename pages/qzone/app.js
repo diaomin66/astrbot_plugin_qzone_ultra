@@ -589,6 +589,47 @@ function mediaDisplaySource(item) {
   return source;
 }
 
+function mediaDedupeKey(source) {
+  let value = text(source).trim().replace(/&amp;/g, "&").replace(/\\\//g, "/");
+  if (!value) return "";
+  if (value.startsWith("//")) value = `https:${value}`;
+  if (!/^https?:\/\//i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const path = decodeURIComponent(url.pathname || "");
+    let query = decodeURIComponent(url.search || "")
+      .replace(/([?&])(?:w|h)=\d+(?=&|$)/gi, "$1")
+      .replace(/\?&/g, "?")
+      .replace(/[?&]$/g, "");
+    if (path.toLowerCase() === "/psc" && query.startsWith("?/")) {
+      const pscPayload = query
+        .slice(1)
+        .replace(/\/(?:a|m|s)(?=&|$)/gi, "/b")
+        .replace(/&(?:bo|w|h)=[^&]*/gi, "")
+        .replace(/[!&?]+$/g, "");
+      if (pscPayload) return `qzone-psc:${pscPayload}`;
+    }
+    return `url:${host}${path}${query}`;
+  } catch (_) {
+    return value.toLowerCase();
+  }
+}
+
+function dedupeMediaEntries(items) {
+  const seen = new Set();
+  const result = [];
+  for (const item of items || []) {
+    const source = mediaDisplaySource(item);
+    if (!source) continue;
+    const key = mediaDedupeKey(source) || source;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ item, source });
+  }
+  return result;
+}
+
 function isVideoSource(url) {
   const value = text(url);
   return value.startsWith("data:video/") || /\.(mp4|m4v|mov|webm|ogg)(?:[?#].*)?$/i.test(value);
@@ -857,10 +898,7 @@ function openLightbox(url) {
 }
 
 function renderMediaGrid(items, className = "post-media") {
-  const entries = (items || [])
-    .map((item) => ({ item, source: mediaDisplaySource(item) }))
-    .filter((entry) => entry.source)
-    .slice(0, 9);
+  const entries = dedupeMediaEntries(items).slice(0, 9);
   if (!entries.length) return null;
 
   const media = document.createElement("div");
