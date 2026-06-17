@@ -2,6 +2,7 @@
 const BRIDGE_READY_TIMEOUT_MS = 5000;
 const BRIDGE_REQUEST_TIMEOUT_MS = 60000;
 const DETAIL_DRAWER_BREAKPOINT = 1200;
+const DETAIL_CACHE_TTL_MS = 45000;
 
 const state = {
   context: null,
@@ -22,6 +23,8 @@ const state = {
   replyDrafts: new Map(),
   pendingReplies: new Set(),
   localVersions: new Map(),
+  detailCache: new Map(),
+  detailInFlight: new Map(),
   detailRequestSeq: 0,
   detailLoadingId: "",
 };
@@ -419,6 +422,10 @@ function mergePost(base, patch) {
   if (base?.stats || patch?.stats) {
     merged.stats = { ...(base?.stats || {}), ...(patch?.stats || {}) };
   }
+  if (base?.images || patch?.images) {
+    const nextImages = patch?.images?.length ? patch.images : base?.images || [];
+    merged.images = dedupeMediaEntries(nextImages).map((entry) => entry.item);
+  }
   return merged;
 }
 
@@ -446,6 +453,72 @@ function renderSelectedIfNeeded(id) {
   if (state.selected?.id === id) {
     renderDetail(state.selected);
   }
+}
+
+function cacheDetailPost(post) {
+  if (!post?.id) return;
+  state.detailCache.set(post.id, {
+    post: mergePost({}, post),
+    expiresAt: Date.now() + DETAIL_CACHE_TTL_MS,
+  });
+}
+
+function cachedDetailPost(id) {
+  const cached = state.detailCache.get(id);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    state.detailCache.delete(id);
+    return null;
+  }
+  return mergePost(currentPostById(id, {}), cached.post);
+}
+
+function selectedPostId() {
+  return text(state.selected?.id);
+}
+
+function syncSelectedFeedCard(id = selectedPostId()) {
+  if (!el.feed) return;
+  for (const card of el.feed.querySelectorAll?.(".post") || []) {
+    const selected = text(card.dataset?.id) === text(id);
+    card.classList.toggle("selected", selected);
+    if (selected) {
+      card.setAttribute?.("aria-current", "true");
+    } else {
+      card.removeAttribute?.("aria-current");
+    }
+  }
+}
+
+function detailScrollTop() {
+  return Number(el.detailPane?.scrollTop || 0);
+}
+
+function restoreDetailScroll(value) {
+  if (!el.detailPane || !Number.isFinite(value)) return;
+  requestAnimationFrameSafe(() => {
+    el.detailPane.scrollTop = value;
+  });
+}
+
+function requestAnimationFrameSafe(callback) {
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(callback);
+  } else {
+    window.setTimeout(callback, 0);
+  }
+}
+
+async function fetchDetailPost(id) {
+  if (state.detailInFlight.has(id)) {
+    return state.detailInFlight.get(id);
+  }
+  const request = apiGet("page/detail", { id })
+    .finally(() => {
+      state.detailInFlight.delete(id);
+    });
+  state.detailInFlight.set(id, request);
+  return request;
 }
 
 
@@ -819,6 +892,7 @@ function clearDetailDrawerChrome() {
   const closeBtn = document.getElementById("detailCloseBtn");
   pane?.classList.remove("visible");
   backdrop?.classList.remove("visible");
+  document.body?.classList?.remove("detail-drawer-open");
   if (closeBtn) closeBtn.hidden = true;
 }
 
@@ -939,8 +1013,11 @@ function renderMediaGrid(items, className = "post-media") {
 function renderPostCard(post) {
   rememberPostAuthors(post);
   const card = document.createElement("article");
-  card.className = "post";
+  card.className = `post${state.selected?.id === post.id ? " selected" : ""}`;
   card.dataset.id = post.id;
+  if (state.selected?.id === post.id) {
+    card.setAttribute?.("aria-current", "true");
+  }
 
   const head = document.createElement("button");
   head.className = "post-header";
@@ -1022,15 +1099,22 @@ function renderPostCard(post) {
 }
 
 function renderDetail(post, options = {}) {
+  const previousId = state.selected?.id;
+  const scrollBefore = previousId === post.id ? detailScrollTop() : 0;
   state.selected = mergePost(state.selected?.id === post.id ? state.selected : {}, post);
   post = state.selected;
   rememberPostAuthors(post);
+  if (!options.loading) {
+    cacheDetailPost(post);
+  }
   const isLoading = Boolean(options.loading || state.detailLoadingId === post.id);
   el.detailEmpty.hidden = true;
   el.detailContent.hidden = false;
   el.detailPane.classList.add("has-selection");
+  el.detailPane.dataset.postId = post.id;
   el.detailContent.setAttribute?.("aria-busy", isLoading ? "true" : "false");
   el.detailContent.replaceChildren();
+  syncSelectedFeedCard(post.id);
 
   const title = document.createElement("div");
   title.className = "detail-title";
@@ -1129,6 +1213,11 @@ function renderDetail(post, options = {}) {
   });
 
   el.detailContent.append(comments, form);
+  if (previousId === post.id && options.preserveScroll !== false) {
+    restoreDetailScroll(scrollBefore);
+  } else if (previousId !== post.id) {
+    el.detailPane.scrollTop = 0;
+  }
 }
 
 function renderComment(post, comment) {
@@ -1286,18 +1375,21 @@ function toggleDetailDrawer(visible) {
             pane.classList.add("visible");
             if (closeBtn) closeBtn.hidden = false;
             if (backdrop) backdrop.classList.add("visible");
+            document.body?.classList?.add("detail-drawer-open");
         } else {
             pane.classList.remove("visible");
             if (closeBtn) closeBtn.hidden = true;
             if (backdrop) backdrop.classList.remove("visible");
+            document.body?.classList?.remove("detail-drawer-open");
             state.selected = null;
+            state.detailLoadingId = "";
+            syncSelectedFeedCard("");
         }
     } else {
         clearDetailDrawerChrome();
-        // Desktop just scroll into view if needed
-        if (visible) {
-            pane.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
-        }
+        // Desktop detail stays pinned in its grid column; do not scroll the
+        // page when opening a photo detail, otherwise image loads can nudge
+        // the viewport and make the layout look crooked.
     }
 }
 
@@ -1308,32 +1400,34 @@ window.addEventListener?.("resize", () => {
 });
 
 async function openDetail(id, focusComment = false) {
-  const cached = currentPostById(id);
+  const cached = cachedDetailPost(id) || currentPostById(id);
   const requestSeq = ++state.detailRequestSeq;
   const versionAtRequestStart = localVersion(id);
   if (state.selected?.id !== id) {
     state.replyTarget = null;
   }
-  state.detailLoadingId = id;
   toggleDetailDrawer(true);
+  const hasFreshDetail = Boolean(cachedDetailPost(id));
+  state.detailLoadingId = hasFreshDetail ? "" : id;
   if (cached) {
-    renderDetail(cached, { loading: true });
-    renderFeed();
+    renderDetail(cached, { loading: !hasFreshDetail, preserveScroll: state.selected?.id === id });
     if (focusComment) {
       setTimeout(() => {
         el.detailContent.querySelector(".comment-form textarea")?.focus();
       }, 0);
     }
   }
+  if (hasFreshDetail) {
+    return;
+  }
   try {
-    const data = await apiGet("page/detail", { id });
+    const data = await fetchDetailPost(id);
     if (requestSeq !== state.detailRequestSeq) return;
     state.detailLoadingId = "";
     const incoming = mergeRemotePost(data.post.id, data.post, versionAtRequestStart);
     const merged = updatePost(incoming.id, incoming) || incoming;
     rememberPostAuthors(merged);
-    renderDetail(merged);
-    renderFeed();
+    renderDetail(merged, { preserveScroll: true });
     if (data.partial) {
       setNotice(data.message || "详情接口响应较慢，已先显示缓存内容。", "warn");
     }
@@ -1346,7 +1440,7 @@ async function openDetail(id, focusComment = false) {
     if (requestSeq !== state.detailRequestSeq) return;
     state.detailLoadingId = "";
     if (cached) {
-      renderDetail(currentPostById(id, cached));
+      renderDetail(currentPostById(id, cached), { preserveScroll: true });
     }
     setNotice(error.message || "详情加载失败", "error");
   }

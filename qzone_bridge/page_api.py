@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import json
 import mimetypes
 import re
@@ -42,6 +43,7 @@ PAGE_DEFAULT_LIMIT = 10
 PAGE_MAX_LIMIT = 30
 PAGE_DETAIL_TIMEOUT_SECONDS = 8.0
 PAGE_STATUS_TIMEOUT_SECONDS = 2.0
+PAGE_DETAIL_CACHE_TTL_SECONDS = 15.0
 
 
 @dataclass(slots=True)
@@ -147,6 +149,8 @@ class QzonePageApi:
         self._feed_seen_refs: dict[tuple[str, int], set[tuple[int, str, int]]] = {}
         self._feed_emitted_cursors: dict[tuple[str, int], set[str]] = {}
         self._uploaded_media_by_id: dict[str, dict[str, Any]] = {}
+        self._detail_cache: dict[tuple[int, str, int, str], tuple[float, dict[str, Any]]] = {}
+        self._detail_inflight: dict[tuple[int, str, int, str], asyncio.Task[dict[str, Any]]] = {}
 
     @property
     def max_feed_limit(self) -> int:
@@ -251,6 +255,10 @@ class QzonePageApi:
     @staticmethod
     def _feed_key(scope: str, hostuin: int) -> tuple[str, int]:
         return (str(scope or "auto").strip().lower() or "auto", int(hostuin or 0))
+
+    @staticmethod
+    def _detail_key(ref: PagePostRef, busi_param: str = "") -> tuple[int, str, int, str]:
+        return (int(ref.hostuin or 0), str(ref.fid or ""), int(ref.appid or 311), str(busi_param or ""))
 
     @staticmethod
     def _entry_ref(entry: FeedEntry) -> tuple[int, str, int]:
@@ -543,6 +551,33 @@ class QzonePageApi:
         params = params or {}
         ref = self._decode_post_ref(params.get("id") or params.get("post_id"))
         busi_param = json.dumps(ref.busi_param, ensure_ascii=False, separators=(",", ":")) if ref.busi_param else ""
+        cache_key = self._detail_key(ref, busi_param)
+        now = time.monotonic()
+        cached = self._detail_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return copy.deepcopy(cached[1])
+        if cached:
+            self._detail_cache.pop(cache_key, None)
+
+        inflight = self._detail_inflight.get(cache_key)
+        if inflight is not None and not inflight.done():
+            return copy.deepcopy(await inflight)
+
+        task = asyncio.create_task(self._detail_uncached(ref, status, busi_param))
+        self._detail_inflight[cache_key] = task
+        try:
+            result = await task
+        finally:
+            self._detail_inflight.pop(cache_key, None)
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict) and not data.get("partial"):
+            self._detail_cache[cache_key] = (
+                time.monotonic() + max(0.0, float(PAGE_DETAIL_CACHE_TTL_SECONDS)),
+                copy.deepcopy(result),
+            )
+        return result
+
+    async def _detail_uncached(self, ref: PagePostRef, status: dict[str, Any], busi_param: str) -> dict[str, Any]:
         try:
             payload = await asyncio.wait_for(
                 self.controller.detail_feed(

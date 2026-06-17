@@ -46,6 +46,18 @@ def test_page_upload_preview_accepts_local_blob_urls() -> None:
     assert "delete payload.preview_url" in app
 
 
+def test_page_detail_logic_avoids_viewport_jump_and_reuses_cache() -> None:
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
+
+    assert "scrollIntoView" not in app
+    assert "detailCache" in app
+    assert "detailInFlight" in app
+    assert "syncSelectedFeedCard" in app
+    assert "body.detail-drawer-open" in css
+    assert "scrollbar-gutter: stable" in css
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for the frontend smoke test")
 def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) -> None:
     harness = tmp_path / "qzone_page_harness.mjs"
@@ -124,6 +136,10 @@ class Element {
 
   setAttribute(name, value) {
     this[name] = String(value);
+  }
+
+  removeAttribute(name) {
+    delete this[name];
   }
 
   focus() {
@@ -248,6 +264,7 @@ let replyPayload = null;
 let deletePayload = null;
 let publishPayload = null;
 let detailResolve;
+let detailApiCalls = 0;
 const detailPromise = new Promise((resolve) => {
   detailResolve = resolve;
 });
@@ -309,6 +326,7 @@ globalThis.window = {
         });
       }
       if (endpoint === "page/detail") {
+        detailApiCalls += 1;
         return detailPromise;
       }
       throw new Error(`unexpected GET ${endpoint}`);
@@ -404,9 +422,13 @@ if (elements.get("feedMeta").textContent !== "1 条") {
 const detailButton = byText(elements.get("feed"), "查看详情");
 if (!detailButton) throw new Error("detail button was not rendered");
 detailButton.handlers.click();
+detailButton.handlers.click();
 
 if (elements.get("detailContent").hidden) {
   throw new Error("cached detail was not rendered immediately");
+}
+if (detailApiCalls !== 1) {
+  throw new Error(`duplicate detail requests were not coalesced: ${detailApiCalls}`);
 }
 const detailMedia = elements.get("detailContent").querySelector(".detail-media");
 if (!detailMedia || !detailMedia.querySelector("img")) {

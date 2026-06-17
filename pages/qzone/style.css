@@ -1,52 +1,83 @@
-﻿/* Modern UI CSS for QQ Zone Ultra */
+/* Warm editorial QQ Zone surface */
 :root {
   color-scheme: light;
-  --bg-color: #f3f6f9;
-  --surface: #ffffff;
-  --surface-hover: #f9fbfc;
-  --text-primary: #1e2022;
-  --text-secondary: #747b81;
-  --border: #eaedf1;
-  --accent: #1877f2;
-  --accent-hover: #1664d0;
-  --accent-glow: rgba(24, 119, 242, 0.15);
-  --success: #17a05d;
-  --danger: #e23e3e;
-  
-  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.04);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.06);
-  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.08);
-  
+  --bg-color: #f5efe7;
+  --surface: rgba(255, 252, 247, 0.88);
+  --surface-hover: rgba(255, 247, 235, 0.96);
+  --text-primary: #221a14;
+  --text-secondary: #7d6d5f;
+  --border: rgba(111, 82, 48, 0.14);
+  --accent: #d26a1f;
+  --accent-hover: #ad4e0f;
+  --accent-glow: rgba(210, 106, 31, 0.18);
+  --success: #24895b;
+  --danger: #c93e35;
+  --focus-ring: rgba(210, 106, 31, 0.28);
+  --shadow-sm: 0 8px 28px rgba(72, 45, 20, 0.07);
+  --shadow-md: 0 18px 46px rgba(72, 45, 20, 0.12);
+  --shadow-lg: 0 28px 72px rgba(72, 45, 20, 0.18);
+  --glass-blur: saturate(1.25) blur(18px);
   --radius-sm: 12px;
   --radius-md: 20px;
   --radius-lg: 28px;
   --radius-full: 9999px;
-  
-  --spring: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-  --transition: all 0.2s ease-out;
+  --spring: all 0.42s cubic-bezier(0.16, 1, 0.3, 1);
+  --transition: all 0.18s ease-out;
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg-color: #121212;
-  --surface: #1e1e1e;
-  --surface-hover: #2c2c2c;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0a0;
-  --border: #333333;
-  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.6);
+  --bg-color: #120f0d;
+  --surface: rgba(31, 27, 24, 0.9);
+  --surface-hover: rgba(44, 37, 32, 0.96);
+  --text-primary: #f4eadc;
+  --text-secondary: #b9aa98;
+  --border: rgba(244, 234, 220, 0.12);
+  --accent: #f0a04b;
+  --accent-hover: #ffb96a;
+  --accent-glow: rgba(240, 160, 75, 0.18);
+  --shadow-sm: 0 8px 28px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 18px 46px rgba(0, 0, 0, 0.36);
+  --shadow-lg: 0 28px 72px rgba(0, 0, 0, 0.52);
 }
 
 body {
   margin: 0;
-  background-color: var(--bg-color);
+  background:
+    radial-gradient(circle at 8% -12%, rgba(255, 203, 126, 0.55), transparent 32vw),
+    radial-gradient(circle at 92% 4%, rgba(98, 172, 255, 0.18), transparent 28vw),
+    linear-gradient(135deg, var(--bg-color), #f8f1e9 46%, #edf4f3);
   color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   min-height: 100vh;
+}
+
+:root[data-theme="dark"] body {
+  background:
+    radial-gradient(circle at 12% -12%, rgba(148, 82, 28, 0.38), transparent 34vw),
+    radial-gradient(circle at 92% 0%, rgba(49, 101, 135, 0.22), transparent 28vw),
+    linear-gradient(135deg, var(--bg-color), #19130f 52%, #0f1716);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  opacity: 0.28;
+  background-image:
+    linear-gradient(rgba(120, 87, 52, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120, 87, 52, 0.08) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+
+body.detail-drawer-open {
+  overflow: hidden;
+  touch-action: none;
 }
 
 button, input, textarea {
@@ -88,12 +119,28 @@ button:active {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
+  backdrop-filter: var(--glass-blur);
   transition: var(--spring);
 }
 
-.account:hover, .composer:focus-within, .post:hover, .detail:hover {
+.account:hover, .composer:focus-within, .post:hover {
   box-shadow: var(--shadow-md);
   transform: translateY(-2px);
+}
+
+.detail:hover {
+  box-shadow: var(--shadow-sm);
+  transform: none;
+}
+
+@keyframes qzoneRiseIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes qzoneSoftPulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
 }
 
 .rail, .timeline, .detail {
@@ -131,6 +178,7 @@ button:active {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  background: linear-gradient(135deg, var(--surface-hover), var(--bg-color));
   transition: var(--spring);
 }
 
@@ -1032,7 +1080,7 @@ button:active {
     border-radius: 24px 24px 0 0;
     box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.1);
     transform: translateY(100%);
-    transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
     margin: 0;
     padding-bottom: env(safe-area-inset-bottom, 20px);
     border: none;
@@ -1348,4 +1396,60 @@ button:not(.primary)[aria-busy="true"]::after {
 }
 .media-preview-remove:hover {
   background: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.composer-meter {
+  margin-top: 10px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.composer-meter.warning {
+  color: var(--danger);
+}
+
+
+
+.detail {
+  scrollbar-gutter: stable both-edges;
+  will-change: contents;
+}
+
+.detail.has-selection #detailContent {
+  animation: qzoneRiseIn 0.32s ease both;
+}
+
+.detail-media {
+  contain: layout paint;
+}
+
+.detail-media.media-layout-1 img,
+.detail-media.media-layout-1 video {
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+}
+
+.detail-loading {
+  animation: qzoneSoftPulse 1.2s ease-in-out infinite;
+}
+
+.post {
+  animation: qzoneRiseIn 0.38s ease both;
+  content-visibility: auto;
+  contain-intrinsic-size: 280px;
+}
+
+.post.selected {
+  transform: translateY(-1px);
 }
