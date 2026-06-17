@@ -835,15 +835,52 @@ def post_from_entry(
     comments = extract_comments(raw or {})
     images: list[str] = []
     seen_image_keys: set[str] = set()
-    for source in (detail_raw, entry_raw, fallback):
+
+    def split_embedded_feed_raw(source: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        embedded = source.get("_feed_raw")
+        fallback_sources = [embedded] if isinstance(embedded, dict) else []
+        if "_feed_raw" not in source:
+            return source, fallback_sources
+        primary = dict(source)
+        primary.pop("_feed_raw", None)
+        return primary, fallback_sources
+
+    def append_images_from(source: dict[str, Any]) -> bool:
         if not source:
-            continue
+            return False
+        before = len(images)
         for image in _extract_image_candidates(source, fid=entry.fid, hostuin=entry.hostuin):
             key = image.key or image.url
             if key in seen_image_keys:
                 continue
             seen_image_keys.add(key)
             images.append(image.url)
+        return len(images) > before
+
+    # `_feed_raw` is a cached list snapshot used only as a media fallback.
+    # If a detail payload already has media, scanning both sources shows the
+    # same Qzone photos twice in WebUI detail cards.
+    fallback_sources: list[dict[str, Any]] = []
+    detail_source, embedded = split_embedded_feed_raw(detail_raw) if detail_raw else ({}, [])
+    fallback_sources.extend(embedded)
+    entry_source, embedded = split_embedded_feed_raw(entry_raw) if entry_raw else ({}, [])
+    fallback_sources.extend(embedded)
+    fallback_source, embedded = split_embedded_feed_raw(fallback) if fallback else ({}, [])
+    fallback_sources.extend(embedded)
+
+    append_images_from(detail_source)
+    if not images:
+        append_images_from(entry_source)
+    if not images:
+        append_images_from(fallback_source)
+    if not images:
+        seen_fallback_nodes: set[int] = set()
+        for source in fallback_sources:
+            marker = id(source)
+            if marker in seen_fallback_nodes:
+                continue
+            seen_fallback_nodes.add(marker)
+            append_images_from(source)
     nickname = (
         _clean_nickname(entry.nickname, hostuin=entry.hostuin)
         or extract_nickname(detail_raw, hostuin=entry.hostuin)
