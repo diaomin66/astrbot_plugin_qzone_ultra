@@ -6531,14 +6531,11 @@ class QzoneStablePlugin(Star):
             hostuin (number): 兼容旧参数，优先级低于 target_uin。
         """
         if not self._is_admin(event):
-            yield event.plain_result(
-                await self._ask_llm_tool_reply(
-                    event,
-                    {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
-                    self._llm_error_fallback_text("没有权限"),
-                )
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
             )
-            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -6551,10 +6548,9 @@ class QzoneStablePlugin(Star):
                 scope=effective_scope,
             )
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
-            return
+            return self._error_text(exc)
         entries = self._to_feed_entries(payload)
-        yield event.plain_result(format_llm_feed_list(entries))
+        return format_llm_feed_list(entries)
 
     @filter.llm_tool(name="qzone_detail_feed")
     async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
