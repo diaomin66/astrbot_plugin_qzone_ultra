@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hmac
 import html as html_lib
 import json
 import os
@@ -3045,7 +3046,10 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
         supplied_secret = request.headers.get(SECRET_HEADER)
-        authenticated = bool(supplied_secret and supplied_secret == service.state.runtime.secret)
+        authenticated = bool(supplied_secret) and hmac.compare_digest(
+            supplied_secret,
+            service.state.runtime.secret,
+        )
         request[AUTHENTICATED_REQUEST_KEY] = authenticated
         if (
             supplied_secret is None
