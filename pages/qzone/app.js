@@ -652,7 +652,7 @@ function mediaLayoutClass(count) {
 
 function mediaDisplaySource(item) {
   const source = typeof item === "object" && item
-    ? text(item.preview_url || item.previewUrl || item.source || item.data_url || item.url)
+    ? text(item.source || item.data_url || item.url || item.preview_url || item.previewUrl)
     : text(item);
   if (!source) return "";
   if (source.startsWith("base64://")) {
@@ -660,6 +660,32 @@ function mediaDisplaySource(item) {
     return `data:${mimeType || "image/jpeg"};base64,${source.replace("base64://", "")}`;
   }
   return source;
+}
+
+function renderRichText(target, fallback, segments, emojiClass = "qzone-emoji") {
+  const entries = Array.isArray(segments) ? segments : [];
+  if (!entries.length) {
+    target.textContent = cleanDisplayText(fallback);
+    return;
+  }
+  target.replaceChildren();
+  for (const segment of entries) {
+    if (segment?.type === "emoji" && segment.source) {
+      const image = document.createElement("img");
+      image.className = emojiClass;
+      image.src = text(segment.source);
+      image.alt = text(segment.alt || "[表情]");
+      image.loading = "lazy";
+      target.append(image);
+      continue;
+    }
+    const value = cleanDisplayText(segment?.text);
+    if (value) {
+      const span = document.createElement("span");
+      span.textContent = value;
+      target.append(span);
+    }
+  }
 }
 
 function mediaDedupeKey(source) {
@@ -715,6 +741,32 @@ function isVideoMediaItem(item, source = "") {
     if (kind === "video" || mimeType.startsWith("video/")) return true;
   }
   return isVideoSource(source || mediaDisplaySource(item));
+}
+
+function mediaKind(item, source = "") {
+  if (isVideoMediaItem(item, source)) return "video";
+  if (item && typeof item === "object") {
+    const kind = text(item.kind || item.type || item.raw_type).toLowerCase();
+    const mimeType = text(item.mime_type || item.content_type || item.mime).toLowerCase();
+    if (kind === "audio" || kind === "music" || kind === "record" || mimeType.startsWith("audio/")) return "audio";
+    if (kind === "file" || kind === "attachment") return "file";
+    if (kind === "image" || mimeType.startsWith("image/")) return "image";
+  }
+  return /\.(mp3|m4a|aac|wav|ogg|flac)(?:[?#].*)?$/i.test(source) ? "audio" : "image";
+}
+
+function mediaDownloadSource(item, source = "") {
+  if (item && typeof item === "object") {
+    return text(item.download_url || item.downloadUrl || item.original_url || item.originalUrl || source);
+  }
+  return text(source || item);
+}
+
+function mediaName(item, kind) {
+  const name = item && typeof item === "object"
+    ? text(item.name || item.filename || item.file_name || item.title).trim()
+    : "";
+  return name || ({ image: "QQ空间原图", video: "QQ空间视频", audio: "QQ空间音频", file: "QQ空间附件" }[kind] || "QQ空间文件");
 }
 
 function fileLooksLikeVideo(file) {
@@ -916,7 +968,9 @@ function renderFeed() {
 }
 
 
-function openLightbox(url) {
+function openLightbox(item) {
+  const url = mediaDisplaySource(item);
+  const kind = mediaKind(item, url);
   let lightbox = document.getElementById("lightbox");
   if (!lightbox) {
     lightbox = document.createElement("div");
@@ -928,11 +982,11 @@ function openLightbox(url) {
   
   const cleanup = () => {
     lightbox.classList.remove("visible");
-    const video = lightbox.querySelector("video");
-    if (video) {
-        video.pause();
-        video.src = "";
-        video.removeAttribute("src");
+    const playable = lightbox.querySelector("video") || lightbox.querySelector("audio");
+    if (playable) {
+        playable.pause();
+        playable.src = "";
+        playable.removeAttribute("src");
     }
     setTimeout(() => {
         lightbox.innerHTML = "";
@@ -954,8 +1008,14 @@ function openLightbox(url) {
   closeBtn.onclick = cleanup;
   
   let mediaElement;
-  if (isVideoSource(url)) {
+  if (kind === "video") {
     mediaElement = document.createElement("video");
+    mediaElement.src = url;
+    mediaElement.controls = true;
+    mediaElement.autoplay = true;
+    mediaElement.playsInline = true;
+  } else if (kind === "audio") {
+    mediaElement = document.createElement("audio");
     mediaElement.src = url;
     mediaElement.controls = true;
     mediaElement.autoplay = true;
@@ -972,40 +1032,69 @@ function openLightbox(url) {
 }
 
 function renderMediaGrid(items, className = "post-media") {
-  const entries = dedupeMediaEntries(items).slice(0, 9);
+  const entries = dedupeMediaEntries(items);
   if (!entries.length) return null;
 
   const media = document.createElement("div");
   media.className = `${className} media-grid ${mediaLayoutClass(entries.length)}`;
   for (const { item, source: url } of entries) {
-    if (isVideoMediaItem(item, url)) {
+    const kind = mediaKind(item, url);
+    const tile = document.createElement("div");
+    tile.className = `media-tile media-${kind}`;
+    if (kind === "video") {
       const video = document.createElement("video");
       video.src = url;
       video.className = "preview-video";
-      video.muted = true;
-      video.loop = true;
+      video.controls = true;
+      video.preload = "metadata";
       video.playsInline = true;
-      video.addEventListener("mouseenter", () => video.play().catch(() => {}));
-      video.addEventListener("mouseleave", () => {
-        video.pause();
-        video.currentTime = 0;
-      });
-      video.addEventListener("click", (event) => {
-        event.stopPropagation();
-        openLightbox(url);
-      });
-      media.append(video);
+      video.referrerPolicy = "no-referrer";
+      video.poster = text(item?.preview_url || item?.previewUrl);
+      tile.append(video);
+    } else if (kind === "audio") {
+      const audio = document.createElement("audio");
+      audio.src = url;
+      audio.controls = true;
+      audio.preload = "metadata";
+      tile.append(audio);
+    } else if (kind === "file") {
+      const file = document.createElement("div");
+      file.className = "file-preview";
+      file.textContent = mediaName(item, kind);
+      tile.append(file);
     } else {
       const image = document.createElement("img");
       image.loading = "lazy";
       image.alt = "说说图片";
       image.src = url;
+      image.referrerPolicy = "no-referrer";
       image.addEventListener("click", (event) => {
         event.stopPropagation();
-        openLightbox(url);
+        openLightbox(item);
       });
-      media.append(image);
+      tile.append(image);
     }
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "media-download";
+    download.textContent = "下载原文件";
+    download.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      download.disabled = true;
+      try {
+        if (item?.media_id && typeof bridge?.download === "function") {
+          await bridge.download("page/media", { id: item.media_id, download: 1 }, mediaName(item, kind));
+        } else {
+          window.open(mediaDownloadSource(item, url), "_blank", "noopener,noreferrer");
+        }
+      } catch (error) {
+        showToast(error?.message || "下载失败，请刷新后重试。", "error");
+      } finally {
+        download.disabled = false;
+      }
+    });
+    tile.append(download);
+    media.append(tile);
   }
   return media;
 }
@@ -1032,7 +1121,7 @@ function renderPostCard(post) {
   const meta = document.createElement("span");
   meta.className = "post-meta";
   const name = document.createElement("strong");
-  name.textContent = authorName;
+  renderRichText(name, authorName, post.author?.segments, "qzone-emoji nickname-emoji");
   const time = document.createElement("span");
   time.textContent = formatTime(post.created_at);
   meta.append(name, time);
@@ -1044,11 +1133,11 @@ function renderPostCard(post) {
   if (contentText) {
     const body = document.createElement("p");
     body.className = "post-content";
-    body.textContent = contentText;
+    renderRichText(body, contentText, post.content_segments);
     card.append(body);
   }
 
-  const images = renderMediaGrid(post.images, "post-media");
+  const images = renderMediaGrid(post.media?.length ? post.media : post.images, "post-media");
   if (images) {
     card.append(images);
   }
@@ -1130,7 +1219,7 @@ function renderDetail(post, options = {}) {
   const titleMeta = document.createElement("div");
   titleMeta.className = "detail-meta";
   const name = document.createElement("strong");
-  name.textContent = authorName;
+  renderRichText(name, authorName, post.author?.segments, "qzone-emoji nickname-emoji");
   const time = document.createElement("span");
   time.textContent = formatTime(post.created_at);
   titleMeta.append(name, time);
@@ -1144,11 +1233,11 @@ function renderDetail(post, options = {}) {
   if (contentText) {
     const content = document.createElement("p");
     content.className = "post-content detail-text";
-    content.textContent = contentText;
+    renderRichText(content, contentText, post.content_segments);
     el.detailContent.append(content);
   }
 
-  const detailMedia = renderMediaGrid(post.images, "detail-media");
+  const detailMedia = renderMediaGrid(post.media?.length ? post.media : post.images, "detail-media");
   if (detailMedia) {
     el.detailContent.append(detailMedia);
   }

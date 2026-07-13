@@ -58,6 +58,23 @@ def test_page_detail_logic_avoids_viewport_jump_and_reuses_cache() -> None:
     assert "scrollbar-gutter: stable" in css
 
 
+def test_page_feed_renders_normalized_media_and_source_downloads() -> None:
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+
+    assert "post.media?.length ? post.media : post.images" in app
+    assert 'kind === "video"' in app
+    assert 'kind === "audio"' in app
+    assert 'kind === "file"' in app
+    assert 'video.preload = "metadata"' in app
+    assert 'audio.preload = "metadata"' in app
+    assert "item.source || item.data_url || item.url || item.preview_url" in app
+    assert 'bridge.download("page/media"' in app
+    assert 'video.referrerPolicy = "no-referrer"' in app
+    assert 'download.textContent = "下载原文件"' in app
+    assert "renderRichText(body, contentText, post.content_segments)" in app
+    assert '"qzone-emoji nickname-emoji"' in app
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for the frontend smoke test")
 def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) -> None:
     harness = tmp_path / "qzone_page_harness.mjs"

@@ -9,16 +9,24 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from qzone_bridge import page_api as page_api_module
+from qzone_bridge import page_media as page_media_module
 from qzone_bridge.astrbot_logging import configure_standalone_logging
 from qzone_bridge.errors import DaemonUnavailableError, QzoneParseError
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
+from qzone_bridge.page_media import open_page_media_stream
 from qzone_bridge import controller as controller_module
 from qzone_bridge.daemon import QzoneDaemonService
 from qzone_bridge.models import BridgeState, FeedEntry, SessionState
 from qzone_bridge.parser import extract_feed_page
-from qzone_bridge.social import extract_images, post_from_entry
+from qzone_bridge.social import (
+    extract_images,
+    extract_post_media,
+    post_from_entry,
+    qzone_rich_text_segments,
+)
 from qzone_bridge.storage import StateStore
 
 
@@ -1161,6 +1169,243 @@ def test_qzone_photo_prefers_unscaled_big_image_url() -> None:
     post = post_from_entry(entry)
 
     assert post.images == [big]
+
+
+@pytest.mark.parametrize(
+    "emoticon",
+    [
+        "https://qzonestyle.gtimg.cn/qzone/em/e178.gif",
+        "https://qzonestyle.gtimg.cn/aoi/img/qz_em/xmp-1.png",
+        "https://qzonestyle.gtimg.cn/club/item/parcel/1/emoji.gif",
+        "https://imgcache.qq.com/club/item/parcel/item/1/sticker.png",
+    ],
+)
+def test_qzone_emoticons_in_content_and_liker_names_are_not_post_images(emoticon: str) -> None:
+    payload = {
+        "hostuin": 10001,
+        "fid": "emoji-feed",
+        "html": (
+            f'<div class="f-info">正文<img src="{emoticon}"></div>'
+            f'<div class="f-like-list">好友<img src="{emoticon}">觉得很赞</div>'
+        ),
+        "like": [{"name": f'好友<img src="{emoticon}">'}],
+    }
+
+    assert extract_images(payload, fid="emoji-feed", hostuin=10001) == []
+    assert extract_post_media(payload, fid="emoji-feed", hostuin=10001) == []
+
+
+def test_liker_emoticon_does_not_replace_post_content_segments() -> None:
+    emoticon = "https://qzonestyle.gtimg.cn/qzone/em/e178.gif"
+    entry = FeedEntry(
+        hostuin=10001,
+        fid="liker-emoji-feed",
+        appid=311,
+        summary="正常正文",
+        nickname="作者",
+        raw={
+            "html": (
+                '<div class="f-info">正常正文</div>'
+                f'<div class="f-like-list">好友<img src="{emoticon}">觉得很赞</div>'
+            ),
+        },
+    )
+
+    post = post_from_entry(entry)
+
+    assert post.summary == "正常正文"
+    assert post.content_segments == []
+
+
+def test_qzone_video_media_prefers_online_play_url_and_keeps_cover() -> None:
+    cover = "https://photo.store.qq.com/psc?/cover/token/b&bo=1"
+    play_url = "https://photovideo.photo.qq.com/1074_video.f20.mp4?dis_t=1"
+    payload = {
+        "hostuin": 10001,
+        "fid": "video-feed",
+        "pic": [
+            {
+                "is_video": 1,
+                "url3": cover,
+                "video_info": {
+                    "url1": cover,
+                    "url3": play_url,
+                    "video_id": "1074_video",
+                    "video_time": 14000,
+                },
+            }
+        ],
+    }
+
+    media = extract_post_media(payload, fid="video-feed", hostuin=10001)
+
+    assert media == [
+        {
+            "kind": "video",
+            "source": play_url,
+            "download_url": play_url,
+            "preview_url": cover,
+            "name": "1074_video.mp4",
+            "mime_type": "video/mp4",
+            "duration_ms": 14000,
+        }
+    ]
+
+
+def test_qzone_audio_and_generic_file_attachments_are_normalized() -> None:
+    payload = {
+        "hostuin": 10001,
+        "fid": "attachment-feed",
+        "attachments": [
+            {
+                "type": "audio",
+                "name": "voice.mp3",
+                "play_url": "https://qzone.example.test/voice.mp3",
+            },
+            {
+                "type": "file",
+                "file_name": "document.pdf",
+                "download_url": "https://qzone.example.test/document.pdf",
+                "file_size": 2048,
+            },
+        ],
+    }
+
+    assert extract_post_media(payload, fid="attachment-feed", hostuin=10001) == [
+        {
+            "kind": "audio",
+            "source": "https://qzone.example.test/voice.mp3",
+            "download_url": "https://qzone.example.test/voice.mp3",
+            "name": "voice.mp3",
+            "mime_type": "audio/mpeg",
+        },
+        {
+            "kind": "file",
+            "source": "https://qzone.example.test/document.pdf",
+            "download_url": "https://qzone.example.test/document.pdf",
+            "name": "document.pdf",
+            "mime_type": "application/pdf",
+            "size": 2048,
+        },
+    ]
+
+
+def test_qzone_unknown_attachment_type_uses_generic_file_fallback() -> None:
+    source = "https://qzone.example.test/resource.bin?token=1"
+
+    media = extract_post_media(
+        {
+            "hostuin": 10001,
+            "fid": "unknown-attachment-feed",
+            "attachments": [{"type": "future_qzone_type", "name": "resource.bin", "url": source}],
+        },
+        fid="unknown-attachment-feed",
+        hostuin=10001,
+    )
+
+    assert media == [{
+        "kind": "file",
+        "source": source,
+        "download_url": source,
+        "name": "resource.bin",
+        "mime_type": "application/octet-stream",
+    }]
+
+
+def test_qzone_rich_text_keeps_official_emoticons_inline() -> None:
+    segments = qzone_rich_text_segments(
+        '你好[em]e178[/em]<img src="//qzonestyle.gtimg.cn/aoi/img/qz_em/xmp-1.png" title="开心">'
+    )
+
+    assert segments == [
+        {"type": "text", "text": "你好"},
+        {
+            "type": "emoji",
+            "source": "https://qzonestyle.gtimg.cn/qzone/em/e178.gif",
+            "alt": "[表情178]",
+        },
+        {
+            "type": "emoji",
+            "source": "https://qzonestyle.gtimg.cn/aoi/img/qz_em/xmp-1.png",
+            "alt": "开心",
+        },
+    ]
+
+
+def test_page_media_proxy_forwards_range_and_forces_download(monkeypatch) -> None:
+    seen_headers = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.update(request.headers)
+        return httpx.Response(
+            206,
+            headers={
+                "content-type": "video/mp4",
+                "content-range": "bytes 0-3/8",
+                "content-length": "4",
+                "accept-ranges": "bytes",
+            },
+            content=b"test",
+            request=request,
+        )
+
+    async def scenario():
+        monkeypatch.setattr(page_media_module, "is_remote_media_url_allowed", lambda _value: True)
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        stream, status, headers = await open_page_media_stream(
+            {
+                "source": "https://photo.qq.com/video.mp4",
+                "name": "视频.mp4",
+                "mime_type": "video/mp4",
+            },
+            range_header="bytes=0-3",
+            download=True,
+            client=client,
+        )
+        body = b"".join([chunk async for chunk in stream])
+        await client.aclose()
+        return body, status, headers
+
+    body, status, headers = asyncio.run(scenario())
+
+    assert seen_headers["range"] == "bytes=0-3"
+    assert status == 206
+    assert body == b"test"
+    assert headers["Content-Range"] == "bytes 0-3/8"
+    assert headers["Content-Disposition"].startswith("attachment;")
+    assert "filename*=UTF-8''" in headers["Content-Disposition"]
+
+
+def test_page_feed_exposes_normalized_media_without_losing_legacy_images() -> None:
+    class _MediaController(_Controller):
+        async def list_feeds(self, **kwargs):
+            payload = await super().list_feeds(**kwargs)
+            payload["items"][0]["raw"] = {
+                "hostuin": 20002,
+                "fid": "fid-secret",
+                "pic": [{
+                    "is_video": 1,
+                    "url3": "https://photo.store.qq.com/cover.jpg",
+                    "video_info": {
+                        "url3": "https://photovideo.photo.qq.com/clip.mp4",
+                        "video_id": "clip",
+                    },
+                }],
+                "attachments": [{
+                    "type": "file",
+                    "name": "archive.zip",
+                    "download_url": "https://qzone.example.test/archive.zip",
+                }],
+            }
+            return payload
+
+    post = asyncio.run(_api(_MediaController()).feed({}))["data"]["items"][0]
+
+    assert [item["kind"] for item in post["media"]] == ["video", "file"]
+    assert post["media"][0]["source"] == "https://photovideo.photo.qq.com/clip.mp4"
+    assert post["media"][0]["preview_url"] == "https://photo.store.qq.com/cover.jpg"
+    assert post["media"][0]["media_id"].startswith("media_")
+    assert post["images"] == []
 
 
 def test_daemon_active_feed_legacy_recent_array_fallback_not_empty(tmp_path) -> None:
