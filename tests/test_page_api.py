@@ -29,6 +29,7 @@ class _Controller:
         self.liked = None
         self.commented = None
         self.detail_requested = None
+        self.detail_request_count = 0
         self.list_record_recent_values = []
         self.status_probe_values = []
         self.status = {
@@ -72,6 +73,7 @@ class _Controller:
         }
 
     async def detail_feed(self, *, hostuin, fid, appid=311, busi_param=""):
+        self.detail_request_count += 1
         self.detail_requested = {
             "hostuin": hostuin,
             "fid": fid,
@@ -264,6 +266,20 @@ def test_page_detail_reuses_feed_busi_param() -> None:
     asyncio.run(api.detail({"id": post_id}))
 
     assert controller.detail_requested["busi_param"] == '{"private":"secret"}'
+
+
+def test_page_detail_reuses_short_lived_backend_cache() -> None:
+    controller = _Controller()
+    api = _api(controller)
+    feed_payload = asyncio.run(api.feed({}))
+    post_id = feed_payload["data"]["items"][0]["id"]
+
+    first = asyncio.run(api.detail({"id": post_id}))
+    second = asyncio.run(api.detail({"id": post_id}))
+
+    assert first["data"]["post"]["content"] == "detail text"
+    assert second["data"]["post"]["content"] == "detail text"
+    assert controller.detail_request_count == 1
 
 
 def test_page_detail_returns_cached_post_when_daemon_detail_times_out(monkeypatch) -> None:

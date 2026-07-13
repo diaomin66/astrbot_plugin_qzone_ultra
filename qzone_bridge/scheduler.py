@@ -20,9 +20,7 @@ def cron_delay_seconds(
         return 0.0
     offset = int(offset_seconds or 0)
     if offset > 0:
-        target += timedelta(seconds=randint(-offset, offset))
-        if target <= current:
-            target = current + timedelta(seconds=1)
+        target += timedelta(seconds=randint(0, offset))
     return max(1.0, (target - current).total_seconds())
 
 

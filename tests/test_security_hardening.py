@@ -9160,6 +9160,72 @@ def test_post_from_entry_deduplicates_real_msglist_detail_photo() -> None:
     assert post.images == ["https://qzone.example.test/photo-a-large.jpg"]
 
 
+def test_post_from_entry_does_not_duplicate_cached_feed_images_when_detail_has_media() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    first = "https://qzone.example.test/photo-a-large.jpg"
+    second = "https://qzone.example.test/photo-b-large.jpg"
+    raw = {
+        "tid": "fid-photo",
+        "pic": [
+            {
+                "pic_id": ",album-a,photo-a",
+                "url3": first,
+            },
+            {
+                "pic_id": ",album-a,photo-b",
+                "url3": second,
+            },
+        ],
+        "_feed_raw": {
+            "html": f'<div><img src="{first}"><img src="{second}"></div>',
+        },
+    }
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-photo",
+        appid=311,
+        summary="photo",
+        raw=raw,
+    )
+
+    post = post_from_entry(entry, detail=raw, local_id=1)
+
+    assert post.images == [first, second]
+
+
+def test_post_from_entry_deduplicates_qzone_psc_url_variants_inside_detail() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import extract_images, post_from_entry
+
+    list_variant = "http://photo.store.qq.com/psc?/V50/token/photo-a/m&bo=old&w=120&h=160"
+    detail_variant = "https://m.qpic.cn/psc?/V50/token/photo-a/b&bo=new"
+    payload = {
+        "tid": "fid-photo",
+        "hostuin": 12345,
+        "pic": [
+            {
+                "pic_id": list_variant,
+                "url3": detail_variant,
+            }
+        ],
+        "html": f'<div><img src="{list_variant}"></div>',
+    }
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-photo",
+        appid=311,
+        summary="photo",
+        raw=payload,
+    )
+
+    post = post_from_entry(entry, detail=payload, local_id=1)
+
+    assert extract_images(payload, fid="fid-photo", hostuin=12345) == [detail_variant]
+    assert post.images == [detail_variant]
+
+
 def test_extract_images_keeps_current_photo_when_photo_has_storage_key() -> None:
     from qzone_bridge.social import extract_images
 

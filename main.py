@@ -4694,8 +4694,9 @@ class QzoneStablePlugin(Star):
         try:
             status = await self.controller.get_status(probe_daemon=False)
             login_uin = int(status.get("login_uin") or 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("qzone auto-comment: status probe failed, cannot determine login_uin: %s", exc)
+            return
         commented = 0
         skipped_self = 0
         skipped_duplicate = 0
@@ -6152,8 +6153,13 @@ class QzoneStablePlugin(Star):
         self._schedule_daemon_warmup("manual bind")
         try:
             payload = await self._status_with_recovery()
-        except QzoneBridgeError:
-            pass
+        except QzoneBridgeError as exc:
+            logger.warning("qzone bind: status refresh after bind failed: %s", exc)
+            yield self._command_result(
+                event,
+                f"Cookie 已绑定，但状态刷新失败：{self._error_text(exc)}\n可稍后用 /qzone status 重新查询。",
+            )
+            return
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("autobind")
@@ -6172,8 +6178,13 @@ class QzoneStablePlugin(Star):
         self._schedule_daemon_warmup("autobind")
         try:
             payload = await self._status_with_recovery()
-        except QzoneBridgeError:
-            pass
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autobind: status refresh after bind failed: %s", exc)
+            yield self._command_result(
+                event,
+                f"Cookie 已绑定，但状态刷新失败：{self._error_text(exc)}\n可稍后用 /qzone status 重新查询。",
+            )
+            return
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("videoauth")
@@ -6502,14 +6513,12 @@ class QzoneStablePlugin(Star):
             当前状态摘要。
         """
         if not self._is_admin(event):
-            yield event.plain_result("只有管理员可以查看 QQ 空间状态。")
-            return
+            return "只有管理员可以查看 QQ 空间状态。"
         try:
             payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
-            return
-        yield event.plain_result(format_status(payload))
+            return self._error_text(exc)
+        return format_status(payload)
 
     @filter.llm_tool(name="qzone_list_feed")
     async def tool_list_feed(
@@ -6531,14 +6540,11 @@ class QzoneStablePlugin(Star):
             hostuin (number): 兼容旧参数，优先级低于 target_uin。
         """
         if not self._is_admin(event):
-            yield event.plain_result(
-                await self._ask_llm_tool_reply(
-                    event,
-                    {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
-                    self._llm_error_fallback_text("没有权限"),
-                )
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
             )
-            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -6551,10 +6557,9 @@ class QzoneStablePlugin(Star):
                 scope=effective_scope,
             )
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
-            return
+            return self._error_text(exc)
         entries = self._to_feed_entries(payload)
-        yield event.plain_result(format_llm_feed_list(entries))
+        return format_llm_feed_list(entries)
 
     @filter.llm_tool(name="qzone_detail_feed")
     async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
@@ -6566,22 +6571,18 @@ class QzoneStablePlugin(Star):
             appid (number): 应用 id，默认 311。
         """
         if not self._is_admin(event):
-            yield event.plain_result(
-                await self._ask_llm_tool_reply(
-                    event,
-                    {"ok": False, "tool": "qzone_detail_feed", "public_reason": "没有权限"},
-                    self._llm_error_fallback_text("没有权限"),
-                )
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_detail_feed", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
             )
-            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
-            return
-        yield event.plain_result(self._render_detail(payload))
+            return self._error_text(exc)
+        return self._render_detail(payload)
 
     @filter.llm_tool(name="qzone_view_post")
     async def tool_view_post(
@@ -6605,14 +6606,11 @@ class QzoneStablePlugin(Star):
             appid (number): 兼容旧参数。
         """
         if not self._is_admin(event):
-            yield event.plain_result(
-                await self._ask_llm_tool_reply(
-                    event,
-                    {"ok": False, "tool": "qzone_view_post", "public_reason": "没有权限"},
-                    self._llm_error_fallback_text("没有权限"),
-                )
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_view_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
             )
-            return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -6639,8 +6637,7 @@ class QzoneStablePlugin(Star):
                         payload,
                         self._llm_error_fallback_text("没有权限"),
                     )
-                    yield event.plain_result(text)
-                    return
+                    return text
                 if not posts:
                     raise QzoneBridgeError("没有找到可操作的说说")
                 if wants_comment:
@@ -6660,8 +6657,7 @@ class QzoneStablePlugin(Star):
                     }
                     self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
                     text = await self._ask_llm_tool_reply(event, payload, "评论发好了。")
-                    yield event.plain_result(text)
-                    return
+                    return text
                 like_payloads = [await self._post_service().like_post(post) for post in posts]
                 payload = {
                     "ok": True,
@@ -6674,19 +6670,17 @@ class QzoneStablePlugin(Star):
                 }
                 self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
                 text = await self._ask_llm_tool_reply(event, self._llm_like_payload(payload["result"]), "点好了。")
-                yield event.plain_result(text)
-                return
+                return text
         except QzoneBridgeError as exc:
             text = await self._ask_llm_tool_reply(
                 event,
                 self._llm_error_payload("qzone_view_post", exc),
                 self._llm_error_fallback_text(exc.message),
             )
-            yield event.plain_result(text)
-            return
+            return text
         fallback = self._format_posts(posts, detail=detail)
         text = await self._ask_llm_view_reply(event, posts, detail=detail, fallback=fallback)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="qzone_publish_post")
     async def tool_publish_post(
@@ -6708,8 +6702,7 @@ class QzoneStablePlugin(Star):
                 {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
                 self._llm_error_fallback_text("没有权限"),
             )
-            yield event.plain_result(text)
-            return
+            return text
         post = await self._collect_target_post_payload(
             event,
             content,
@@ -6726,8 +6719,7 @@ class QzoneStablePlugin(Star):
                 self._llm_error_payload("qzone_publish_post", exc),
                 self._llm_error_fallback_text(exc.message),
             )
-            yield event.plain_result(text)
-            return
+            return text
         log_payload = {
             "ok": True,
             "tool": "qzone_publish_post",
@@ -6744,7 +6736,7 @@ class QzoneStablePlugin(Star):
             },
             "发好了。",
         )
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="qzone_comment_post")
     async def tool_comment_post(
@@ -6798,8 +6790,7 @@ class QzoneStablePlugin(Star):
                 payload,
                 self._llm_error_fallback_text("没有权限"),
             )
-            yield event.plain_result(text)
-            return
+            return text
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -6834,8 +6825,7 @@ class QzoneStablePlugin(Star):
                 self._llm_error_payload("qzone_comment_post", exc),
                 self._llm_error_fallback_text(exc.message),
             )
-            yield event.plain_result(text)
-            return
+            return text
         log_payload = {"ok": True, "tool": "qzone_comment_post", "arguments": arguments, "result": results}
         self._log_tool_call_result(log_payload)
         text = await self._ask_llm_tool_reply(
@@ -6843,7 +6833,7 @@ class QzoneStablePlugin(Star):
             {"ok": True, "tool": "qzone_comment_post", "result": {"message": "评论发好了。", "count": len(results)}},
             "评论发好了。",
         )
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="qzone_delete_post")
     async def tool_delete_post(
@@ -6885,8 +6875,7 @@ class QzoneStablePlugin(Star):
                 payload,
                 self._llm_error_fallback_text("没有权限"),
             )
-            yield event.plain_result(text)
-            return
+            return text
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -6924,8 +6913,7 @@ class QzoneStablePlugin(Star):
                 self._llm_error_payload("qzone_delete_post", exc),
                 self._llm_error_fallback_text(exc.message),
             )
-            yield event.plain_result(text)
-            return
+            return text
 
         count = len(results)
         first_post = results[0].get("post") if results else {}
@@ -6947,7 +6935,7 @@ class QzoneStablePlugin(Star):
             llm_payload,
             f"「{summary}」删好了。" if summary else "删好了。",
         )
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="qzone_like_post")
     async def tool_like_post(
@@ -7005,8 +6993,7 @@ class QzoneStablePlugin(Star):
                 llm_payload,
                 self._llm_error_fallback_text("没有权限"),
             )
-            yield event.plain_result(text)
-            return
+            return text
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
@@ -7049,8 +7036,7 @@ class QzoneStablePlugin(Star):
                 llm_payload,
                 self._llm_error_fallback_text(exc.message),
             )
-            yield event.plain_result(text)
-            return
+            return text
         self._log_tool_call_result(
             {
                 "ok": True,
@@ -7064,7 +7050,7 @@ class QzoneStablePlugin(Star):
             self._llm_like_payload(payload),
             self._like_fallback_text(payload),
         )
-        yield event.plain_result(text)
+        return text
 
     async def terminate(self):
         for task in self._scheduled_tasks:
