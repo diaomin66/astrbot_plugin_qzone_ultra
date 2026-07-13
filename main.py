@@ -28,9 +28,11 @@ from astrbot.api.star import Context, Star
 try:
     from quart import jsonify as _quart_jsonify
     from quart import request as _quart_request
+    from quart import Response as _quart_response_class
 except Exception:
     _quart_jsonify = None
     _quart_request = None
+    _quart_response_class = None
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
@@ -761,6 +763,7 @@ from qzone_bridge.onebot_cookie import (
 )
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
+from qzone_bridge.page_media import open_page_media_stream
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
 from qzone_bridge.video import materialize_video_covers, materialize_video_sources
@@ -1135,6 +1138,7 @@ class QzoneStablePlugin(Star):
             ("page/reply", self.page_reply, ["POST"], "Qzone Page reply"),
             ("page/delete", self.page_delete, ["POST"], "Qzone Page delete"),
             ("page/upload-media", self.page_upload_media, ["POST"], "Qzone Page upload media"),
+            ("page/media", self.page_media, ["GET"], "Qzone Page media stream"),
         )
         for endpoint, handler, methods, description in routes:
             path = f"/{self.plugin_name}/{endpoint}"
@@ -1250,6 +1254,29 @@ class QzoneStablePlugin(Star):
             )
 
         return await self._page_json(handle_upload)
+
+    async def page_media(self):
+        try:
+            params = await self._page_query_params()
+            media = self.page_api.page_media_ref(params.get("id") or params.get("media_id"))
+            request = _quart_request
+            headers = getattr(request, "headers", {}) if request is not None else {}
+            range_header = str(headers.get("Range") or headers.get("range") or "")
+            download = str(params.get("download") or "").strip().lower() in {"1", "true", "yes"}
+            body, status, response_headers = await open_page_media_stream(
+                media,
+                range_header=range_header,
+                download=download,
+            )
+            if _quart_response_class is None:
+                return body, status, response_headers
+            return _quart_response_class(body, status=status, headers=response_headers)
+        except Exception as exc:
+            payload, status = page_error_payload(exc)
+            return json.dumps(payload, ensure_ascii=False), status, {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+            }
 
     def _llm_adapter(self) -> QzoneLLM:
         self.llm.context = getattr(self, "_context", None) or getattr(self, "context", None)

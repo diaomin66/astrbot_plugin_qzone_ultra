@@ -149,6 +149,8 @@ class QzonePageApi:
         self._feed_seen_refs: dict[tuple[str, int], set[tuple[int, str, int]]] = {}
         self._feed_emitted_cursors: dict[tuple[str, int], set[str]] = {}
         self._uploaded_media_by_id: dict[str, dict[str, Any]] = {}
+        self._page_media_by_id: dict[str, dict[str, Any]] = {}
+        self._page_media_ids_by_source: dict[str, str] = {}
         self._detail_cache: dict[tuple[int, str, int, str], tuple[float, dict[str, Any]]] = {}
         self._detail_inflight: dict[tuple[int, str, int, str], asyncio.Task[dict[str, Any]]] = {}
 
@@ -408,6 +410,7 @@ class QzonePageApi:
         ref_entry: FeedEntry | None = None,
     ) -> dict[str, Any]:
         author = {
+            "segments": list(post.nickname_segments),
             "uin": post.hostuin,
             "nickname": post.nickname or "QQ空间用户",
         }
@@ -418,6 +421,7 @@ class QzonePageApi:
             login_avatar = str(login_author.get("avatar") or "").strip()
             if login_avatar:
                 author["avatar"] = login_avatar
+        page_media = [self._page_post_media_item(item) for item in post.media if isinstance(item, dict)]
         payload = {
             "id": self._post_ref_id(
                 post.hostuin,
@@ -430,6 +434,7 @@ class QzonePageApi:
             ),
             "local_id": post.local_id,
             "author": author,
+            "content_segments": list(post.content_segments),
             "content": post.summary,
             "created_at": post.created_at,
             "appid": post.appid,
@@ -439,6 +444,7 @@ class QzonePageApi:
             },
             "liked": bool(post.liked),
             "images": dedupe_image_sources(post.images)[:9],
+            "media": page_media,
             "can_comment": bool(post.fid and post.hostuin),
             "can_like": bool(post.fid and post.hostuin),
             "can_delete": bool(login_uin and post.hostuin == login_uin),
@@ -449,6 +455,28 @@ class QzonePageApi:
                 for index, comment in enumerate(post.comments, start=1)
             ]
         return payload
+
+    def _page_post_media_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(item)
+        source = str(payload.get("download_url") or payload.get("source") or "").strip()
+        if not source:
+            return payload
+        media_id = self._page_media_ids_by_source.get(source)
+        if not media_id:
+            media_id = "media_" + secrets.token_urlsafe(18)
+            self._page_media_ids_by_source[source] = media_id
+        stored = dict(payload)
+        stored["source"] = source
+        self._page_media_by_id[media_id] = stored
+        payload["media_id"] = media_id
+        return payload
+
+    def page_media_ref(self, value: Any) -> dict[str, Any]:
+        media_id = str(value or "").strip()
+        media = self._page_media_by_id.get(media_id)
+        if media is None:
+            raise QzoneParseError("媒体引用已过期，请刷新说说后重试。")
+        return dict(media)
 
     async def status(self) -> dict[str, Any]:
         self._schedule_preload("page status")

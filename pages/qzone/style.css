@@ -496,6 +496,20 @@ button:active {
   color: var(--text-primary);
 }
 
+.qzone-emoji {
+  width: 1.35em;
+  height: 1.35em;
+  margin: 0 0.08em;
+  vertical-align: -0.28em;
+  object-fit: contain;
+}
+
+.nickname-emoji {
+  width: 1.1em;
+  height: 1.1em;
+  vertical-align: -0.2em;
+}
+
 .post-actions {
   display: grid;
   grid-template-columns: max-content max-content minmax(96px, 1fr);
@@ -654,6 +668,44 @@ button:active {
 
 .preview-video {
   background: #000;
+}
+
+.media-tile {
+  position: relative;
+  min-width: 0;
+}
+
+.media-tile audio {
+  width: 100%;
+}
+
+.media-audio,
+.media-file {
+  grid-column: 1 / -1;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.file-preview {
+  min-height: 44px;
+  padding-right: 110px;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.media-download {
+  display: inline-flex;
+  margin-top: 8px;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.media-download:hover {
+  text-decoration: underline;
 }
 
 /* Post stats */

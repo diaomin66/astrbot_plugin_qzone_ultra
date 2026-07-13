@@ -86,3 +86,37 @@
 - `CHANGELOG.md`：新增 v0.8.2 更新记录。
 - `progress.md`：新增各 issue 与发布任务记录。
 - 回滚方式：回退本任务对应提交，或将上述版本字段恢复为 0.8.1 并删除 v0.8.2 日志条目。
+
+## 2026-07-13 - Task: 修复 QQ 空间 Page 媒体读取、播放与原文件下载
+### What was done
+- 规范化说说正文、昵称表情及图片、视频、音频、普通附件的读取结果，避免 QQ 表情和点赞人表情污染图片与正文。
+- 视频预览固定使用 QQ 原视频源，封面仅作 poster；下载通过 AstrBot Bridge 与后端流式响应输出原始文件。
+- 修复下载路由直接返回异步迭代器三元组造成的 HTTP 500，改为 Quart 流式 Response，并保留 Range、MIME、长度及附件文件名。
+- 更新媒体使用文档、问题记录、版本号与更新日志，并同步至指定本地 AstrBot 插件目录。
+### Testing
+- `python -m pytest tests\test_page_api.py tests\test_qzone_page_frontend.py -q -p no:cacheprovider`：65 passed。
+- `node --check pages\qzone\app.js`、`python -m ruff check .`、`python -m compileall -q main.py daemon_main.py qzone_bridge tests`、`git diff --check`：全部通过。
+- 真实 QQ 视频：HTTP Range 返回 206，H.264 High + AAC LC；Edge Headless 达到 `readyState=4`、无媒体错误。
+- 真实 AstrBot Bridge：`page/status`、`page/feed` 返回 200；`page/media` 返回原始图片字节、正确 MIME 与 `Content-Disposition: attachment`，未再出现 500。
+- 全量测试首次执行超过 240 秒工具时限，因此以受影响的 65 项定向回归和静态检查作为本轮可信验证；未将超时表述为通过。
+### Notes
+- `main.py`：注册媒体路由并使用 Quart 流式 Response 返回原文件。
+- `qzone_bridge/page_media.py`：新增安全、支持 Range 的远程媒体流。
+- `qzone_bridge/page_api.py`：注册脱敏媒体引用并输出统一媒体对象。
+- `qzone_bridge/social.py`：规范提取表情与多类型媒体。
+- `pages/qzone/app.js`：安全渲染表情、多类型预览及 Bridge 下载。
+- `pages/qzone/style.css`：增加媒体和附件展示样式。
+- `tests/test_page_api.py`、`tests/test_qzone_page_frontend.py`：增加媒体、表情、下载及前端回归。
+- `docs/qzone-pages-media.md`、`docs/qzone-pages-issue-log.md`：记录媒体能力、限制及本次根因。
+- `metadata.yaml`、`qzone_bridge/__init__.py`、`qzone_bridge/models.py`、`CHANGELOG.md`：更新为 0.9.0 并记录变更。
+- `progress.md`：追加本任务实施和验证证据。
+- 回滚方式：回退本任务对应提交；本地 AstrBot 可从 `core\data\plugin_backups\astrbot_plugin_qzone_ultra_media_proxy_20260713_095208` 恢复后重启。
+
+## 2026-07-13 - Task: QQ 空间 Page 媒体修复最终全量复核
+### What was done
+- 在定向回归与真实环境验证之后，再执行一次不受前次工具时限影响的完整测试集。
+### Testing
+- `python -m pytest tests -q -p no:cacheprovider`：454 passed，耗时 157.36 秒。
+### Notes
+- `progress.md`：追加最终全量测试结果；前一条中的“首次执行超过工具时限”保留为真实历史记录。
+- 回滚方式：删除本条追加记录；代码回滚仍使用上一任务记录中的提交或本地插件备份。

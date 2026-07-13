@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 from dataclasses import asdict, dataclass, field
 from html import unescape
@@ -255,6 +256,8 @@ def normalize_image_source(value: Any) -> str:
         return ""
     host = parsed.netloc.lower()
     path = parsed.path.lower()
+    if is_qzone_emoticon_source(source):
+        return ""
     if "qlogo" in host or host in {"thirdqq.qlogo.cn", "q.qlogo.cn"}:
         return ""
     if "/headimg" in path or "/headimg_dl" in path:
@@ -265,6 +268,79 @@ def normalize_image_source(value: Any) -> str:
     source = re.sub(r"([?&])(?:w|h)=\d+(?=&|$)", "", source)
     source = source.replace("?&", "?").rstrip("?&")
     return source
+
+
+def is_qzone_emoticon_source(value: Any) -> bool:
+    source = unescape(str(value or "")).strip().strip("\"'").replace("\\/", "/")
+    if source.startswith("//"):
+        source = f"https:{source}"
+    parsed = urlparse(source)
+    host = str(parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    return bool(
+        (
+            host in {"qzonestyle.gtimg.cn", "qzs.qq.com", "i.gtimg.cn"}
+            and (
+                re.search(r"/(?:qzone/)?(?:em|emotion|emoticon)(?:/|_|-)", path)
+                or path.startswith("/aoi/img/qz_em/")
+                or path.startswith("/club/item/parcel/")
+            )
+        )
+        or (host == "imgcache.qq.com" and path.startswith("/club/item/parcel/item/"))
+    )
+
+
+def qzone_rich_text_segments(value: Any) -> list[dict[str, str]]:
+    raw = unescape(str(value or "")).replace("\\/", "/")
+    if not raw:
+        return []
+    matches: list[tuple[int, int, dict[str, str]]] = []
+    for match in QZONE_EM_CODE_RE.finditer(raw):
+        code = match.group("code")
+        matches.append((
+            match.start(),
+            match.end(),
+            {
+                "type": "emoji",
+                "source": f"https://qzonestyle.gtimg.cn/qzone/em/e{code}.gif",
+                "alt": f"[表情{code}]",
+            },
+        ))
+    for match in IMG_TAG_RE.finditer(raw):
+        tag = match.group(0)
+        source = ""
+        for attr in IMG_SOURCE_ATTR_RE.finditer(tag):
+            if str(attr.group("name") or "").lower() == "src":
+                source = attr.group(3) or attr.group(4) or ""
+                break
+        if not is_qzone_emoticon_source(source):
+            continue
+        alt_match = IMG_ALT_ATTR_RE.search(tag)
+        alt = (alt_match.group(2) or alt_match.group(3) or "[表情]") if alt_match else "[表情]"
+        if source.startswith("//"):
+            source = f"https:{source}"
+        matches.append((
+            match.start(),
+            match.end(),
+            {"type": "emoji", "source": source, "alt": clean_qzone_text(alt)},
+        ))
+    if not matches:
+        return []
+    matches.sort(key=lambda item: (item[0], item[1]))
+    segments: list[dict[str, str]] = []
+    cursor = 0
+    for start, end, emoji in matches:
+        if start < cursor:
+            continue
+        text = clean_qzone_text(raw[cursor:start])
+        if text:
+            segments.append({"type": "text", "text": text})
+        segments.append(emoji)
+        cursor = end
+    tail = clean_qzone_text(raw[cursor:])
+    if tail:
+        segments.append({"type": "text", "text": tail})
+    return segments
 
 
 def _normalized_qzone_psc_payload(value: str) -> str:
@@ -500,6 +576,9 @@ class QzonePost:
     comment_count: int = 0
     liked: bool = False
     images: list[str] = field(default_factory=list)
+    media: list[dict[str, Any]] = field(default_factory=list)
+    content_segments: list[dict[str, str]] = field(default_factory=list)
+    nickname_segments: list[dict[str, str]] = field(default_factory=list)
     comments: list[QzoneComment] = field(default_factory=list)
     busi_param: dict[str, Any] = field(default_factory=dict)
     local_id: int = 0
@@ -703,12 +782,24 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
         )
 
     def add_mapping_image(value: dict[str, Any]) -> bool:
+        if _to_int(value.get("is_video") or value.get("isVideo")) or isinstance(value.get("video_info"), dict):
+            return False
         source = best_mapping_image_source(value)
         if not source:
             return False
         identity = photo_identity(value) if looks_like_qzone_photo(value) else ""
         add(source, identity=identity)
         return bool(identity)
+
+    def is_non_image_attachment(value: dict[str, Any]) -> bool:
+        kind = str(value.get("kind") or value.get("type") or value.get("media_type") or "").lower()
+        mime = str(value.get("mime_type") or value.get("content_type") or value.get("mime") or "").lower()
+        return (
+            kind in {"video", "movie", "audio", "music", "record", "voice", "file", "attachment"}
+            or (bool(kind) and kind not in {"image", "photo", "picture", "pic"})
+            or mime.startswith(("video/", "audio/", "application/"))
+            or _to_int(value.get("is_video") or value.get("isVideo")) > 0
+        )
 
     def normalize_feed_id(value: Any) -> str:
         text = str(value or "").strip()
@@ -816,6 +907,8 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
         seen_nodes.add(marker)
         if not belongs_to_target(value):
             return
+        if is_non_image_attachment(value):
+            return
         if add_mapping_image(value) and looks_like_qzone_photo(value):
             return
         for key in IMAGE_HTML_KEYS:
@@ -840,6 +933,7 @@ def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin
                 | set(IMAGE_HTML_KEYS)
                 | set(IMAGE_CONTAINER_KEYS)
                 | set(IMAGE_NESTED_CONTAINER_KEYS)
+                | {"video_info", "videoInfo"}
             )
             for key, child in value.items():
                 if key in handled:
@@ -861,6 +955,143 @@ def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) 
     return [item.url for item in _extract_image_candidates(payload, fid=fid, hostuin=hostuin)]
 
 
+_MEDIA_SOURCE_KEYS = (
+    "download_url", "downloadUrl", "play_url", "playUrl", "video_url", "videoUrl",
+    "audio_url", "audioUrl", "media_url", "mediaUrl", "file_url", "fileUrl",
+    "origin_url", "originUrl", "original_url", "originalUrl", "source", "url3", "url2", "url1", "url",
+)
+IMG_ALT_ATTR_RE = re.compile(
+    r"""\b(?:alt|title)\s*=\s*(?:(["'])(.*?)\1|([^\s"'<>`]+))""",
+    re.I | re.S,
+)
+QZONE_EM_CODE_RE = re.compile(r"\[em\]e(?P<code>\d+)\[/em\]", re.I)
+_MEDIA_NAME_KEYS = ("name", "filename", "file_name", "fileName", "title")
+_ATTACHMENT_CONTAINER_KEYS = (
+    "attachments", "attachment", "files", "file_list", "fileList", "audio", "audios",
+    "music", "musics", "video", "videos", "media", "medias",
+)
+
+
+def _remote_media_url(value: Any) -> str:
+    source = unescape(str(value or "")).strip().strip("\"'").replace("\\/", "/")
+    if source.startswith("//"):
+        source = f"https:{source}"
+    parsed = urlparse(source)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return source
+
+
+def _mapping_source(value: dict[str, Any]) -> str:
+    for key in _MEDIA_SOURCE_KEYS:
+        source = _remote_media_url(value.get(key))
+        if source:
+            return source
+    return ""
+
+
+def _mapping_name(value: dict[str, Any], source: str, *, fallback: str = "") -> str:
+    for key in _MEDIA_NAME_KEYS:
+        name = str(value.get(key) or "").strip()
+        if name:
+            return name
+    return urlparse(source).path.rsplit("/", 1)[-1] or fallback
+
+
+def _media_kind(value: dict[str, Any], source: str, name: str) -> str:
+    raw_kind = str(value.get("kind") or value.get("type") or value.get("media_type") or "").lower()
+    mime = str(value.get("mime_type") or value.get("content_type") or value.get("mime") or "").lower()
+    suffix = (name or urlparse(source).path).lower()
+    if _to_int(value.get("is_video") or value.get("isVideo")) or raw_kind in {"video", "movie"}:
+        return "video"
+    if raw_kind in {"audio", "music", "record", "voice"} or mime.startswith("audio/"):
+        return "audio"
+    if raw_kind in {"image", "photo", "picture", "pic"} or mime.startswith("image/"):
+        return "image"
+    if mime.startswith("video/") or re.search(r"\.(?:mp4|m4v|mov|webm|m3u8)(?:$|[?#])", suffix):
+        return "video"
+    if re.search(r"\.(?:mp3|m4a|aac|wav|ogg|flac)(?:$|[?#])", suffix):
+        return "audio"
+    return "file"
+
+
+def extract_post_media(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[dict[str, Any]]:
+    """Normalize Qzone photos, videos, audio and file cards for browser clients."""
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(item: dict[str, Any]) -> dict[str, Any] | None:
+        source = _mapping_source(item)
+        if not source:
+            return None
+        name = _mapping_name(item, source)
+        kind = _media_kind(item, source, name)
+        key = (kind, source)
+        if key in seen:
+            return None
+        seen.add(key)
+        mime = str(item.get("mime_type") or item.get("content_type") or item.get("mime") or "").strip()
+        mime = mime or mimetypes.guess_type(name or urlparse(source).path)[0] or {
+            "video": "video/mp4", "audio": "audio/mpeg", "image": "image/jpeg",
+        }.get(kind, "application/octet-stream")
+        media: dict[str, Any] = {
+            "kind": kind, "source": source, "download_url": source,
+            "name": name or f"qzone-{kind}", "mime_type": mime,
+        }
+        size = _to_int(item.get("size") or item.get("file_size") or item.get("fileSize"))
+        if size > 0:
+            media["size"] = size
+        result.append(media)
+        return media
+
+    for pic in _iter_mappings(payload.get("pic") or payload.get("pics") or payload.get("photos")):
+        video_info = pic.get("video_info") or pic.get("videoInfo")
+        if not isinstance(video_info, dict):
+            continue
+        source = _mapping_source(video_info)
+        if not source:
+            continue
+        video_id = str(video_info.get("video_id") or video_info.get("videoId") or "").strip()
+        video = dict(video_info)
+        video.update({"kind": "video", "source": source, "name": f"{video_id or 'qzone-video'}.mp4"})
+        normalized = add(video)
+        if normalized is not None:
+            cover = _mapping_source({key: pic.get(key) for key in IMAGE_ALIAS_PRIORITY_KEYS})
+            if cover:
+                normalized["preview_url"] = cover
+            duration = _to_int(video_info.get("video_time") or video_info.get("duration"))
+            if duration > 0:
+                normalized["duration_ms"] = duration
+
+    for image in extract_images(payload, fid=fid, hostuin=hostuin):
+        add({"kind": "image", "source": image})
+
+    seen_nodes: set[int] = set()
+
+    def walk(value: Any, depth: int = 4) -> None:
+        if depth < 0:
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item, depth - 1)
+            return
+        if not isinstance(value, dict) or id(value) in seen_nodes:
+            return
+        seen_nodes.add(id(value))
+        if _mapping_source(value):
+            add(value)
+        for key in _ATTACHMENT_CONTAINER_KEYS:
+            child = value.get(key)
+            if isinstance(child, (dict, list)):
+                walk(child, depth - 1)
+
+    for key in _ATTACHMENT_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, (dict, list)):
+            walk(value)
+    return result
+
+
 def post_from_entry(
     entry: FeedEntry,
     *,
@@ -874,7 +1105,9 @@ def post_from_entry(
     raw = detail_raw or entry_raw
     comments = extract_comments(raw or {})
     images: list[str] = []
+    media: list[dict[str, Any]] = []
     seen_image_keys: set[str] = set()
+    seen_media: set[tuple[str, str]] = set()
 
     def split_embedded_feed_raw(source: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         embedded = source.get("_feed_raw")
@@ -889,6 +1122,13 @@ def post_from_entry(
         if not source:
             return False
         before = len(images)
+
+        for item in extract_post_media(source, fid=entry.fid, hostuin=entry.hostuin):
+            key = (str(item.get("kind") or ""), str(item.get("source") or ""))
+            if key in seen_media:
+                continue
+            seen_media.add(key)
+            media.append(item)
         for image in _extract_image_candidates(source, fid=entry.fid, hostuin=entry.hostuin):
             key = image.key or image.url
             if key in seen_image_keys:
@@ -927,6 +1167,39 @@ def post_from_entry(
         or extract_nickname(entry_raw, hostuin=entry.hostuin)
         or extract_nickname(fallback, hostuin=entry.hostuin)
     )
+
+    def first_rich_segments(initial: tuple[Any, ...], keys: tuple[str, ...]) -> list[dict[str, str]]:
+        for value in initial:
+            segments = qzone_rich_text_segments(value)
+            if segments:
+                return segments
+        for source in (detail_raw, entry_raw, fallback):
+            if not isinstance(source, dict):
+                continue
+            for key in keys:
+                segments = qzone_rich_text_segments(source.get(key))
+                if segments:
+                    return segments
+        return []
+
+    content_segments = first_rich_segments(
+        (entry.summary,),
+        ("content", "con", "summary", "text"),
+    )
+    if not content_segments:
+        for source in (detail_raw, entry_raw, fallback):
+            if not isinstance(source, dict):
+                continue
+            html_value = str(source.get("html") or "")
+            match = re.search(
+                r"""<(?P<tag>[a-z0-9]+)\b[^>]*class=["'][^"']*\bf-info\b[^"']*["'][^>]*>(?P<body>.*?)</(?P=tag)>""",
+                html_value,
+                re.I | re.S,
+            )
+            content_segments = qzone_rich_text_segments(match.group("body") if match else "")
+            if content_segments:
+                break
+    nickname_segments = first_rich_segments((entry.nickname,), NICKNAME_KEYS)
     post_raw = dict(raw or {})
     if fallback and fallback is not raw:
         post_raw.setdefault("_feed_raw", fallback)
@@ -941,6 +1214,9 @@ def post_from_entry(
         comment_count=max(entry.comment_count, len(comments)),
         liked=entry.liked,
         images=images,
+        media=media,
+        content_segments=content_segments,
+        nickname_segments=nickname_segments,
         comments=comments,
         busi_param=dict(entry.busi_param or {}),
         local_id=local_id,
