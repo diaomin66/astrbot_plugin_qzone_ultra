@@ -13,10 +13,7 @@ DEFAULT_USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
-DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT = (
-    "日系二次元厚涂插画，细腻笔触与自然柔和的明暗塑造，保留角色五官、发丝和配饰细节；"
-    "采用自拍或生活随手构图，不作真人摄影或写实皮肤质感，不强制平涂赛璐璐，不改变角色原有形象"
-)
+DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT = ""
 DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE = (
     "为人物生成自然的自拍或生活随手构图提示，结合有依据的当前场景，不推断未知活动或地点。\n\n"
     "{life_context}"

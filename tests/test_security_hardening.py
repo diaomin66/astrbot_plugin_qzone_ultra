@@ -347,12 +347,16 @@ def test_bridge_cache_contract_rejects_stale_life_context_signature(monkeypatch:
 def test_life_timezone_and_style_settings_defaults_and_explicit_empty_style() -> None:
     defaults = PluginSettings.from_mapping({})
     assert defaults.life_publish_timezone == "Asia/Shanghai"
-    assert "日系二次元厚涂插画" in defaults.life_publish_image_style_prompt
+    assert defaults.life_publish_image_style_prompt == ""
+    schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+    assert schema["life_publish"]["items"]["image_style_prompt"]["default"] == defaults.life_publish_image_style_prompt
     assert "真实手机自拍" not in defaults.life_publish_image_prompt_template
     assert "给定日期" in defaults.life_publish_caption_prompt
     explicit = PluginSettings.from_mapping({"life_publish": {"timezone": "UTC+08:00", "image_style_prompt": ""}})
     assert explicit.life_publish_timezone == "UTC+08:00"
     assert explicit.life_publish_image_style_prompt == ""
+    configured = PluginSettings.from_mapping({"life_publish": {"image_style_prompt": "CUSTOM_STYLE"}})
+    assert configured.life_publish_image_style_prompt == "CUSTOM_STYLE"
 
 
 @pytest.mark.parametrize(
@@ -8446,6 +8450,7 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
         {
             "life_publish": {
                 "image_prompt_template": "根据日程生成自拍：\n{life_context}",
+                "image_style_prompt": "CUSTOM_STYLE",
             }
         }
     )
@@ -8459,7 +8464,8 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
     assert "傍晚散步" not in prompt
     assert "来源日期：未知" in prompt
     assert "<画风约束>" in prompt
-    assert "日系二次元厚涂插画" in captured["prompt"]
+    assert "CUSTOM_STYLE" in captured["prompt"]
+    assert "日系二次元厚涂插画" not in captured["prompt"]
     assert prompt.count("<视觉参考>") == 1
     assert captured["prompt"].startswith("根据日程生成自拍")
     assert captured["event"] is not None
@@ -8479,12 +8485,16 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
     assert "当前穿着和姿势未知" in assembled
 
 
-def test_life_image_prompt_static_mode_skips_persona_provider_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("style_settings", [{}, {"image_style_prompt": ""}], ids=["omitted", "explicit-empty"])
+def test_life_image_prompt_static_mode_skips_persona_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, style_settings: dict[str, str]
+) -> None:
     main = _import_main_with_stubs(monkeypatch)
 
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = PluginSettings.from_mapping({
         "life_publish": {
+            **style_settings,
             "use_llm_image_prompt": False,
             "inherit_persona_visual": False,
             "image_prompt_template": "静态模板：{life_context}",
@@ -8495,7 +8505,8 @@ def test_life_image_prompt_static_mode_skips_persona_provider_resolution(monkeyp
     assert prompt.startswith("静态模板：")
     assert "今天散步" not in prompt  # direct helper lacks a frozen dated projection
     assert "来源日期：未知" in prompt
-    assert "<画风约束>" in prompt
+    assert "<画风约束>" not in prompt
+    assert "日系二次元厚涂插画" not in prompt
 
 
 def test_life_operation_freezes_clock_style_and_projection_before_scheduler_await(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
