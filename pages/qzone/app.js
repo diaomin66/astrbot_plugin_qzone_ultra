@@ -1,4 +1,4 @@
-﻿const bridge = window.AstrBotPluginPage;
+const bridge = window.AstrBotPluginPage;
 const BRIDGE_READY_TIMEOUT_MS = 5000;
 const BRIDGE_REQUEST_TIMEOUT_MS = 60000;
 const DETAIL_DRAWER_BREAKPOINT = 1200;
@@ -16,17 +16,33 @@ const state = {
   media: [],
   loading: false,
   pendingLikes: new Set(),
+  pendingComments: new Set(),
   pendingDeletes: new Set(),
   pendingDeleteConfirms: new Map(),
   knownAuthors: new Map(),
   replyTarget: null,
   replyDrafts: new Map(),
+  commentDrafts: new Map(),
   pendingReplies: new Set(),
   localVersions: new Map(),
   detailCache: new Map(),
   detailInFlight: new Map(),
   detailRequestSeq: 0,
   detailLoadingId: "",
+  lifeJob: null,
+  lifePollTimer: null,
+  lifeRequestPending: false,
+  lifeRequestId: "",
+  lifeAssociation: null,
+  lifeAssociationInvalid: "",
+  lifeAssociationPreviewUnavailable: false,
+  lifeRecovery: null,
+  lifeRecoveryExpired: false,
+  lifeLoadPending: false,
+  publishPending: false,
+  pendingUploads: 0,
+  composerRevision: 0,
+  confirmationToken: null,
 };
 
 let themeSyncBound = false;
@@ -52,6 +68,20 @@ const el = {
   mediaInput: document.getElementById("mediaInput"),
   mediaStrip: document.getElementById("mediaStrip"),
   publishButton: document.getElementById("publishButton"),
+  generateLifeDraft: document.getElementById("generateLifeDraft"),
+  lifeDraftStatus: document.getElementById("lifeDraftStatus"),
+  lifeDraftResult: document.getElementById("lifeDraftResult"),
+  lifeDraftDiagnostics: document.getElementById("lifeDraftDiagnostics"),
+  lifeDraftPreview: document.getElementById("lifeDraftPreview"),
+  lifeDraftLongContent: document.getElementById("lifeDraftLongContent"),
+  loadLifeDraft: document.getElementById("loadLifeDraft"),
+  discardLifeDraft: document.getElementById("discardLifeDraft"),
+  actionConfirmDialog: document.getElementById("actionConfirmDialog"),
+  actionConfirmTitle: document.getElementById("actionConfirmTitle"),
+  actionConfirmMessage: document.getElementById("actionConfirmMessage"),
+  actionConfirmFeedback: document.getElementById("actionConfirmFeedback"),
+  actionConfirmCancel: document.getElementById("actionConfirmCancel"),
+  actionConfirmAccept: document.getElementById("actionConfirmAccept"),
   refreshButton: document.getElementById("refreshButton"),
   feedTitle: document.getElementById("feedTitle"),
   feedMeta: document.getElementById("feedMeta"),
@@ -554,6 +584,118 @@ function setNotice(message, tone = "info") {
   }
 }
 
+let actionConfirmationSequence = 0;
+
+function actionBusyFeedback() {
+  const message = "已有操作正在等待确认或完成，请稍候再试。";
+  if (state.confirmationToken && el.actionConfirmFeedback) el.actionConfirmFeedback.textContent = message;
+  setNotice(message, "warn");
+}
+
+function beginActionConfirmation({ title, message, confirmText = "确认", cancelText = "取消" }) {
+  if (state.confirmationToken) {
+    actionBusyFeedback();
+    return null;
+  }
+  const dialog = el.actionConfirmDialog;
+  if (!dialog || typeof dialog.showModal !== "function" || typeof dialog.close !== "function" || typeof dialog.addEventListener !== "function" || typeof dialog.removeEventListener !== "function" || !el.actionConfirmAccept || !el.actionConfirmCancel) {
+    setNotice("当前页面无法显示安全的确认窗口，操作已停止。请刷新页面后重试。", "error");
+    return null;
+  }
+  let resolvePromise;
+  const promise = new Promise(resolve => { resolvePromise = resolve; });
+  const token = {
+    id: ++actionConfirmationSequence,
+    resolve: resolvePromise,
+    settled: false,
+    opener: document.activeElement || null,
+    onCancel: null,
+    onClose: null,
+    onKeydown: null,
+  };
+  state.confirmationToken = token;
+  renderLifeDraft();
+  if (el.actionConfirmTitle) el.actionConfirmTitle.textContent = text(title || "请确认操作");
+  if (el.actionConfirmMessage) el.actionConfirmMessage.textContent = text(message || "请确认是否继续。");
+  if (el.actionConfirmFeedback) el.actionConfirmFeedback.textContent = "";
+  el.actionConfirmAccept.textContent = text(confirmText || "确认");
+  el.actionConfirmCancel.textContent = text(cancelText || "取消");
+  token.onCancel = event => {
+    event.preventDefault();
+    settleActionConfirmation(token, false);
+  };
+  token.onClose = () => {
+    if (dialog.open) return;
+    if (!token.settled) settleActionConfirmation(token, false);
+  };
+  token.onKeydown = event => {
+    if (event.key !== "Tab") return;
+    const active = document.activeElement;
+    if (event.shiftKey && active === el.actionConfirmCancel) {
+      event.preventDefault();
+      el.actionConfirmAccept.focus?.();
+    } else if (!event.shiftKey && active === el.actionConfirmAccept) {
+      event.preventDefault();
+      el.actionConfirmCancel.focus?.();
+    }
+  };
+  dialog.addEventListener("cancel", token.onCancel);
+  dialog.addEventListener("close", token.onClose);
+  dialog.addEventListener("keydown", token.onKeydown);
+  try {
+    dialog.showModal();
+    if (!dialog.open) throw new Error("dialog did not open");
+    el.actionConfirmCancel.focus?.();
+  } catch (_) {
+    dialog.removeEventListener?.("cancel", token.onCancel);
+    dialog.removeEventListener?.("close", token.onClose);
+    dialog.removeEventListener?.("keydown", token.onKeydown);
+    token.settled = true;
+    token.resolve(false);
+    state.confirmationToken = null;
+    renderLifeDraft();
+    setNotice("确认窗口未能打开，操作已停止。请刷新页面后重试。", "error");
+    return null;
+  }
+  return { token, promise };
+}
+
+function settleActionConfirmation(token, accepted) {
+  if (!token || token !== state.confirmationToken || token.settled) return;
+  token.settled = true;
+  el.actionConfirmDialog?.removeEventListener?.("cancel", token.onCancel);
+  el.actionConfirmDialog?.removeEventListener?.("close", token.onClose);
+  el.actionConfirmDialog?.removeEventListener?.("keydown", token.onKeydown);
+  let closeFailed = false;
+  try {
+    if (el.actionConfirmDialog?.open) el.actionConfirmDialog.close();
+  } catch (_) {
+    closeFailed = true;
+  }
+  if (el.actionConfirmDialog?.open) closeFailed = true;
+  if (closeFailed) setNotice("确认窗口未能关闭，操作已停止。请刷新页面后重试。", "error");
+  token.resolve(Boolean(accepted) && !closeFailed);
+}
+
+function releaseActionConfirmation(token) {
+  if (!token || state.confirmationToken !== token) return;
+  if (!token.settled) settleActionConfirmation(token, false);
+  state.confirmationToken = null;
+  if (el.actionConfirmFeedback) el.actionConfirmFeedback.textContent = "";
+  renderLifeDraft();
+  const opener = token.opener;
+  queueMicrotask(() => {
+    if (!document.hidden && opener && opener.isConnected !== false && !opener.disabled && !opener.hidden) opener.focus?.();
+  });
+}
+
+function cancelActiveActionConfirmation() {
+  const token = state.confirmationToken;
+  if (!token) return;
+  settleActionConfirmation(token, false);
+  releaseActionConfirmation(token);
+}
+
 
 async function withTimeout(promise, timeoutMs, message) {
   let timeoutId;
@@ -570,11 +712,15 @@ async function withTimeout(promise, timeoutMs, message) {
 function normalizeBridgeResult(result, fallbackMessage) {
   if (result && typeof result === "object") {
     if (result.status === "error") {
-      throw new Error(result.message || fallbackMessage);
+      const error = new Error(result.message || fallbackMessage);
+      error.code = result.code || result.error?.code || "PAGE_ERROR";
+      throw error;
     }
     if (Object.prototype.hasOwnProperty.call(result, "ok")) {
       if (!result.ok) {
-        throw new Error(result.error?.message || result.message || fallbackMessage);
+        const error = new Error(result.error?.message || result.message || fallbackMessage);
+        error.code = result.error?.code || result.code || "PAGE_ERROR";
+        throw error;
       }
       return result.data || {};
     }
@@ -904,6 +1050,7 @@ function renderMedia() {
     remove.addEventListener("click", () => {
       revokeLocalPreviewUrl(state.media[index]);
       state.media.splice(index, 1);
+      state.composerRevision += 1;
       renderMedia();
     });
 
@@ -944,6 +1091,7 @@ function clearDetailDrawerChrome() {
   const closeBtn = document.getElementById("detailCloseBtn");
   pane?.classList.remove("visible");
   backdrop?.classList.remove("visible");
+  pane?.setAttribute("aria-hidden", String(isDetailDrawerMode()));
   document.body?.classList?.remove("detail-drawer-open");
   if (closeBtn) closeBtn.hidden = true;
 }
@@ -1291,14 +1439,56 @@ function renderDetail(post, options = {}) {
   const input = document.createElement("textarea");
   input.rows = 3;
   input.placeholder = "写下你的评论...";
+  input.value = state.commentDrafts.get(post.id) || "";
+  input.addEventListener("input", () => {
+    state.commentDrafts.set(post.id, input.value);
+  });
   const submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "发送";
-  form.append(input, submit);
+  submit.disabled = state.pendingComments.has(post.id);
+  const aiButton = document.createElement("button");
+  aiButton.type = "button";
+  aiButton.className = "ghost ai-comment-draft";
+  aiButton.textContent = "AI 生成评论";
+  aiButton.setAttribute("aria-label", "AI 生成评论");
+  const aiStatus = document.createElement("span");
+  aiStatus.className = "muted ai-draft-status";
+  aiStatus.setAttribute("role", "status");
+  aiButton.addEventListener("click", async () => {
+    if (aiButton.disabled) return;
+    const targetId = post.id;
+    const originalValue = input.value;
+    aiButton.disabled = true;
+    aiButton.textContent = "正在生成…";
+    aiStatus.textContent = "正在生成评论草稿";
+    try {
+      const data = await apiPost("page/ai-comment", { id: targetId });
+      if (!input.isConnected || selectedPostId() !== targetId || input.value !== originalValue) return;
+      input.value = text(data.content || "");
+      state.commentDrafts.set(targetId, input.value);
+      aiStatus.textContent = "草稿已填入，可编辑后手动发送";
+    } catch (error) {
+      if (input.isConnected && selectedPostId() === targetId) aiStatus.textContent = error.message || "生成评论草稿失败";
+    } finally {
+      aiButton.disabled = false;
+      aiButton.textContent = "AI 生成评论";
+    }
+  });
+  form.append(input, aiButton, submit, aiStatus);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await sendComment(post, input.value);
-    input.value = "";
+    const postId = post.id;
+    if (state.pendingComments.has(postId) || !input.value.trim()) return;
+    state.commentDrafts.set(postId, input.value);
+    state.pendingComments.add(postId);
+    renderSelectedIfNeeded(postId);
+    try {
+      if (await sendComment(post, input.value)) state.commentDrafts.delete(postId);
+    } finally {
+      state.pendingComments.delete(postId);
+      renderSelectedIfNeeded(postId);
+    }
   });
 
   el.detailContent.append(comments, form);
@@ -1373,7 +1563,39 @@ function renderComment(post, comment) {
     submit.type = "submit";
     submit.className = "primary";
     submit.textContent = "发送回复";
-    actions.append(cancel, submit);
+    const aiButton = document.createElement("button");
+    aiButton.type = "button";
+    aiButton.className = "ghost ai-reply-draft";
+    aiButton.textContent = "AI 生成回复";
+    aiButton.setAttribute("aria-label", "AI 生成回复");
+    const aiStatus = document.createElement("span");
+    aiStatus.className = "muted ai-draft-status";
+    aiStatus.setAttribute("role", "status");
+    aiButton.addEventListener("click", async () => {
+      if (aiButton.disabled) return;
+      const postId = post.id;
+      const commentId = text(comment.id);
+      const commentUin = Number(comment.author?.uin || comment.uin || 0);
+      const originalValue = input.value;
+      aiButton.disabled = true;
+      aiButton.textContent = "正在生成…";
+      aiStatus.textContent = "正在生成回复草稿";
+      try {
+        const data = await apiPost("page/ai-reply", { id: postId, commentid: commentId, comment_uin: commentUin });
+        if (!input.isConnected || state.replyTarget?.postId !== postId || state.replyTarget?.commentId !== commentId || input.value !== originalValue) return;
+        input.value = text(data.content || "");
+        state.replyDrafts.set(targetKey, input.value);
+        aiStatus.textContent = "草稿已填入，可编辑后手动发送";
+      } catch (error) {
+        if (input.isConnected && state.replyTarget?.postId === postId && state.replyTarget?.commentId === commentId) {
+          aiStatus.textContent = error.message || "生成回复草稿失败";
+        }
+      } finally {
+        aiButton.disabled = false;
+        aiButton.textContent = "AI 生成回复";
+      }
+    });
+    actions.append(cancel, aiButton, submit, aiStatus);
     form.append(input, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1391,8 +1613,15 @@ function renderComment(post, comment) {
 }
 
 async function loadStatus() {
+  const previousUin = String(state.status?.login?.uin || "");
   const data = await apiGet("page/status");
   state.status = data;
+  const currentUin = String(data?.login?.uin || "");
+  if (state.lifeAssociation && currentUin !== String(state.lifeAssociation.accountUin)) {
+    invalidateLifeAssociation("登录账号已变化，日常草稿关联已锁定；清空后才能作为普通内容重新编辑。");
+  } else if (previousUin && previousUin !== currentUin && state.lifeJob?.account_uin !== Number(currentUin)) {
+    state.lifeJob = null;
+  }
   renderStatus();
 }
 
@@ -1462,11 +1691,13 @@ function toggleDetailDrawer(visible) {
     if (isDetailDrawerMode()) {
         if (visible) {
             pane.classList.add("visible");
+            pane.setAttribute("aria-hidden", "false");
             if (closeBtn) closeBtn.hidden = false;
             if (backdrop) backdrop.classList.add("visible");
             document.body?.classList?.add("detail-drawer-open");
         } else {
             pane.classList.remove("visible");
+            pane.setAttribute("aria-hidden", "true");
             if (closeBtn) closeBtn.hidden = true;
             if (backdrop) backdrop.classList.remove("visible");
             document.body?.classList?.remove("detail-drawer-open");
@@ -1619,6 +1850,7 @@ async function sendComment(post, content) {
     updatePost(postId, { comments: nextComments });
     markLocalChange(postId);
     setNotice("评论已发送。", "success");
+    return true;
   } catch (error) {
     const target = currentPostById(postId, post);
     const currentComments = [...(target?.comments || [])];
@@ -1632,6 +1864,7 @@ async function sendComment(post, content) {
     });
     markLocalChange(postId);
     setNotice(error.message || "评论失败", "error");
+    return false;
   } finally {
     renderFeed();
     renderSelectedIfNeeded(postId);
@@ -1757,22 +1990,623 @@ async function deletePost(post) {
   }
 }
 
+function setLifeDraftStatus(message, tone = "info") {
+  if (!el.lifeDraftStatus) return;
+  el.lifeDraftStatus.textContent = text(message || "");
+  el.lifeDraftStatus.dataset.tone = tone;
+}
+
+const LIFE_RECOVERY_SESSION_KEY = "qzoneLifeDraftRecovery";
+
+function invalidateLifeAssociation(message) {
+  if (state.lifeAssociation) state.lifeAssociationInvalid = message || "该日常草稿已失效。";
+  if (message) setLifeDraftStatus(message, "warn");
+  renderLifeDraft();
+}
+
+function saveLifeRecovery() {
+  try {
+    if (state.lifeRecovery) sessionStorage.setItem(LIFE_RECOVERY_SESSION_KEY, JSON.stringify(state.lifeRecovery));
+    else sessionStorage.removeItem(LIFE_RECOVERY_SESSION_KEY);
+  } catch (_) {}
+}
+
+function restoreLifeRecovery() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(LIFE_RECOVERY_SESSION_KEY) || "null");
+    if (saved && Number.isFinite(Number(saved.startedAt))) state.lifeRecovery = saved;
+  } catch (_) {}
+}
+
+function clearLifePoll() {
+  if (state.lifePollTimer) window.clearTimeout(state.lifePollTimer);
+  state.lifePollTimer = null;
+}
+
+function scheduleLifePoll(jobId, delay = 1400) {
+  clearLifePoll();
+  if (document.hidden || (!jobId && !state.lifeRecovery)) return;
+  state.lifePollTimer = window.setTimeout(() => {
+    state.lifePollTimer = null;
+    refreshLifeDraft(jobId || "", { poll: true, recovery: !jobId });
+  }, delay);
+}
+
+const lifeDiagnosticMessages = {
+  INTERFACE_ERROR: "调用接口时发生错误", REQUEST_ERROR: "请求处理失败",
+  SOURCE_OR_FORMAT_ERROR: "媒体来源或格式未通过处理", AUTH_REQUIRED: "登录状态需要重新确认",
+  DAEMON_UNAVAILABLE: "后台服务暂不可用", TIMEOUT: "操作等待超时",
+  CANCELLED: "操作被取消，结果按未确认保留", INTERNAL_ERROR: "内部处理发生错误",
+  SOURCE_TOO_LARGE: "图片来源超过大小限制", ENCODED_SOURCE_TOO_LARGE: "图片编码内容超过大小限制",
+  SOURCE_MISSING: "图片来源缺失", SOURCE_UNTRUSTED: "图片来源未通过本地校验",
+  PIXEL_LIMIT: "图片尺寸超过处理限制", RASTER_UNSUPPORTED: "图片格式不受支持",
+  RASTER_DECODE_FAILED: "图片解码失败", OUTPUT_TOO_LARGE: "预览图片超过输出限制",
+  REMOTE_POLICY_FAILED: "图片来源校验未通过", PREVIEW_TIMEOUT: "预览读取或处理超时",
+};
+const lifeDiagnosticPhases = new Set(["controller_call", "result_processing", "bookkeeping", "preview_read", "preview_raster", "preview_wait"]);
+
+function acceptedLifeDiagnostic(value, allowedPhases) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!Object.hasOwn(lifeDiagnosticMessages, value.code) || !lifeDiagnosticPhases.has(value.phase)
+      || !allowedPhases.has(value.phase) || !/^[0-9a-f]{12}$/.test(value.id || "")) return null;
+  return { id: value.id, code: value.code, phase: value.phase };
+}
+
+function renderLifeDiagnostics(job) {
+  if (!el.lifeDraftDiagnostics) return;
+  const rows = [];
+  const publish = acceptedLifeDiagnostic(job?.publish_diagnostic, new Set(["controller_call", "result_processing", "bookkeeping"]));
+  const preview = acceptedLifeDiagnostic(job?.preview_diagnostic, new Set(["preview_read", "preview_raster", "preview_wait"]));
+  if (publish) rows.push(`发布结果仍按“${job?.publish_state === "unknown" ? "未确认" : "已记录状态"}”处理；诊断：${publish.code}：${lifeDiagnosticMessages[publish.code]}（${publish.phase}，编号 ${publish.id}）。`);
+  if (preview) rows.push(`仅图片预览诊断（不说明发布原因）：${preview.code}：${lifeDiagnosticMessages[preview.code]}（${preview.phase}，编号 ${preview.id}）；原草稿媒体仍保留。`);
+  const previewReference = job?.preview_diagnostic_reference;
+  if (!preview && previewReference && Object.hasOwn(lifeDiagnosticMessages, previewReference.code) && /^[0-9a-f]{12}$/.test(previewReference.id || "")) {
+    rows.push(`仅图片预览诊断：${previewReference.code}：${lifeDiagnosticMessages[previewReference.code]}（阶段待任务状态查询确认，编号 ${previewReference.id}）；原草稿媒体仍保留。`);
+  }
+  el.lifeDraftDiagnostics.textContent = rows.join(" ");
+  el.lifeDraftDiagnostics.hidden = rows.length === 0;
+}
+
+function renderLifeDraft() {
+  const job = state.lifeJob;
+  if (!el.generateLifeDraft || !el.lifeDraftResult) return;
+  if (el.mediaInput) {
+    const mediaDisabled = Boolean(state.confirmationToken || state.lifeLoadPending || state.publishPending);
+    el.mediaInput.disabled = mediaDisabled;
+    el.mediaInput.parentNode?.classList?.toggle("is-disabled", mediaDisabled);
+    if (mediaDisabled) el.mediaInput.parentNode?.setAttribute?.("aria-disabled", "true");
+    else el.mediaInput.parentNode?.removeAttribute?.("aria-disabled");
+  }
+  const recovering = Boolean(state.lifeRecovery);
+  el.generateLifeDraft.textContent = recovering ? "查询已有任务" : "生成日常草稿";
+  el.generateLifeDraft.disabled = state.lifeRequestPending || job?.state === "running" || !state.status?.login?.uin;
+  el.generateLifeDraft.setAttribute("aria-busy", String(Boolean(state.lifeRequestPending || job?.state === "running")));
+  el.lifeDraftResult.hidden = job?.state !== "succeeded" && !state.lifeAssociation;
+  renderLifeDiagnostics(job);
+  if (el.discardLifeDraft) {
+    el.discardLifeDraft.hidden = !state.lifeAssociation;
+    el.discardLifeDraft.disabled = state.publishPending || state.lifeLoadPending || state.pendingUploads > 0;
+  }
+  if (el.loadLifeDraft) el.loadLifeDraft.disabled = state.lifeLoadPending || state.publishPending || state.pendingUploads > 0 || Boolean(state.lifeAssociation) || (job?.state === "succeeded" && job.publish_state !== "ready");
+  if (el.lifeDraftLongContent) {
+    const longText = job?.state === "succeeded" && text(job.content).length > 1200 ? text(job.content) : "";
+    el.lifeDraftLongContent.hidden = !longText;
+    el.lifeDraftLongContent.value = longText;
+  }
+  if (state.lifeRecoveryExpired) {
+    setLifeDraftStatus("任务查询超过保留时间；确认后可重新生成。", "warn");
+    return;
+  }
+  if (recovering) {
+    const age = Date.now() - Number(state.lifeRecovery.startedAt || Date.now());
+    setLifeDraftStatus(age >= 15 * 60 * 1000
+      ? "任务查询超过保留时间；确认后可重新生成。"
+      : "生成请求结果待确认；点击“查询已有任务”仅查询状态，不会再次提交生成。", "warn");
+    return;
+  }
+  if (state.lifeAssociationInvalid) {
+    setLifeDraftStatus(state.lifeAssociationInvalid, "warn");
+    return;
+  }
+  if (state.lifeAssociation) {
+    if (state.lifeAssociation.publishState === "published" || job?.publish_state === "published") {
+      setLifeDraftStatus("该日常草稿已确认发布；不会再次发送。需要新内容请先明确清空日常稿。", "success");
+    } else if (state.lifeAssociation.uncertain || ["sending", "unknown"].includes(job?.publish_state)) {
+      setLifeDraftStatus("该日常草稿的发布结果尚未确认；仅查询状态，不会重发。", "warn");
+    } else {
+      setLifeDraftStatus(`已载入草稿 ${job?.draft_id || "—"}。${state.lifeAssociationPreviewUnavailable ? "图片预览暂不可用，原媒体仍保留。" : ""}编辑后点击“发布说说”并确认；不会自动发布。`, state.lifeAssociationPreviewUnavailable ? "warn" : "success");
+    }
+    if (job?.state === "succeeded") renderLifeDraftPreviews(job);
+    return;
+  }
+  if (!job || job.state === "idle") {
+    const cap = job?.capability || {};
+    const status = [cap.life_scheduler ? `Life Scheduler：${cap.life_scheduler}` : "", cap.omnidraw ? `OmniDraw：${cap.omnidraw}` : "", cap.provider ? `模型：${cap.provider}` : ""].filter(Boolean).join("；");
+    setLifeDraftStatus(`${cap.message || "可按需生成一份可编辑的日常草稿。"}${status ? `（${status}）` : ""}`, cap.available === false ? "warn" : "info");
+  } else if (job.state === "running") {
+    setLifeDraftStatus(job.message || "正在生成日常草稿…");
+  } else if (job.state === "succeeded") {
+    if (job.publish_state === "published") {
+      setLifeDraftStatus("该日常草稿已确认发布；不会再次发送。需要新内容请先明确清空日常稿。", "success");
+    } else if (["sending", "unknown"].includes(job.publish_state)) {
+      setLifeDraftStatus("该日常草稿的发布结果尚未确认；仅查询状态，不会重发。", "warn");
+    } else if (job.publish_state !== "ready") {
+      setLifeDraftStatus("该日常草稿的发布状态无法确认；载入已停止，请重新查询状态。", "warn");
+    } else {
+      setLifeDraftStatus(`${job.message || "日常草稿已保存。"} 草稿编号 ${job.draft_id || "—"}，目标 QQ ${job.account_uin}。`, "success");
+    }
+    renderLifeDraftPreviews(job);
+  } else {
+    setLifeDraftStatus(job.message || "日常草稿任务已结束。", job.state === "failed" ? "error" : "info");
+  }
+}
+
+async function renderLifeDraftPreviews(job) {
+  if (!el.lifeDraftPreview || job !== state.lifeJob) return;
+  el.lifeDraftPreview.replaceChildren();
+  const media = Array.isArray(job.media) ? job.media : [];
+  if (!media.length) {
+    const label = document.createElement("span");
+    label.className = "life-draft-no-media";
+    label.textContent = job.has_media ? "图片预览暂不可用，原媒体仍保留。" : "纯文字草稿";
+    el.lifeDraftPreview.append(label);
+    return;
+  }
+  for (const item of media.slice(0, 9)) {
+    const figure = document.createElement("figure");
+    figure.className = "life-draft-thumb";
+    const image = document.createElement("img");
+    image.alt = text(item.name || "日常草稿图片");
+    image.dataset.mediaId = text(item.media_id);
+    const caption = document.createElement("figcaption");
+    caption.textContent = text(item.name || "日常图片");
+    figure.append(image, caption);
+    el.lifeDraftPreview.append(figure);
+    try {
+      const preview = await apiGet("page/life-draft-preview", { job_id: job.id, media_id: item.media_id });
+      if (state.lifeJob === job && state.lifeJob.state === "succeeded" && preview.data_url) image.src = preview.data_url;
+      else image.alt = "预览暂不可用";
+    } catch (error) {
+      image.alt = "预览暂不可用";
+      figure.classList.add("is-unavailable");
+      const diagnosticMatch = /([A-Z_]+) ([0-9a-f]{12})$/.exec(String(error?.message || ""));
+      if (diagnosticMatch && Object.hasOwn(lifeDiagnosticMessages, diagnosticMatch[1])
+          && state.lifeJob === job && Number(state.status?.login?.uin || 0) === Number(job.account_uin)) {
+        job.preview_diagnostic_reference = { code: diagnosticMatch[1], id: diagnosticMatch[2] };
+        renderLifeDiagnostics(job);
+      }
+    }
+  }
+}
+
+async function refreshLifeDraft(jobId = "", { poll = false, recovery = false } = {}) {
+  try {
+    const job = await apiGet("page/life-draft", jobId ? { id: jobId } : {});
+    if (recovery && state.lifeRecovery) {
+      const elapsed = Date.now() - Number(state.lifeRecovery.startedAt || Date.now());
+      if (elapsed >= 15 * 60 * 1000) {
+        state.lifeRecovery = null;
+        state.lifeRecoveryExpired = true;
+        saveLifeRecovery();
+      } else if (job?.state === "idle") {
+        setLifeDraftStatus("未找到已接收任务，正在仅查询最新状态；不会自动重新生成。", "warn");
+      } else if (job?.state === "failed" || job?.state === "cancelled") {
+        state.lifeRecovery = null;
+        state.lifeRecoveryExpired = false;
+        saveLifeRecovery();
+      } else {
+        state.lifeRecovery = null;
+        state.lifeRecoveryExpired = false;
+        saveLifeRecovery();
+      }
+    }
+    state.lifeJob = job || { state: "idle" };
+    if (state.lifeAssociation && (Number(job?.account_uin || 0) !== Number(state.lifeAssociation.accountUin) || String(job?.id || "") !== String(state.lifeAssociation.jobId))) {
+      invalidateLifeAssociation("原日常草稿无法在当前账号/查询结果中验证；不会作为普通内容发送。请明确清空后重新编辑。");
+    } else if (state.lifeAssociation && job?.publish_state === "published") {
+      state.lifeAssociation.publishState = "published";
+      state.lifeAssociation.uncertain = false;
+      state.lifeAssociationInvalid = "";
+    } else if (state.lifeAssociation && ["sending", "unknown"].includes(job?.publish_state)) {
+      state.lifeAssociation.publishState = job.publish_state;
+      state.lifeAssociation.uncertain = true;
+    }
+    renderLifeDraft();
+    if (job?.state === "running") scheduleLifePoll(job.id, poll ? 1800 : 800);
+    else if (state.lifeRecovery) scheduleLifePoll("", 3000);
+    else clearLifePoll();
+    return job;
+  } catch (error) {
+    if (jobId && ["LIFE_EXPIRED", "LIFE_ACCOUNT_CHANGED"].includes(error.code)) {
+      invalidateLifeAssociation(`${error.message || "该日常草稿已失效。"} 清空草稿前不会按普通内容发送。`);
+    }
+    if (poll) {
+      if (state.lifeRecovery) setLifeDraftStatus(`任务接收状态待确认：${error.message || "查询暂不可用"}。可点“查询已有任务”重试；不会重新生成。`, "warn");
+      else setLifeDraftStatus(`状态查询失败：${error.message || "网络暂不可用"}；可稍后重新查询，不会重新开始生成。`, "warn");
+      scheduleLifePoll(jobId, 3000);
+    } else {
+      setLifeDraftStatus(error.message || "日常草稿状态暂不可用。", "warn");
+    }
+    return null;
+  }
+}
+
+async function startLifeDraft() {
+  if (state.lifeRecovery) {
+    await refreshLifeDraft("", { poll: true, recovery: true });
+    return;
+  }
+  if (state.lifeRequestPending || state.lifeJob?.state === "running") return;
+  state.lifeRequestPending = true;
+  state.lifeRequestId = (globalThis.crypto?.randomUUID?.() || `life_${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  renderLifeDraft();
+  setLifeDraftStatus("正在提交草稿生成任务…");
+  const requestId = state.lifeRequestId;
+  try {
+    const job = await apiPost("page/life-draft", { action: "generate_draft", request_id: requestId });
+    state.lifeRecovery = null;
+    state.lifeRecoveryExpired = false;
+    saveLifeRecovery();
+    state.lifeJob = job;
+    renderLifeDraft();
+    if (job?.state === "running") scheduleLifePoll(job.id);
+  } catch (error) {
+    state.lifeRecovery = { requestId, startedAt: Date.now() };
+    state.lifeRecoveryExpired = false;
+    saveLifeRecovery();
+    setLifeDraftStatus(`${error.message || "请求结果暂不明确"} 正在查询已有任务，不会自动重发生成请求。`, "warn");
+    await refreshLifeDraft("", { poll: true, recovery: true });
+  } finally {
+    state.lifeRequestPending = false;
+    renderLifeDraft();
+  }
+}
+
+async function loadLifeDraftIntoComposer() {
+  const job = state.lifeJob;
+  if (state.confirmationToken) {
+    actionBusyFeedback();
+    return;
+  }
+  if (!job || job.state !== "succeeded" || job.publish_state !== "ready") {
+    setLifeDraftStatus("当前没有处于可载入状态的已完成日常草稿；请重新查询后再试。", "warn");
+    return;
+  }
+  if (state.lifeLoadPending || state.publishPending || state.pendingUploads > 0 || state.lifeAssociation) {
+    setNotice("编辑器当前有操作或已载入日常稿，请完成后再载入。", "warn");
+    return;
+  }
+  if (Number(state.status?.login?.uin || 0) !== Number(job.account_uin)) {
+    invalidateLifeAssociation("登录账号已变化；请清空当前日常稿或切回原账号重新查询。");
+    return;
+  }
+  const accountUin = Number(state.status?.login?.uin || 0);
+  const jobId = String(job.id || "");
+  const revision = state.composerRevision;
+  const originalContent = text(el.publishContent.value);
+  const originalMediaJson = JSON.stringify(state.media.map(mediaForPublish));
+  const originalMediaIds = JSON.stringify((job.media || []).map(item => text(item.media_id)));
+  const baseIntentCurrent = () => state.composerRevision === revision
+    && (!actionToken || state.confirmationToken === actionToken)
+    && text(el.publishContent.value) === originalContent
+    && JSON.stringify(state.media.map(mediaForPublish)) === originalMediaJson
+    && Number(state.status?.login?.uin || 0) === accountUin
+    && state.lifeJob?.id === jobId
+    && Number(state.lifeJob?.account_uin || 0) === accountUin
+    && state.lifeJob?.state === "succeeded"
+    && state.lifeJob?.publish_state === "ready"
+    && state.pendingUploads === 0
+    && !state.publishPending
+    && !state.lifeAssociation;
+  let actionToken = null;
+  state.lifeLoadPending = true;
+  renderLifeDraft();
+  try {
+    const dirty = Boolean(originalContent || state.media.length);
+    if (dirty) {
+      const action = beginActionConfirmation({
+        title: "替换当前编辑内容？",
+        message: "载入日常草稿会替换当前文字和媒体。是否继续？",
+        confirmText: "载入草稿",
+      });
+      if (!action) return;
+      actionToken = action.token;
+      if (!await action.promise) {
+        setNotice("已取消载入；当前编辑内容和媒体保持不变。", "info");
+        return;
+      }
+      if (!baseIntentCurrent()) {
+        setNotice("确认期间编辑器、账号或草稿状态已变化；当前内容保持不变，请重新检查后载入。", "warn");
+        return;
+      }
+    }
+    const previews = [];
+    let loadInvalidated = false;
+    for (const item of job.media || []) {
+      let previewUrl = "";
+      try {
+        const preview = await apiGet("page/life-draft-preview", { job_id: jobId, media_id: item.media_id });
+        previewUrl = preview.data_url || "";
+      } catch (error) {
+        if (["LIFE_EXPIRED", "LIFE_ACCOUNT_CHANGED"].includes(error.code)) {
+          loadInvalidated = true;
+          setLifeDraftStatus(`${error.message} 草稿载入已停止。`, "warn");
+        }
+      }
+      previews.push({ ...item, preview_url: previewUrl });
+    }
+    if (loadInvalidated || !baseIntentCurrent()) {
+      setNotice("载入期间账号、草稿或编辑器发生变化；已保留当前内容，请重新查询后再载入。", "warn");
+      return;
+    }
+    let verifiedJob = null;
+    try {
+      verifiedJob = await apiGet("page/life-draft", { id: jobId });
+    } catch (error) {
+      setNotice(`${error.message || "无法重新验证日常草稿"} 草稿载入已停止。`, "warn");
+      return;
+    }
+    if (!verifiedJob || String(verifiedJob.id || "") !== jobId || Number(verifiedJob.account_uin || 0) !== accountUin || verifiedJob.state !== "succeeded" || !baseIntentCurrent()) {
+      setNotice("载入期间账号、草稿或编辑器发生变化；已保留当前内容，请重新查询后再载入。", "warn");
+      return;
+    }
+    const cachedState = state.lifeJob?.publish_state;
+    if (cachedState !== "ready" || verifiedJob.publish_state !== "ready") {
+      if (verifiedJob.publish_state === "published" || verifiedJob.publish_state === "unknown" || verifiedJob.publish_state === "sending") state.lifeJob = verifiedJob;
+      renderLifeDraft();
+      setNotice(verifiedJob.publish_state === "published"
+        ? "该日常草稿已确认发布；载入已停止，不会再次发送。"
+        : verifiedJob.publish_state === "sending" || verifiedJob.publish_state === "unknown"
+          ? "该日常草稿的发布结果尚未确认；载入已停止，请查询状态。"
+          : "该日常草稿的发布状态无法确认；载入已停止，请重新查询。", "warn");
+      return;
+    }
+    if (JSON.stringify((verifiedJob.media || []).map(item => text(item.media_id))) !== originalMediaIds) {
+      setNotice("日常草稿媒体在载入期间发生变化；已保留当前内容，请重新查询。", "warn");
+      return;
+    }
+    state.lifeJob = verifiedJob;
+    if (text(verifiedJob.content).length > 1200) {
+      renderLifeDraft();
+      setNotice("草稿超过编辑器 1200 字限制；下方只读原文可复制，请自行精简后再发布。", "warn");
+      return;
+    }
+    clearMediaQueue();
+    el.publishContent.value = text(verifiedJob.content);
+    state.media = previews;
+    state.lifeAssociation = { jobId: verifiedJob.id, accountUin: Number(verifiedJob.account_uin), uncertain: false };
+    state.lifeAssociationInvalid = "";
+    state.composerRevision += 1;
+    const counter = document.getElementById("charCounter");
+    if (counter) counter.textContent = `${el.publishContent.value.length}/1200`;
+    renderMedia();
+    const unavailablePreview = Boolean(verifiedJob.has_media && previews.some(item => !item.preview_url));
+    state.lifeAssociationPreviewUnavailable = unavailablePreview;
+    setLifeDraftStatus(`已载入草稿 ${verifiedJob.draft_id || "—"}。${unavailablePreview ? "图片预览暂不可用，原媒体仍保留。" : ""}编辑后点击“发布说说”并确认；不会自动发布。`, unavailablePreview ? "warn" : "success");
+    renderLifeDraft();
+  } finally {
+    state.lifeLoadPending = false;
+    renderLifeDraft();
+    releaseActionConfirmation(actionToken);
+  }
+}
+
+async function discardLifeDraftAssociation() {
+  const association = state.lifeAssociation;
+  if (state.confirmationToken) {
+    actionBusyFeedback();
+    return;
+  }
+  if (!association) {
+    setLifeDraftStatus("当前没有已载入的日常稿可清空。", "info");
+    return;
+  }
+  const revision = state.composerRevision;
+  const currentLoginUin = Number(state.status?.login?.uin || 0);
+  const cachedJobSnapshot = {
+    id: String(state.lifeJob?.id || ""),
+    accountUin: Number(state.lifeJob?.account_uin || 0),
+    state: text(state.lifeJob?.state),
+    publishState: text(state.lifeJob?.publish_state),
+  };
+  const associationSnapshot = {
+    jobId: String(association.jobId || ""),
+    accountUin: Number(association.accountUin || 0),
+    invalid: text(state.lifeAssociationInvalid),
+    publishState: text(association.publishState),
+    uncertain: Boolean(association.uncertain),
+  };
+  const contentSnapshot = text(el.publishContent.value);
+  const mediaSnapshot = JSON.stringify(state.media.map(mediaForPublish));
+  const action = beginActionConfirmation({
+    title: "清空当前日常稿？",
+    message: "这会清除当前编辑器中的日常稿文字和媒体；已保存的服务器草稿会保留。",
+    confirmText: "清空日常稿",
+  });
+  if (!action) return;
+  try {
+    if (!await action.promise) {
+      setNotice("已取消清空；当前日常稿保持不变。", "info");
+      return;
+    }
+    if (state.lifeAssociation !== association || state.composerRevision !== revision
+      || text(el.publishContent.value) !== contentSnapshot
+      || JSON.stringify(state.media.map(mediaForPublish)) !== mediaSnapshot
+      || String(association.jobId || "") !== associationSnapshot.jobId
+      || Number(association.accountUin || 0) !== associationSnapshot.accountUin
+      || text(state.lifeAssociationInvalid) !== associationSnapshot.invalid
+      || text(association.publishState) !== associationSnapshot.publishState
+      || Boolean(association.uncertain) !== associationSnapshot.uncertain
+      || String(state.lifeJob?.id || "") !== cachedJobSnapshot.id
+      || Number(state.lifeJob?.account_uin || 0) !== cachedJobSnapshot.accountUin
+      || text(state.lifeJob?.state) !== cachedJobSnapshot.state
+      || text(state.lifeJob?.publish_state) !== cachedJobSnapshot.publishState
+      || Number(state.status?.login?.uin || 0) !== currentLoginUin
+      || state.confirmationToken !== action.token
+      || state.lifeLoadPending || state.publishPending || state.pendingUploads > 0) {
+      setNotice("确认期间日常稿、账号或编辑器已变化；未清空，请重新检查后操作。", "warn");
+      return;
+    }
+    el.publishContent.value = "";
+    clearMediaQueue();
+    state.lifeAssociation = null;
+    state.lifeAssociationInvalid = "";
+    state.lifeAssociationPreviewUnavailable = false;
+    state.composerRevision += 1;
+    renderMedia();
+    const counter = document.getElementById("charCounter");
+    if (counter) counter.textContent = "0/1200";
+    setLifeDraftStatus("当前日常稿已清空；已保存的原草稿仍保留。", "info");
+    renderLifeDraft();
+  } finally {
+    releaseActionConfirmation(action.token);
+  }
+}
+
 async function publish(event) {
   event.preventDefault();
-  const content = el.publishContent.value;
+  if (state.confirmationToken) {
+    actionBusyFeedback();
+    return;
+  }
+  if (state.publishPending || state.lifeLoadPending || state.pendingUploads > 0) {
+    setNotice("编辑器操作尚未完成，请稍候再发布。", "warn");
+    return;
+  }
+  const content = text(el.publishContent.value);
+  const mediaPayload = state.media.map(mediaForPublish);
+  const mediaSnapshot = JSON.stringify(mediaPayload);
   if (!content.trim() && !state.media.length) {
     setNotice("写点文字或添加图片/视频再发布。", "warn");
     return;
   }
+  const lifeAssociation = state.lifeAssociation;
+  let actionToken = null;
+  if (lifeAssociation) {
+    if (state.lifeAssociationInvalid) {
+      setLifeDraftStatus(`${state.lifeAssociationInvalid} 请用“清空日常稿，重新编辑”明确解除关联。`, "error");
+      return;
+    }
+    if (lifeAssociation.publishState === "published" || state.lifeJob?.publish_state === "published") {
+      setLifeDraftStatus("该日常草稿已确认发布，不会再次发送。请明确清空后作为新内容编辑。", "warn");
+      return;
+    }
+    if (Number(state.status?.login?.uin || 0) !== Number(lifeAssociation.accountUin)) {
+      invalidateLifeAssociation("登录账号已变化，日常草稿关联已锁定；清空后才能作为普通内容重新编辑。");
+      return;
+    }
+    if (lifeAssociation.uncertain || ["sending", "unknown"].includes(state.lifeJob?.publish_state)) {
+      await refreshLifeDraft(lifeAssociation.jobId);
+      if (state.lifeJob?.publish_state === "published") setLifeDraftStatus("该日常草稿已确认发布，不会重发。", "success");
+      else setLifeDraftStatus("发布结果待确认；已查询任务状态，不会重发此日常草稿。", "warn");
+      return;
+    }
+    const composerRevision = state.composerRevision;
+    const originalAssociation = lifeAssociation;
+    const originalSelectedJob = state.lifeJob;
+    const jobId = String(lifeAssociation.jobId || "");
+    const accountUin = Number(lifeAssociation.accountUin || 0);
+    const verifiedPayload = { content, media: mediaPayload.map(item => ({ ...item })), life_job_id: jobId };
+    let verifiedJob = null;
+    const lifeIntentCurrent = () => state.composerRevision === composerRevision
+      && state.confirmationToken === actionToken
+      && text(el.publishContent.value) === content
+      && JSON.stringify(state.media.map(mediaForPublish)) === mediaSnapshot
+      && state.lifeAssociation === originalAssociation
+      && !state.lifeAssociationInvalid
+      && String(state.lifeAssociation?.jobId || "") === jobId
+      && Number(state.lifeAssociation?.accountUin || 0) === accountUin
+      && Number(state.status?.login?.uin || 0) === accountUin
+      && state.lifeJob?.id === jobId
+      && (state.lifeJob === originalSelectedJob || (verifiedJob && state.lifeJob === verifiedJob))
+      && Number(state.lifeJob?.account_uin || 0) === accountUin
+      && state.lifeJob?.state === "succeeded"
+      && state.lifeJob?.publish_state === "ready"
+      && !state.publishPending
+      && !state.lifeLoadPending
+      && state.pendingUploads === 0;
+    const action = beginActionConfirmation({
+      title: "确认发布日常草稿？",
+      message: `即将以 QQ ${accountUin} 发布这份已审核的日常草稿。确认后将先重新验证账号和草稿状态，再按当前已审核内容发送一次。`,
+      confirmText: "确认发布",
+    });
+    if (!action) return;
+    actionToken = action.token;
+    try {
+      if (!await action.promise) {
+        setNotice("已取消发布；日常草稿和编辑内容保持不变。", "info");
+        return;
+      }
+      if (!lifeIntentCurrent()) {
+        setNotice("确认后编辑内容、账号或日常草稿状态已变化；未发送，请重新检查并确认。", "warn");
+        return;
+      }
+      try {
+        verifiedJob = await apiGet("page/life-draft", { id: jobId });
+      } catch (error) {
+        setNotice(`${error.message || "无法重新验证日常草稿"} 未发送，请重新查询后再确认。`, "warn");
+        return;
+      }
+      if (!verifiedJob || String(verifiedJob.id || "") !== jobId || Number(verifiedJob.account_uin || 0) !== accountUin || verifiedJob.state !== "succeeded") {
+        setNotice("账号或日常草稿身份无法重新验证；未发送，请重新查询。", "warn");
+        return;
+      }
+      if (!lifeIntentCurrent()) {
+        setNotice("重新验证期间编辑器、账号或选中的日常草稿已变化；未发送，请重新检查并确认。", "warn");
+        return;
+      }
+      const currentCachedState = state.lifeJob?.publish_state;
+      if (currentCachedState !== "ready") {
+        renderLifeDraft();
+        setNotice(currentCachedState === "published"
+          ? "该日常草稿已确认发布；本次未发送。"
+          : "该日常草稿状态已变化；本次未发送，请重新查询。", "warn");
+        return;
+      }
+      state.lifeJob = verifiedJob;
+      if (verifiedJob.publish_state !== "ready") {
+        renderLifeDraft();
+        setNotice(verifiedJob.publish_state === "published"
+          ? "该日常草稿已确认发布；本次未发送。"
+          : verifiedJob.publish_state === "sending" || verifiedJob.publish_state === "unknown"
+            ? "该日常草稿发布结果尚未确认；本次未发送，请查询状态。"
+            : "该日常草稿发布状态无法确认；本次未发送，请重新查询。", "warn");
+        return;
+      }
+      if (!lifeIntentCurrent()) {
+        setNotice("重新验证后编辑内容、账号或草稿状态已变化；未发送，请重新检查并确认。", "warn");
+        return;
+      }
+      state.publishPending = true;
+      renderLifeDraft();
+      await publishCapturedPayload(verifiedPayload, { lifeAssociation: originalAssociation, composerRevision });
+    } finally {
+      releaseActionConfirmation(actionToken);
+    }
+    return;
+  }
+  const composerRevision = state.composerRevision;
+  await publishCapturedPayload({ content, media: mediaPayload.map(item => ({ ...item })) }, { composerRevision });
+}
+
+async function publishCapturedPayload(body, { lifeAssociation = null, composerRevision }) {
+  state.publishPending = true;
   el.publishButton.disabled = true;
   const originalText = el.publishButton.textContent;
   el.publishButton.textContent = "发布中...";
   try {
-    const media = state.media.map(mediaForPublish);
-    const data = await apiPost("page/publish", { content, media });
-    el.publishContent.value = "";
-    clearMediaQueue();
-    renderMedia();
+    const data = await apiPost("page/publish", body);
+    if (lifeAssociation) {
+      lifeAssociation.publishState = "published";
+      lifeAssociation.uncertain = false;
+      if (state.lifeJob?.id === lifeAssociation.jobId) state.lifeJob.publish_state = "published";
+    }
+    if (composerRevision === state.composerRevision) {
+      el.publishContent.value = "";
+      clearMediaQueue();
+      state.composerRevision += 1;
+      renderMedia();
+    }
     if (data.post) {
       data.post.author = mergeAuthor(currentLoginAuthor(), data.post.author);
       rememberPostAuthors(data.post);
@@ -1783,14 +2617,23 @@ async function publish(event) {
     }
     setNotice("说说已发布。", "success");
   } catch (error) {
+    if (lifeAssociation) {
+      lifeAssociation.uncertain = true;
+      lifeAssociation.publishState = "unknown";
+      if (state.lifeJob?.id === lifeAssociation.jobId) state.lifeJob.publish_state = "unknown";
+      await refreshLifeDraft(lifeAssociation.jobId);
+    }
     setNotice(error.message || "发布失败", "error");
   } finally {
+    state.publishPending = false;
     el.publishButton.disabled = false;
     el.publishButton.textContent = originalText;
+    renderLifeDraft();
   }
 }
 
 async function uploadFiles(files) {
+  if (state.publishPending) return;
   const maxMedia = state.status?.limits?.images || 9;
   for (const file of files) {
     const incomingVideo = fileLooksLikeVideo(file);
@@ -1802,6 +2645,9 @@ async function uploadFiles(files) {
       setNotice(`最多只能添加 ${maxMedia} 个图片/视频。`, "warn");
       break;
     }
+    state.pendingUploads += 1;
+    state.composerRevision += 1;
+    renderLifeDraft();
     try {
       const data = await uploadPageMedia(file);
       const media = uploadedMediaFromPayload(data);
@@ -1814,14 +2660,21 @@ async function uploadFiles(files) {
         media.preview_url = previewUrl;
       }
       state.media.push(media);
+      state.composerRevision += 1;
     } catch (error) {
       setNotice(error.message || "媒体上传失败", "error");
+    } finally {
+      state.pendingUploads = Math.max(0, state.pendingUploads - 1);
+      renderLifeDraft();
     }
   }
   renderMedia();
 }
 
 function bindEvents() {
+  el.actionConfirmAccept?.addEventListener("click", () => settleActionConfirmation(state.confirmationToken, true));
+  el.actionConfirmCancel?.addEventListener("click", () => settleActionConfirmation(state.confirmationToken, false));
+  window.addEventListener("pagehide", cancelActiveActionConfirmation);
   for (const tab of el.tabs) {
     tab.addEventListener("click", async () => {
       state.scope = tab.dataset.scope;
@@ -1850,6 +2703,7 @@ function bindEvents() {
   const charCounter = document.getElementById("charCounter");
   if (contentInput && charCounter) {
       contentInput.addEventListener("input", () => {
+          state.composerRevision += 1;
           const len = contentInput.value.length;
           charCounter.textContent = `${len}/1200`;
           if (len > 1100) charCounter.classList.add("warning");
@@ -1860,10 +2714,21 @@ function bindEvents() {
   el.refreshButton.addEventListener("click", () => {
     state.cursor = "";
     state.posts = [];
+    loadStatus().then(() => refreshLifeDraft()).catch(() => {});
     loadFeed();
   });
   el.moreButton.addEventListener("click", () => loadFeed({ append: true }));
   el.publishForm.addEventListener("submit", publish);
+  el.generateLifeDraft?.addEventListener("click", startLifeDraft);
+  el.loadLifeDraft?.addEventListener("click", loadLifeDraftIntoComposer);
+  el.discardLifeDraft?.addEventListener("click", discardLifeDraftAssociation);
+  window.addEventListener("pagehide", clearLifePoll);
+  document.addEventListener?.("visibilitychange", () => {
+    if (!document.hidden && state.lifeRecovery) scheduleLifePoll("", 0);
+    else if (!document.hidden && state.lifeJob?.state === "running") scheduleLifePoll(state.lifeJob.id, 0);
+    else if (!document.hidden && state.lifeAssociation?.uncertain) scheduleLifePoll(state.lifeAssociation.jobId, 0);
+    else if (document.hidden) clearLifePoll();
+  });
   el.mediaInput.addEventListener("change", async () => {
     await uploadFiles(el.mediaInput.files || []);
     el.mediaInput.value = "";
@@ -1891,9 +2756,11 @@ async function init() {
 
   bindEvents();
   renderTabs();
+  restoreLifeRecovery();
   
   try {
     await loadStatus();
+    await refreshLifeDraft("", { poll: Boolean(state.lifeRecovery), recovery: Boolean(state.lifeRecovery) });
     await loadFeed();
   } catch (error) {
     setNotice(error.message || "初始化失败", "error");

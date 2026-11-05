@@ -11,17 +11,20 @@ import asyncio
 import base64
 import binascii
 import copy
+import hashlib
+import io
 import json
 import mimetypes
 import re
 import secrets
 import time
+import httpx
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote_to_bytes, urlparse
 
-from .errors import DaemonUnavailableError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError
+from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import (
     QZONE_IMAGE_SUFFIXES,
     QZONE_MAX_IMAGES,
@@ -35,6 +38,9 @@ from .media import (
 )
 from .models import FeedEntry
 from .social import QzoneComment, QzonePost, dedupe_image_sources, post_from_entry
+from .local_media import resolve_trusted_local_media_path
+from .page_life import DIAGNOSTIC_MESSAGES, PageLifeError, PageLifeJob, PageLifeJobStore, public_diagnostic
+from .page_media import open_page_media_stream
 from .utils import truncate
 
 
@@ -44,6 +50,55 @@ PAGE_MAX_LIMIT = 30
 PAGE_DETAIL_TIMEOUT_SECONDS = 8.0
 PAGE_STATUS_TIMEOUT_SECONDS = 2.0
 PAGE_DETAIL_CACHE_TTL_SECONDS = 15.0
+PAGE_AI_DRAFT_TIMEOUT_SECONDS = 45.0
+PAGE_AI_SLOT_WAIT_SECONDS = 0.05
+PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+PAGE_LIFE_PREVIEW_MAX_PIXELS = 20_000_000
+PAGE_LIFE_PREVIEW_MAX_EDGE = 512
+PAGE_LIFE_PREVIEW_MAX_JPEG_BYTES = 128 * 1024
+PAGE_LIFE_PREVIEW_TIMEOUT_SECONDS = 10.0
+
+
+class _PreviewDiagnosticError(ValueError):
+    def __init__(self, code: str, phase: str = "preview_read") -> None:
+        self.code = code
+        self.phase = phase
+
+
+def _safe_diagnostic(error: BaseException, phase: str) -> dict[str, Any]:
+    """Classify by exact known types only; never inspect exception text or arbitrary attributes."""
+    code = "INTERNAL_ERROR"
+    try:
+        error_type = type(error)
+        if error_type is TypeError:
+            code = "INTERFACE_ERROR"
+        elif (error_type is asyncio.TimeoutError or error_type is TimeoutError
+              or error_type is httpx.TimeoutException or error_type is httpx.ConnectTimeout
+              or error_type is httpx.ReadTimeout or error_type is httpx.WriteTimeout
+              or error_type is httpx.PoolTimeout):
+            code = "TIMEOUT"
+        elif error_type is asyncio.CancelledError:
+            code = "CANCELLED"
+        elif error_type is QzoneRequestError:
+            code = "REQUEST_ERROR"
+        elif error_type is QzoneParseError:
+            code = "SOURCE_OR_FORMAT_ERROR"
+        elif error_type is QzoneAuthError or error_type is QzoneNeedsRebind:
+            code = "AUTH_REQUIRED"
+        elif error_type is DaemonUnavailableError:
+            code = "DAEMON_UNAVAILABLE"
+        elif error_type is _PreviewDiagnosticError:
+            candidate = object.__getattribute__(error, "code")
+            if type(candidate) is str and candidate in DIAGNOSTIC_MESSAGES:
+                code = candidate
+            phase_value = object.__getattribute__(error, "phase")
+            if type(phase_value) is str and phase_value in {"preview_read", "preview_raster", "preview_wait"}:
+                phase = phase_value
+    except BaseException:
+        # A hostile exception implementation must not leave a job in `sending`.
+        code = "INTERNAL_ERROR"
+    return {"id": secrets.token_hex(6), "code": code, "phase": phase,
+            "message": DIAGNOSTIC_MESSAGES[code], "at": time.time()}
 
 
 @dataclass(slots=True)
@@ -138,12 +193,33 @@ class QzonePageApi:
         settings: Any,
         status_provider: Callable[[], Awaitable[dict[str, Any]]] | None = None,
         preload_scheduler: Callable[[str], None] | None = None,
+        ai_comment_generator: Callable[[QzonePost], Awaitable[str]] | None = None,
+        ai_reply_generator: Callable[[QzonePost, QzoneComment], Awaitable[str]] | None = None,
+        reply_lock: asyncio.Lock | None = None,
+        manual_reply_marker: Callable[[int, int, str, str, int], Awaitable[bool]] | None = None,
+        life_draft_generator: Callable[[Callable[[str], None]], Awaitable[Any]] | None = None,
+        life_capability_provider: Callable[[], dict[str, Any]] | None = None,
+        draft_store: Any = None,
     ):
         self.controller = controller
         self.post_service_factory = post_service_factory
         self.settings = settings
         self.status_provider = status_provider
         self.preload_scheduler = preload_scheduler
+        self.ai_comment_generator = ai_comment_generator
+        self.ai_reply_generator = ai_reply_generator
+        self._ai_generation_slots = asyncio.Semaphore(2)
+        self.reply_lock = reply_lock or asyncio.Lock()
+        self.manual_reply_marker = manual_reply_marker
+        self.life_draft_generator = life_draft_generator
+        self.life_capability_provider = life_capability_provider
+        self.draft_store = draft_store
+        self._life_jobs = PageLifeJobStore()
+        self._life_preview_slots = asyncio.Semaphore(2)
+        self._life_preview_inflight: dict[tuple[str, str], asyncio.Task[bytes]] = {}
+        self._life_owned_upload_ids: dict[str, str] = {}
+        self._life_owned_media: dict[str, tuple[str, str]] = {}
+        self._life_closed = False
         self._refs_by_id: dict[str, PagePostRef] = {}
         self._ids_by_ref: dict[tuple[int, str, int], str] = {}
         self._feed_seen_refs: dict[tuple[str, int], set[tuple[int, str, int]]] = {}
@@ -195,6 +271,325 @@ class QzonePageApi:
         if status.get("needs_rebind") or not _to_int(status.get("cookie_count"), 0):
             raise QzoneNeedsRebind()
         return status
+
+    async def _life_owner_status(self) -> tuple[dict[str, Any], int]:
+        status = await self._ensure_cookie_bound()
+        account_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
+        if account_uin <= 0:
+            raise PageLifeError("LIFE_INVALID_OWNER", "请先绑定有效 QQ 账号后生成日常草稿。")
+        return status, account_uin
+
+    async def _prune_life_media(self) -> None:
+        retained = await self._life_jobs.retained_ids()
+        cancelled: list[asyncio.Task[bytes]] = []
+        for upload_id, job_id in list(self._life_owned_upload_ids.items()):
+            if job_id not in retained:
+                self._drop_life_upload(upload_id, job_id)
+        for media_id, (job_id, _upload_id) in list(self._life_owned_media.items()):
+            if job_id not in retained:
+                self._life_owned_media.pop(media_id, None)
+        for key, task in list(self._life_preview_inflight.items()):
+            if key[0] not in retained:
+                self._life_preview_inflight.pop(key, None)
+                if not task.done():
+                    task.cancel()
+                    cancelled.append(task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+    def _drop_life_upload(self, upload_id: str, job_id: str) -> None:
+        if self._life_owned_upload_ids.get(upload_id) != job_id:
+            return
+        stored = self._uploaded_media_by_id.get(upload_id)
+        if isinstance(stored, dict) and stored.get("_life_job_id") == job_id:
+            self._uploaded_media_by_id.pop(upload_id, None)
+        self._life_owned_upload_ids.pop(upload_id, None)
+
+    def _life_capability_status(self) -> dict[str, Any]:
+        if self.life_capability_provider is None:
+            return {"available": False, "message": "日常草稿功能当前未就绪。", "life_scheduler": "unknown", "omnidraw": "unknown", "provider": "unknown", "text_only_allowed": False}
+        try:
+            value = self.life_capability_provider()
+        except Exception:
+            return {"available": False, "message": "日常草稿依赖状态暂不可查询。", "life_scheduler": "unknown", "omnidraw": "unknown", "provider": "unknown", "text_only_allowed": False}
+        if not isinstance(value, dict):
+            value = {}
+        return {
+            "available": bool(value.get("available")),
+            "message": _clean_text(value.get("message"), 160),
+            "life_scheduler": str(value.get("life_scheduler") or "unknown")[:16],
+            "omnidraw": str(value.get("omnidraw") or "unknown")[:16],
+            "provider": "unknown",
+            "text_only_allowed": bool(value.get("text_only_allowed")),
+        }
+
+    async def start_life_draft(self, body: Any) -> dict[str, Any]:
+        if self._life_closed:
+            raise PageLifeError("LIFE_CLOSED", "日常草稿服务正在关闭，请稍后重试。")
+        if not isinstance(body, dict) or set(body) != {"action", "request_id"}:
+            raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿请求格式无效。")
+        action, request_id = body.get("action"), body.get("request_id")
+        if action != "generate_draft" or not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id, flags=re.ASCII):
+            raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿请求格式无效。")
+        if self.life_draft_generator is None or self.draft_store is None:
+            raise PageLifeError("LIFE_UNAVAILABLE", "日常草稿功能当前未就绪。")
+        _status, account_uin = await self._life_owner_status()
+        capability = self._life_capability_status()
+        await self._prune_life_media()
+        job, created = await self._life_jobs.admit(
+            request_id, account_uin, allow_new=capability["available"],
+            unavailable_message=capability["message"] or "日常草稿依赖尚未就绪。",
+        )
+        if created:
+            task = asyncio.create_task(self._run_life_generation(job.id, account_uin))
+            await self._life_jobs.attach_task(job.id, task)
+        data = PageLifeJobStore.public_payload(job)
+        data["capability"] = capability
+        return _success(data, message="草稿生成任务已接收。" if created else "已关联现有草稿生成任务。")
+
+    async def get_life_draft(self, params: Any = None) -> dict[str, Any]:
+        params = params or {}
+        if not isinstance(params, dict) or set(params) - {"id"}:
+            raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿查询参数无效。")
+        _, account_uin = await self._life_owner_status()
+        await self._prune_life_media()
+        job_id = str(params.get("id") or "").strip()
+        if job_id:
+            job = await self._life_jobs.get(job_id, account_uin)
+        else:
+            job = await self._life_jobs.active_or_latest(account_uin)
+        data = PageLifeJobStore.public_payload(job) if job else {"state": "idle"}
+        data["capability"] = self._life_capability_status()
+        return _success(data)
+
+    async def _run_life_generation(self, job_id: str, account_uin: int) -> None:
+        try:
+            def progress(phase: str) -> None:
+                try:
+                    asyncio.get_running_loop().create_task(self._life_jobs.set_phase(job_id, phase))
+                except RuntimeError:
+                    pass
+
+            result = await self.life_draft_generator(progress)  # type: ignore[misc]
+            if self._life_closed:
+                raise PageLifeError("LIFE_CLOSED", "插件已关闭，日常草稿生成已取消。")
+            if result is None or not isinstance(getattr(result, "content", None), str):
+                raise PageLifeError("LIFE_GENERATION_FAILED", "日常草稿生成失败，请检查配置后重试。")
+            current_status, current_uin = await self._life_owner_status()
+            if current_uin != account_uin:
+                raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，草稿未保存。")
+            media_objects = list(getattr(result, "media", []) or [])
+            if len(media_objects) > QZONE_MAX_IMAGES:
+                raise PageLifeError("LIFE_GENERATION_FAILED", "生成媒体数量超出限制，草稿未保存。")
+            media_sources: dict[str, dict[str, Any]] = {}
+            public_media: list[dict[str, Any]] = []
+            draft_media: list[dict[str, Any]] = []
+            for index, item in enumerate(media_objects):
+                raw = item.to_dict() if callable(getattr(item, "to_dict", None)) else dict(item) if isinstance(item, dict) else {}
+                source = str(raw.get("source") or "").strip()
+                if not source:
+                    continue
+                media_id = "lm_" + secrets.token_urlsafe(12)
+                upload_id = "life_upload_" + secrets.token_urlsafe(18)
+                name = self._safe_upload_filename(raw.get("name") or raw.get("filename") or f"life-{index + 1}.jpg")
+                kind = str(raw.get("kind") or "image")
+                mime_type = str(raw.get("mime_type") or guess_mime_type(name) or "image/jpeg").split(";", 1)[0]
+                size = _to_int(raw.get("size"), 0)
+                stored = {**raw, "kind": kind, "name": name, "mime_type": mime_type, "upload_id": upload_id,
+                          "trusted_local": bool(raw.get("trusted_local")), "_life_job_id": job_id,
+                          "_life_owner_uin": account_uin, "_life_media_id": media_id}
+                self._uploaded_media_by_id[upload_id] = stored
+                self._life_owned_upload_ids[upload_id] = job_id
+                self._life_owned_media[media_id] = (job_id, upload_id)
+                media_sources[media_id] = stored
+                public_media.append({"kind": kind, "name": name, "mime_type": mime_type,
+                                     "upload_id": upload_id, "media_id": media_id, "size": size})
+                draft_media.append(dict(raw))
+            await self._life_jobs.begin_draft_save(job_id, account_uin)
+            current_status, current_uin = await self._life_owner_status()
+            if current_uin != account_uin:
+                raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，草稿未保存。")
+            draft = await self.draft_store.add_async(
+                author_uin=account_uin,
+                author_name=str(current_status.get("login_nickname") or current_status.get("nickname") or "WebUI 日常草稿"),
+                group_id=0, content=result.content, media=draft_media, anonymous=False,
+            )
+            _, current_uin = await self._life_owner_status()
+            if current_uin != account_uin:
+                raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，草稿未显示。")
+            has_media = bool(public_media)
+            text_only = bool(self._life_capability_status().get("text_only_allowed"))
+            message = "纯文字日常草稿已保存。" if text_only and not has_media else "日常草稿已保存，可载入编辑后手动发布。"
+            await self._life_jobs.succeed(
+                job_id, draft_id=int(getattr(draft, "id", 0) or 0), content=result.content,
+                media=public_media, media_sources=media_sources, has_media=has_media, message=message,
+            )
+            await self._prune_life_media()
+        except asyncio.CancelledError:
+            await self._life_jobs.cancel_generation(job_id)
+            await self._prune_life_media()
+            raise
+        except PageLifeError as exc:
+            await self._life_jobs.fail(job_id, exc.message)
+            await self._prune_life_media()
+        except Exception:
+            await self._life_jobs.fail(job_id, "日常草稿生成或保存失败，请检查配置后重试。")
+            await self._prune_life_media()
+
+    async def life_draft_preview(self, params: Any = None) -> dict[str, Any]:
+        if self._life_closed:
+            raise PageLifeError("LIFE_CLOSED", "日常草稿服务正在关闭，请稍后重试。")
+        params = params or {}
+        if not isinstance(params, dict) or set(params) != {"job_id", "media_id"}:
+            raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿预览参数无效。")
+        _, account_uin = await self._life_owner_status()
+        await self._prune_life_media()
+        job_id, media_id = str(params.get("job_id") or ""), str(params.get("media_id") or "")
+        job = await self._life_jobs.get(job_id, account_uin)
+        owned = self._life_owned_media.get(media_id)
+        if owned is None or owned[0] != job.id or job.state != "succeeded":
+            raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE", "日常草稿图片预览暂不可用。")
+        cached = job.thumbnail_cache.get(media_id)
+        if cached is None:
+            key = (job.id, media_id)
+            task = self._life_preview_inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._life_make_thumbnail(job, media_id))
+                self._life_preview_inflight[key] = task
+            try:
+                cached = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                diagnostic = _safe_diagnostic(asyncio.CancelledError(), "preview_wait")
+                await self._life_jobs.mark_preview_diagnostic(job.id, media_id, diagnostic)
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+            except Exception as error:
+                # Revalidate ownership and retention before exposing a failure from a slower read/raster task.
+                _, current_uin = await self._life_owner_status()
+                if current_uin != account_uin:
+                    raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，不能读取该日常草稿预览。") from None
+                await self._life_jobs.get(job_id, current_uin)
+                diagnostic = _safe_diagnostic(error, "preview_read")
+                if type(error) is _PreviewDiagnosticError:
+                    diagnostic = _safe_diagnostic(error, "preview_read")
+                diagnostic = await self._life_jobs.mark_preview_diagnostic(job.id, media_id, diagnostic)
+                if diagnostic is None:
+                    raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE", "日常草稿图片预览暂不可用。") from None
+                raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE",
+                    f"日常草稿图片预览暂不可用。{diagnostic['code']} {diagnostic['id']}") from None
+            finally:
+                if task.done():
+                    self._life_preview_inflight.pop(key, None)
+        _, current_uin = await self._life_owner_status()
+        if current_uin != account_uin:
+            raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，不能读取该日常草稿预览。")
+        await self._life_jobs.get(job_id, current_uin)
+        return _success({"job_id": job.id, "media_id": media_id,
+                         "data_url": "data:image/jpeg;base64," + base64.b64encode(cached).decode("ascii")})
+
+    async def _life_make_thumbnail(self, job: PageLifeJob, media_id: str) -> bytes:
+        try:
+            return await asyncio.wait_for(
+                self._life_make_thumbnail_bounded(job, media_id), timeout=PAGE_LIFE_PREVIEW_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            raise _PreviewDiagnosticError("PREVIEW_TIMEOUT", "preview_wait") from None
+
+    async def _life_make_thumbnail_bounded(self, job: PageLifeJob, media_id: str) -> bytes:
+        async with self._life_preview_slots:
+            media = job.media_sources.get(media_id)
+            if not isinstance(media, dict):
+                raise _PreviewDiagnosticError("SOURCE_MISSING")
+            source = str(media.get("source") or "")
+
+            async def read_source() -> bytes:
+                scheme = urlparse(source).scheme.lower()
+                if scheme in {"http", "https"}:
+                    try:
+                        stream, _status, _headers = await open_page_media_stream(media)
+                    except QzoneParseError:
+                        raise _PreviewDiagnosticError("REMOTE_POLICY_FAILED") from None
+                    chunks: list[bytes] = []
+                    total = 0
+                    try:
+                        async for chunk in stream:
+                            total += len(chunk)
+                            if total > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
+                                raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
+                            chunks.append(chunk)
+                    finally:
+                        await stream.aclose()
+                    return b"".join(chunks)
+                if scheme in {"data", "base64"} or source.startswith("base64://"):
+                    if len(source) > (PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES * 4 // 3) + 4096:
+                        raise _PreviewDiagnosticError("ENCODED_SOURCE_TOO_LARGE")
+                    data, _mime = self._decode_upload_source(source)
+                    if len(data) > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
+                        raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
+                    return data
+                if media.get("trusted_local"):
+                    path = resolve_trusted_local_media_path(source, name=str(media.get("name") or ""), suffixes=QZONE_IMAGE_SUFFIXES)
+                    if path is None:
+                        raise _PreviewDiagnosticError("SOURCE_MISSING")
+                    return await asyncio.to_thread(lambda: path.open("rb").read(PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES + 1))
+                raise _PreviewDiagnosticError("SOURCE_UNTRUSTED")
+
+            try:
+                data = await read_source()
+                if not data or len(data) > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
+                    raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
+                try:
+                    result = await asyncio.to_thread(self._rasterize_life_preview, data)
+                except _PreviewDiagnosticError:
+                    raise
+                except Exception:
+                    raise _PreviewDiagnosticError("RASTER_DECODE_FAILED", "preview_raster") from None
+                if self._life_closed or not await self._life_jobs.can_cache_thumbnail(job.id):
+                    raise asyncio.CancelledError
+                job.thumbnail_cache[media_id] = result
+                return result
+            except asyncio.CancelledError:
+                raise
+
+    @staticmethod
+    def _rasterize_life_preview(data: bytes) -> bytes:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
+                raise _PreviewDiagnosticError("RASTER_UNSUPPORTED", "preview_raster")
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > PAGE_LIFE_PREVIEW_MAX_PIXELS:
+                raise _PreviewDiagnosticError("PIXEL_LIMIT", "preview_raster")
+            image.seek(0)
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((PAGE_LIFE_PREVIEW_MAX_EDGE, PAGE_LIFE_PREVIEW_MAX_EDGE), Image.Resampling.LANCZOS)
+            for quality in (82, 70, 58, 45, 32):
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                result = output.getvalue()
+                if len(result) <= PAGE_LIFE_PREVIEW_MAX_JPEG_BYTES:
+                    return result
+        raise _PreviewDiagnosticError("OUTPUT_TOO_LARGE", "preview_raster")
+
+    async def close(self) -> None:
+        self._life_closed = True
+        tasks = list(self._life_preview_inflight.values())
+        self._life_preview_inflight.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await self._life_jobs.close()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for upload_id, job_id in list(self._life_owned_upload_ids.items()):
+            self._drop_life_upload(upload_id, job_id)
+        self._life_owned_media.clear()
+        self._life_preview_inflight.clear()
 
     def _limit(self, value: Any, default: int = PAGE_DEFAULT_LIMIT) -> int:
         limit = _to_int(value, default)
@@ -691,47 +1086,105 @@ class QzonePageApi:
             raise QzoneParseError("媒体列表格式不正确。")
         if len(media) > QZONE_MAX_IMAGES:
             raise QzoneParseError(f"QQ空间一次最多只能上传 {QZONE_MAX_IMAGES} 个图片/视频。")
-        payload = await self.controller.publish_post(
-            content=content,
-            sync_weibo=_to_bool(body.get("sync_weibo"), False),
-            media=media,
-            content_sanitized=True,
-        )
-        data = {
-            "message": payload.get("message") or "说说已发布。",
-            "media_count": _to_int(payload.get("media_count"), len(media)),
-            "photo_count": _to_int(payload.get("photo_count"), len(media)),
-        }
-        fid = str(payload.get("fid") or "")
-        login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
-        if fid and login_uin:
-            created_at = int(time.time())
-            ref_entry = FeedEntry(
-                hostuin=login_uin,
-                fid=fid,
-                appid=311,
-                summary=content,
-                nickname=str(self._login_author_payload(status).get("nickname") or ""),
-                created_at=created_at,
-            )
-            data["post"] = {
-                "id": self._post_ref_id(login_uin, fid, 311, snapshot=asdict(ref_entry)),
-                "author": self._login_author_payload(status),
+        life_job_id = str(body.get("life_job_id") or "").strip()
+        life_upload_ids = [str(item.get("upload_id") or "") for item in (body.get("media") or []) if isinstance(item, dict)]
+        owned_jobs = {self._life_owned_upload_ids.get(upload_id, "") for upload_id in life_upload_ids if upload_id in self._life_owned_upload_ids}
+        if owned_jobs and (not life_job_id or owned_jobs != {life_job_id}):
+            raise PageLifeError("LIFE_PROVENANCE_REQUIRED", "日常草稿媒体需要通过原草稿载入并确认发布。")
+        life_job: PageLifeJob | None = None
+        digest = ""
+        should_send = True
+        if life_job_id:
+            if _to_int(status.get("login_uin") or status.get("uin"), 0) <= 0:
+                raise PageLifeError("LIFE_INVALID_OWNER", "请先绑定有效 QQ 账号后发布日常草稿。")
+            life_job = await self._life_jobs.get(life_job_id, _to_int(status.get("login_uin") or status.get("uin"), 0))
+            if life_job.state != "succeeded":
+                raise PageLifeError("LIFE_NOT_READY", "日常草稿尚未生成完成。")
+            for upload_id in life_upload_ids:
+                owner_job = self._life_owned_upload_ids.get(upload_id)
+                if owner_job and owner_job != life_job_id:
+                    raise PageLifeError("LIFE_PROVENANCE_MISMATCH", "媒体不属于当前日常草稿。")
+            sync_weibo = _to_bool(body.get("sync_weibo"), False)
+            canonical_media = [
+                {key: value for key, value in item.items() if key not in {"preview_url", "previewUrl", "_life_job_id", "_life_owner_uin", "_life_media_id"}}
+                for item in media
+            ]
+            digest = hashlib.sha256(json.dumps(
+                {"content": content, "media": canonical_media, "sync_weibo": sync_weibo},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+            ).encode("utf-8")).hexdigest()
+            life_job, should_send = await self._life_jobs.begin_publish(life_job_id, life_job.account_uin, digest)
+            if not should_send:
+                return _success(dict(life_job.publish_result or {}), message="说说已发布。")
+            media = canonical_media
+        dispatched = False
+        publish_phase = "controller_call"
+        try:
+            kwargs = {
                 "content": content,
-                "created_at": created_at,
-                "appid": 311,
-                "stats": {"likes": 0, "comments": 0},
-                "liked": False,
-                "images": [
-                    source
-                    for source in (self._browser_media_source(item) for item in media if isinstance(item, dict))
-                    if source
-                ][:9],
-                "can_comment": True,
-                "can_like": True,
-                "can_delete": True,
+                "sync_weibo": _to_bool(body.get("sync_weibo"), False),
+                "media": media,
+                "content_sanitized": True,
             }
-        return _success(data, message="说说已发布。")
+            if life_job is not None:
+                kwargs["expected_login_uin"] = life_job.account_uin
+            dispatched = True
+            payload = await self.controller.publish_post(**kwargs)
+            publish_phase = "result_processing"
+            data = {
+                "message": "说说已发布。" if life_job is not None else (payload.get("message") or "说说已发布。"),
+                "media_count": _to_int(payload.get("media_count"), len(media)),
+                "photo_count": _to_int(payload.get("photo_count"), len(media)),
+            }
+            fid = str(payload.get("fid") or "")
+            login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
+            if fid and login_uin:
+                created_at = int(time.time())
+                ref_entry = FeedEntry(
+                    hostuin=login_uin,
+                    fid=fid,
+                    appid=311,
+                    summary=content,
+                    nickname=str(self._login_author_payload(status).get("nickname") or ""),
+                    created_at=created_at,
+                )
+                data["post"] = {
+                    "id": self._post_ref_id(login_uin, fid, 311, snapshot=asdict(ref_entry)),
+                    "author": self._login_author_payload(status),
+                    "content": content,
+                    "created_at": created_at,
+                    "appid": 311,
+                    "stats": {"likes": 0, "comments": 0},
+                    "liked": False,
+                    "images": [] if life_job is not None else [
+                        source
+                        for source in (self._browser_media_source(item) for item in media if isinstance(item, dict))
+                        if source
+                    ][:9],
+                    "can_comment": True,
+                    "can_like": True,
+                    "can_delete": True,
+                }
+            if life_job is not None:
+                publish_phase = "bookkeeping"
+                marked = await asyncio.shield(self._life_jobs.mark_published(life_job.id, data))
+                if not marked:
+                    diagnostic = _safe_diagnostic(RuntimeError(), "bookkeeping")
+                    await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
+            return _success(data, message="说说已发布。")
+        except asyncio.CancelledError:
+            if life_job is not None and dispatched:
+                diagnostic = _safe_diagnostic(asyncio.CancelledError(), publish_phase)
+                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
+            raise
+        except Exception as error:
+            if life_job is not None and dispatched:
+                diagnostic = _safe_diagnostic(error, publish_phase)
+                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
+                retained = public_diagnostic(life_job.publish_diagnostic) or diagnostic
+                raise PageLifeError("LIFE_UNKNOWN",
+                    f"发布结果尚不确定，请查询空间状态；系统不会自动重试。{retained['code']} {retained['id']}") from None
+            raise
 
     async def like(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         self._schedule_preload("page like")
@@ -798,14 +1251,18 @@ class QzonePageApi:
             raise QzoneParseError("回复内容不能为空。")
         if not commentid or not comment_uin:
             raise QzoneParseError("缺少要回复的评论。")
-        payload = await self.controller.reply_comment(
-            hostuin=ref.hostuin,
-            fid=ref.fid,
-            commentid=commentid,
-            comment_uin=comment_uin,
-            content=content,
-            appid=ref.appid,
-        )
+        async with self.reply_lock:
+            payload = await self.controller.reply_comment(
+                hostuin=ref.hostuin,
+                fid=ref.fid,
+                commentid=commentid,
+                comment_uin=comment_uin,
+                content=content,
+                appid=ref.appid,
+            )
+            login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
+            if self.manual_reply_marker is not None and login_uin and ref.hostuin == login_uin:
+                await self.manual_reply_marker(login_uin, ref.hostuin, ref.fid, commentid, comment_uin)
         return _success(
             {
                 "reply": {
@@ -817,6 +1274,104 @@ class QzonePageApi:
             },
             message="回复已发送。",
         )
+
+    async def _ai_generation_context(
+        self, body: dict[str, Any] | None, *, reply: bool
+    ) -> tuple[QzonePost, QzoneComment | None]:
+        body = body or {}
+        ref = self._decode_post_ref(body.get("id") or body.get("post_id"))
+        if reply:
+            commentid = str(body.get("commentid") or body.get("comment_id") or "").strip()
+            comment_uin = _to_int(body.get("comment_uin") or body.get("commentUin"), 0)
+            if not commentid or len(commentid) > 128 or not comment_uin:
+                raise QzoneParseError("缺少要回复的评论。")
+        else:
+            commentid, comment_uin = "", 0
+        status = await self._ensure_cookie_bound()
+        busi_param = json.dumps(ref.busi_param, ensure_ascii=False, separators=(",", ":")) if ref.busi_param else ""
+        detail = await asyncio.wait_for(
+            self._detail_uncached(ref, status, busi_param),
+            timeout=max(0.001, float(PAGE_DETAIL_TIMEOUT_SECONDS)),
+        )
+        data = detail.get("data") if isinstance(detail, dict) else None
+        post_data = data.get("post") if isinstance(data, dict) else None
+        if not isinstance(post_data, dict) or data.get("partial"):
+            raise QzoneParseError("说说详情尚未确认，暂时不能生成草稿。")
+        comments = []
+        target = None
+        for item in post_data.get("comments") or []:
+            if not isinstance(item, dict):
+                continue
+            comment = QzoneComment(
+                commentid=str(item.get("id") or item.get("commentid") or ""),
+                uin=_to_int(item.get("author", {}).get("uin") if isinstance(item.get("author"), dict) else item.get("uin"), 0),
+                nickname=str(item.get("author", {}).get("nickname") if isinstance(item.get("author"), dict) else item.get("nickname") or ""),
+                content=str(item.get("content") or ""),
+                created_at=_to_int(item.get("created_at"), 0),
+                parent_id=str(item.get("parent_id") or ""),
+            )
+            comments.append(comment)
+            if comment.commentid == commentid and comment.uin == comment_uin:
+                target = comment
+        if reply and target is None:
+            raise QzoneParseError("目标评论已不存在或不属于这条说说。")
+        author = post_data.get("author") if isinstance(post_data.get("author"), dict) else {}
+        stats = post_data.get("stats") if isinstance(post_data.get("stats"), dict) else {}
+        post = QzonePost(
+            hostuin=ref.hostuin,
+            fid=ref.fid,
+            appid=ref.appid,
+            summary=str(post_data.get("content") or ""),
+            nickname=str(author.get("nickname") or ""),
+            created_at=_to_int(post_data.get("created_at"), 0),
+            like_count=_to_int(stats.get("likes"), 0),
+            comment_count=_to_int(stats.get("comments"), 0),
+            images=[str(item) for item in post_data.get("images", []) if isinstance(item, str)],
+            comments=comments,
+            busi_param=ref.busi_param,
+        )
+        return post, target
+
+    async def _ai_draft(self, body: dict[str, Any] | None, *, reply: bool) -> dict[str, Any]:
+        generator = self.ai_reply_generator if reply else self.ai_comment_generator
+        if generator is None:
+            raise QzoneParseError("AI 草稿功能未配置。")
+        try:
+            await asyncio.wait_for(self._ai_generation_slots.acquire(), timeout=PAGE_AI_SLOT_WAIT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise QzoneParseError("AI 草稿生成繁忙，请稍后重试。") from exc
+        try:
+            async def generate() -> str:
+                post, comment = await self._ai_generation_context(body, reply=reply)
+                try:
+                    value = await generator(post, comment) if reply else await generator(post)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise QzoneParseError("AI 草稿生成失败，请稍后重试。") from exc
+                return str(value or "").strip()
+
+            try:
+                content = await asyncio.wait_for(generate(), timeout=PAGE_AI_DRAFT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise QzoneParseError("AI 草稿生成超时，请稍后重试。") from exc
+            except (QzoneParseError, QzoneNeedsRebind, DaemonUnavailableError):
+                raise
+            except Exception as exc:
+                # Keep controller/provider implementation details out of the Pages response.
+                raise QzoneParseError("获取说说上下文失败，请稍后重试。") from exc
+        finally:
+            self._ai_generation_slots.release()
+        content = str(content or "").strip()
+        if not content:
+            raise QzoneParseError("AI 未生成有效草稿。")
+        return _success({"content": content})
+
+    async def ai_comment(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._ai_draft(body, reply=False)
+
+    async def ai_reply(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._ai_draft(body, reply=True)
 
     async def delete(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         self._schedule_preload("page delete")

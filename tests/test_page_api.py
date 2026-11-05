@@ -4,6 +4,8 @@ import asyncio
 import base64
 import logging
 import struct
+import socket
+import threading
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,8 @@ import httpx
 
 from qzone_bridge import page_api as page_api_module
 from qzone_bridge import page_media as page_media_module
+from qzone_bridge import source_policy
+from qzone_bridge.source_policy import RemoteMediaUrlCheck
 from qzone_bridge.astrbot_logging import configure_standalone_logging
 from qzone_bridge.errors import DaemonUnavailableError, QzoneParseError
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
@@ -152,6 +156,239 @@ def _api(controller: _Controller | None = None) -> QzonePageApi:
         post_service_factory=lambda: None,
         settings=SimpleNamespace(max_feed_limit=20),
     )
+
+
+def test_ai_comment_uses_fresh_post_context_and_returns_draft_only():
+    controller = _Controller()
+    seen = []
+
+    async def generate(post):
+        seen.append(post)
+        return "generated draft"
+
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    result = asyncio.run(api.ai_comment({"id": post_id, "content": "untrusted", "nickname": "forged"}))
+    assert result["data"]["content"] == "generated draft"
+    assert seen[0].summary == "detail text"
+    assert controller.detail_request_count == 1
+
+
+def test_ai_reply_checks_comment_identity_against_fresh_post_detail():
+    controller = _Controller()
+    seen = []
+
+    async def generate(post, comment):
+        seen.append((post, comment))
+        return "reply draft"
+
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_reply_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    result = asyncio.run(api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003}))
+    assert result["data"]["content"] == "reply draft"
+    assert seen[0][1].content == "nice"
+    with pytest.raises(QzoneParseError):
+        asyncio.run(api.ai_reply({"id": post_id, "commentid": "forged", "comment_uin": 30003}))
+
+
+def test_ai_draft_provider_errors_are_redacted():
+    async def generate(post):
+        raise RuntimeError("sensitive provider credential marker")
+
+    controller = _Controller()
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    with pytest.raises(QzoneParseError) as caught:
+        asyncio.run(api.ai_comment({"id": post_id}))
+    payload, _ = page_error_payload(caught.value)
+    assert "sensitive provider credential marker" not in str(payload)
+    assert payload["message"] == "AI 草稿生成失败，请稍后重试。"
+
+
+def test_ai_draft_timeout_covers_context_and_generation_and_releases_slot(monkeypatch):
+    async def generate(post):
+        await asyncio.sleep(0.2)
+        return "too late"
+
+    controller = _Controller()
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    monkeypatch.setattr(page_api_module, "PAGE_AI_DRAFT_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(QzoneParseError, match="生成超时"):
+        asyncio.run(api.ai_comment({"id": post_id}))
+    assert api._ai_generation_slots._value == 2
+
+
+@pytest.mark.parametrize("reply", [False, True])
+def test_real_persona_guard_page_callbacks_return_approved_editable_drafts_only(reply):
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.settings import PluginSettings
+
+    async def scenario():
+        class Manager:
+            async def resolve_selected_persona(self, **kwargs):
+                return "p", {"prompt": "黑发，左耳银色耳环"}, None, False
+            async def get_persona_v3_by_id(self, _pid):
+                return {"prompt": "黑发，左耳银色耳环"}
+        class Provider:
+            def __init__(self): self.calls = 0
+            async def text_chat(self, *, prompt, contexts, system_prompt):
+                self.calls += 1
+                if prompt.startswith("Review whether"):
+                    return '{"accepted":true,"rewrite":""}'
+                return "这句很贴切。"
+        provider = Provider()
+        class Context:
+            persona_manager = Manager()
+            conversation_manager = None
+            platform_manager = None
+            async def get_config(self, umo): return {"provider_settings": {}}
+            async def get_using_provider(self, **kwargs): return provider
+        adapter = QzoneLLM(Context(), PluginSettings(persona_id="p"))
+        controller = _Controller()
+        api = QzonePageApi(
+            controller=controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=lambda post: adapter.generate_comment_text(None, post),
+            ai_reply_generator=lambda post, comment: adapter.generate_reply_text(None, post, comment),
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        if reply:
+            result = await api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003})
+        else:
+            result = await api.ai_comment({"id": post_id})
+        assert result["data"]["content"] == "这句很贴切"
+        assert provider.calls == 2
+        assert controller.commented is None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reply", [False, True])
+def test_real_persona_guard_page_rejection_has_fixed_error_and_no_draft(reply):
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.settings import PluginSettings
+
+    async def scenario():
+        class Manager:
+            async def resolve_selected_persona(self, **kwargs):
+                return "p", {"prompt": "black hair"}, None, False
+            async def get_persona_v3_by_id(self, _pid):
+                return {"prompt": "black hair"}
+        class Provider:
+            def __init__(self): self.calls = 0
+            async def text_chat(self, *, prompt, contexts, system_prompt):
+                self.calls += 1
+                if prompt.startswith("Review whether"):
+                    return '{"accepted":false,"rewrite":"SENSITIVE_REWRITE"}'
+                return "SENSITIVE_DRAFT"
+        provider = Provider()
+        class Context:
+            persona_manager = Manager()
+            conversation_manager = None
+            platform_manager = None
+            async def get_config(self, umo): return {"provider_settings": {}}
+            async def get_using_provider(self, **kwargs): return provider
+        adapter = QzoneLLM(Context(), PluginSettings(persona_id="p"))
+        controller = _Controller()
+        api = QzonePageApi(
+            controller=controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=lambda post: adapter.generate_comment_text(None, post),
+            ai_reply_generator=lambda post, comment: adapter.generate_reply_text(None, post, comment),
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        with pytest.raises(QzoneParseError) as caught:
+            if reply:
+                await api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003})
+            else:
+                await api.ai_comment({"id": post_id})
+        payload, _ = page_error_payload(caught.value)
+        assert payload["message"] == "AI 草稿生成失败，请稍后重试。"
+        assert "SENSITIVE" not in str(payload)
+        assert provider.calls == 3  # candidate, first review, and terminal review of the correction
+        assert controller.commented is None
+    asyncio.run(scenario())
+
+
+def test_ai_draft_slot_saturation_returns_busy_instead_of_queueing():
+    async def run():
+        controller = _Controller()
+        async def generate(post):
+            return "draft"
+        api = QzonePageApi(
+            controller=controller,
+            post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=generate,
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        await api._ai_generation_slots.acquire()
+        await api._ai_generation_slots.acquire()
+        try:
+            with pytest.raises(QzoneParseError, match="繁忙"):
+                await api.ai_comment({"id": post_id})
+        finally:
+            api._ai_generation_slots.release()
+            api._ai_generation_slots.release()
+    asyncio.run(run())
+
+
+def test_manual_page_reply_marks_only_own_posts_for_auto_reply_deduplication():
+    async def run():
+        class OwnController(_Controller):
+            async def list_feeds(self, **kwargs):
+                payload = await super().list_feeds(**kwargs)
+                payload["items"][0]["hostuin"] = self.status["login_uin"]
+                return payload
+
+        own_marks = []
+        own_controller = OwnController()
+        async def marker(*args):
+            own_marks.append(args)
+            return True
+        own_api = QzonePageApi(
+            controller=own_controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20), manual_reply_marker=marker,
+        )
+        own_id = (await own_api.feed({}))['data']['items'][0]['id']
+        await own_api.reply({"id": own_id, "commentid": "comment-1", "comment_uin": 30003, "content": "manual"})
+        assert own_marks == [(10001, 10001, "fid-secret", "comment-1", 30003)]
+
+        friend_marks = []
+        friend_api = QzonePageApi(
+            controller=_Controller(), post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            manual_reply_marker=lambda *args: _record(friend_marks, *args),
+        )
+        friend_id = (await friend_api.feed({}))['data']['items'][0]['id']
+        await friend_api.reply({"id": friend_id, "commentid": "comment-1", "comment_uin": 30003, "content": "manual"})
+        assert friend_marks == []
+    asyncio.run(run())
+
+
+async def _record(items, *values):
+    items.append(values)
+    return True
 
 
 def _png_bytes(width: int = 32, height: int = 32, *, pad_bytes: int = 0) -> bytes:
@@ -1350,7 +1587,11 @@ def test_page_media_proxy_forwards_range_and_forces_download(monkeypatch) -> Non
         )
 
     async def scenario():
-        monkeypatch.setattr(page_media_module, "is_remote_media_url_allowed", lambda _value: True)
+        monkeypatch.setattr(
+            page_media_module,
+            "check_remote_media_url",
+            lambda _value: RemoteMediaUrlCheck(True, "ALLOWED", "photo.qq.com"),
+        )
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         stream, status, headers = await open_page_media_stream(
             {
@@ -1374,6 +1615,40 @@ def test_page_media_proxy_forwards_range_and_forces_download(monkeypatch) -> Non
     assert headers["Content-Range"] == "bytes 0-3/8"
     assert headers["Content-Disposition"].startswith("attachment;")
     assert "filename*=UTF-8''" in headers["Content-Disposition"]
+
+
+def test_page_media_dns_and_redirect_checks_run_off_event_loop(monkeypatch) -> None:
+    loop_thread = threading.get_ident()
+    dns_threads = []
+    dns_hosts = []
+
+    def lookup(host, *args, **kwargs):
+        dns_hosts.append(host)
+        dns_threads.append(threading.get_ident())
+        return [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "media.example.test":
+            return httpx.Response(302, headers={"location": "https://cdn.example.test/file.mp4"}, request=request)
+        return httpx.Response(206, headers={"content-type": "video/mp4"}, content=b"mock", request=request)
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
+        try:
+            stream, status, _ = await open_page_media_stream(
+                {"source": "https://media.example.test/base.mp4", "mime_type": "video/mp4"}, client=client
+            )
+            body = b"".join([chunk async for chunk in stream])
+            return body, status
+        finally:
+            await client.aclose()
+
+    body, status = asyncio.run(scenario())
+    assert (body, status) == (b"mock", 206)
+    assert dns_hosts == ["media.example.test", "cdn.example.test"]
+    assert dns_threads and all(thread_id != loop_thread for thread_id in dns_threads)
 
 
 def test_page_feed_exposes_normalized_media_without_losing_legacy_images() -> None:

@@ -21,6 +21,17 @@
     "description": "大模型配置",
     "type": "object",
     "items": {
+      "persona_id": {
+        "description": "上下文无关的定时/Pages AI 草稿可选人格 ID；留空沿用 AstrBot 当前人格",
+        "type": "string",
+        "default": ""
+      },
+      "context_umo": {
+        "description": "定时/Pages AI 草稿使用的 AstrBot 会话标识；留空时仅在唯一 aiocqhttp 实例下从管理群/管理员推导",
+        "type": "string",
+        "default": "",
+        "hint": "格式示例：平台实例ID:GroupMessage:群号 或 平台实例ID:FriendMessage:QQ号。"
+      },
       "post_provider_id": {
         "description": "写说说用的大模型提供商",
         "type": "string",
@@ -116,6 +127,12 @@
         "type": "text",
         "default": "这条帖子收到了一条评论，请自然回复此条评论，不要解释。",
         "hint": "用于 回评/回复评论。"
+      },
+      "persona_consistency_check": {
+        "description": "人格一致性复核",
+        "type": "bool",
+        "default": true,
+        "hint": "选中人格非空时复核最终说说、评论和回复；通常增加1次调用，需修订时最多增加2次。关闭后保留旧行为。"
       }
     }
   },
@@ -244,6 +261,18 @@
         "default": false,
         "hint": "开启后，trigger.publish_cron 触发时会读取 Life Scheduler 日程、让 LLM 写自拍提示词、调用 OmniDraw generate_selfie(return_result=true) 取图，再发说说或存草稿。关闭时沿用原纯文本定时发说说。"
       },
+      "timezone": {
+        "description": "生活日程时区",
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "hint": "用于判断日程当前/过去/未来；可填 IANA 名称（如 Asia/Shanghai）或 UTC+08:00。无效时区会中止本次 Life 任务。"
+      },
+      "image_style_prompt": {
+        "description": "Life 图片画风约束",
+        "type": "text",
+        "default": "日系二次元厚涂插画，细腻笔触与自然柔和的明暗塑造，保留角色五官、发丝和配饰细节；采用自拍或生活随手构图，不作真人摄影或写实皮肤质感，不强制平涂赛璐璐，不改变角色原有形象",
+        "hint": "作为提示词级画风要求，不保证具体模型或成图完全遵循；留空关闭新增画风约束。"
+      },
       "use_life_context": {
         "description": "读取 Life Scheduler 日程",
         "type": "bool",
@@ -313,14 +342,26 @@
       "image_prompt_template": {
         "description": "自拍提示词模板",
         "type": "text",
-        "default": "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\\n\\n{life_context}",
+        "default": "为人物生成自然的自拍或生活随手构图提示，结合有依据的当前场景，不推断未知活动或地点。\\n\\n{life_context}",
         "hint": "支持 {life_context} 占位符。"
       },
       "caption_prompt": {
         "description": "配文提示词模板",
         "type": "text",
-        "default": "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
+        "default": "根据给定日期的生活日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
         "hint": "支持 {life_context} 和 {image_prompt} 占位符。"
+      },
+      "inherit_persona_visual": {
+        "description": "Life 图片提示继承人格视觉特征",
+        "type": "bool",
+        "default": true,
+        "hint": "使用视觉专用摘要或经过原文片段校验的视觉描述；不会把完整人格交给图片提示词。"
+      },
+      "persona_visual_prompt": {
+        "description": "管理员填写的视觉专用人格摘要",
+        "type": "text",
+        "default": "",
+        "hint": "仅填写外观、配饰和特征服装，最多2400字符；左右侧等细节建议明确描述。"
       }
     }
   },
@@ -506,5 +547,21 @@
     "type": "float",
     "default": 0.35,
     "hint": "发布结果图远程头像或图片预览的单资源超时。"
+  },
+  "auto_reply": {
+    "description": "自动回复自己说说下的新评论",
+    "type": "object",
+    "items": {
+      "enabled": {"description": "启用自动回复", "type": "bool", "default": false},
+      "poll_interval": {"description": "轮询间隔（秒）", "type": "int", "default": 120, "hint": "最小 30 秒。"},
+      "delay_min": {"description": "发送前最短等待（秒）", "type": "int", "default": 30},
+      "delay_max": {"description": "发送前最长等待（秒）", "type": "int", "default": 180},
+      "recent_posts": {"description": "每轮检查的最近说说数", "type": "int", "default": 5},
+      "max_per_run": {"description": "每轮最多回复数", "type": "int", "default": 2},
+      "daily_limit": {"description": "每日回复预留额度", "type": "int", "default": 20},
+      "skip_low_information": {"description": "跳过低信息评论", "type": "bool", "default": true},
+      "reply_probability": {"description": "自动回复概率", "type": "float", "default": 0.8, "slider": {"min": 0.0, "max": 1.0}},
+      "ignore_users": {"description": "自动回评忽略的 QQ 号或昵称列表", "type": "list", "default": []}
+    }
   }
 }

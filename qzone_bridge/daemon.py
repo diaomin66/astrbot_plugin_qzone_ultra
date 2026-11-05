@@ -1122,6 +1122,7 @@ class QzoneDaemonService:
         self.state.runtime.started_at = now_iso()
         self.state.runtime.last_seen_at = now_iso()
         self.client = QzoneClient(self.state.session, timeout=request_timeout, user_agent=user_agent)
+        self._session_target_lock = asyncio.Lock()
         self.keepalive_interval = max(30, int(keepalive_interval))
         self.health_state = "idle"
         self._keepalive_task: asyncio.Task | None = None
@@ -1341,21 +1342,22 @@ class QzoneDaemonService:
         resolved_uin = normalize_uin(cookies, override=uin)
         if not resolved_uin:
             raise QzoneParseError("Cookie 缺少 uin / p_uin，无法识别登录 QQ")
-        self.state.session = SessionState(
-            uin=resolved_uin,
-            cookies=cookies,
-            qzonetokens={},
-            source=source,
-            updated_at=now_iso(),
-            last_ok_at="",
-            last_error=None,
-            revision=self.state.session.revision + 1,
-            needs_rebind=False,
-        )
-        self.client.update_session(self.state.session)
-        self.client.feed_cache.clear()
-        self.recent_feed_entries.clear()
-        self.save()
+        async with self._session_target_lock:
+            self.state.session = SessionState(
+                uin=resolved_uin,
+                cookies=cookies,
+                qzonetokens={},
+                source=source,
+                updated_at=now_iso(),
+                last_ok_at="",
+                last_error=None,
+                revision=self.state.session.revision + 1,
+                needs_rebind=False,
+            )
+            self.client.update_session(self.state.session)
+            self.client.feed_cache.clear()
+            self.recent_feed_entries.clear()
+            self.save()
         try:
             await self.warmup()
         except Exception as exc:
@@ -1364,21 +1366,22 @@ class QzoneDaemonService:
         return self.snapshot()
 
     async def unbind(self) -> dict[str, Any]:
-        self.state.session = SessionState(
-            uin=0,
-            cookies={},
-            qzonetokens={},
-            source="manual",
-            updated_at=now_iso(),
-            last_ok_at="",
-            last_error=None,
-            revision=self.state.session.revision + 1,
-            needs_rebind=True,
-        )
-        self.client.update_session(self.state.session)
-        self.client.feed_cache.clear()
-        self.recent_feed_entries.clear()
-        self.save()
+        async with self._session_target_lock:
+            self.state.session = SessionState(
+                uin=0,
+                cookies={},
+                qzonetokens={},
+                source="manual",
+                updated_at=now_iso(),
+                last_ok_at="",
+                last_error=None,
+                revision=self.state.session.revision + 1,
+                needs_rebind=True,
+            )
+            self.client.update_session(self.state.session)
+            self.client.feed_cache.clear()
+            self.recent_feed_entries.clear()
+            self.save()
         self.health_state = "needs_rebind"
         return self.snapshot()
 
@@ -2560,6 +2563,34 @@ class QzoneDaemonService:
         sync_weibo: bool = False,
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
+        expected_login_uin: int | None = None,
+    ) -> dict[str, Any]:
+        if expected_login_uin is None:
+            return await self._publish_post_impl(
+                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized
+            )
+        async with self._session_target_lock:
+            live_session = getattr(self.client, "session", None)
+            if (
+                self.state.session.uin != int(expected_login_uin)
+                or live_session is None
+                or live_session.uin != int(expected_login_uin)
+                or self._session_needs_rebind()
+                or live_session.needs_rebind
+                or not live_session.cookies
+            ):
+                raise QzoneNeedsRebind("登录账号已变化，日常草稿未发布。")
+            return await self._publish_post_impl(
+                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized
+            )
+
+    async def _publish_post_impl(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool = False,
+        media: list[dict[str, Any]] | None = None,
+        content_sanitized: bool = False,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         normalized_media = collapse_single_video_cover_companion_media(normalize_media_list(media))
@@ -3142,11 +3173,14 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 )
             content = str(body.get("content") or "")
             media = body.get("media") or body.get("attachments") or body.get("photos") or []
+            expected_login_uin = body.get("expected_login_uin")
+            expected_login_uin = _body_int(body, "expected_login_uin", 0) if expected_login_uin is not None else None
             return await service.publish_post(
                 content=content,
                 sync_weibo=_body_bool(body, "sync_weibo", False),
                 media=media,
                 content_sanitized=_body_bool(body, "content_sanitized", False),
+                expected_login_uin=expected_login_uin,
             )
 
         return await _bridge_response(

@@ -63,7 +63,12 @@ from .parser import (
     unwrap_payload,
 )
 from .render import cookie_summary
-from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, resolve_remote_media_redirect
+from .source_policy import (
+    RemoteMediaUrlCheck,
+    check_remote_media_redirect,
+    check_remote_media_url,
+    is_windows_drive_path,
+)
 from .utils import extract_callback_json, json_loads, now_iso
 
 log = get_logger(__name__)
@@ -114,6 +119,21 @@ IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
 IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
 IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 REMOTE_IMAGE_DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _remote_media_policy_error(result: RemoteMediaUrlCheck, *, redirect: bool = False) -> QzoneParseError:
+    messages = {
+        "INVALID_URL": "URL 格式无效",
+        "UNSAFE_HOST": "主机地址不安全",
+        "DNS_LOOKUP_FAILED": "域名解析失败",
+        "UNSAFE_DNS": "DNS 结果不是公网地址",
+    }
+    reason = result.code if result.code in messages else "INVALID_URL"
+    stage = "图片跳转地址校验失败" if redirect else "图片来源校验失败"
+    return QzoneParseError(
+        f"{stage}（{reason}）：{messages[reason]}；主机={result.host}",
+        detail={"reason": reason, "host": result.host},
+    )
 
 
 @dataclass(slots=True)
@@ -1125,16 +1145,27 @@ class QzoneClient:
         )
 
     async def _load_image_source(self, media: dict[str, Any]) -> tuple[bytes, str, str]:
-        item = normalize_media_item(media, default_kind="image")
+        try:
+            item = normalize_media_item(media, default_kind="image")
+        except (TypeError, ValueError, UnicodeError):
+            raw_source = media.get("source", "") if isinstance(media, dict) else ""
+            result = await asyncio.to_thread(check_remote_media_url, str(raw_source or ""))
+            raise _remote_media_policy_error(result)
         if item is None or not item.source:
             raise QzoneParseError("图片来源为空或无效")
 
         source = item.source.strip()
+        try:
+            parsed = urlparse(source)
+        except (TypeError, ValueError, UnicodeError):
+            result = await asyncio.to_thread(check_remote_media_url, source)
+            raise _remote_media_policy_error(result)
+        if parsed.scheme.lower() in {"http", "https"}:
+            result = await asyncio.to_thread(check_remote_media_url, source)
+            if not result.allowed:
+                raise _remote_media_policy_error(result)
         filename = item.name or source_name(source) or "image.jpg"
         mime_type = item.mime_type
-        parsed = urlparse(source)
-        if parsed.scheme.lower() in {"http", "https"} and not await asyncio.to_thread(is_remote_media_url_allowed, source):
-            raise QzoneParseError("图片 URL 不安全，仅允许 http/https 公网地址", detail={"url": source})
         cached = self._cached_image_source(source) if parsed.scheme.lower() in {"http", "https"} else None
         if cached is not None:
             cached_data, cached_mime = cached
@@ -1166,12 +1197,13 @@ class QzoneClient:
                         if response.status_code in QZONE_REDIRECT_STATUS_CODES:
                             if redirect_count >= 3:
                                 raise QzoneRequestError("图片跳转次数过多", detail={"url": source})
-                            redirected = resolve_remote_media_redirect(
+                            redirected, redirect_check = await asyncio.to_thread(
+                                check_remote_media_redirect,
                                 current_url,
                                 response.headers.get("location", ""),
                             )
                             if not redirected:
-                                raise QzoneParseError("图片跳转地址不安全", detail={"url": current_url})
+                                raise _remote_media_policy_error(redirect_check, redirect=True)
                             current_url = redirected
                             continue
                         if response.status_code >= 400:
