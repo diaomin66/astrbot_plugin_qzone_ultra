@@ -307,7 +307,7 @@
         "description": "失败策略",
         "type": "string",
         "default": "skip",
-        "hint": "skip=日程/提示词/生图失败则跳过；text_only=生图失败时允许只发文字/存文字草稿。"
+        "hint": "skip=失败则跳过；text_only=非超时生图失败时允许只发文字/存文字草稿。任何生成阶段超时都会停止任务，不回退文字。"
       },
       "aspect_ratio": {
         "description": "OmniDraw 自拍宽高比",
@@ -332,6 +332,27 @@
         "type": "int",
         "default": 1,
         "hint": "自动/手动日常说说调用 generate_selfie(return_result=true) 未返回图片或抛错时的额外重试次数，0=不重试，最大 5。"
+      },
+      "generation_timeout_seconds": {
+        "description": "日常说说生成总时限（秒）",
+        "type": "int",
+        "default": 300,
+        "slider": { "min": 30, "max": 1800, "step": 1 },
+        "hint": "覆盖日程读取、提示词、配图和配文生成；不含保存草稿及 QQ 发布。范围 30–1800 秒，子阶段仍受总时限剩余时间约束。"
+      },
+      "image_timeout_seconds": {
+        "description": "日常说说配图时限（秒）",
+        "type": "int",
+        "default": 180,
+        "slider": { "min": 10, "max": 1200, "step": 1 },
+        "hint": "覆盖 OmniDraw 全部尝试及重试间隔。范围 10–1200 秒，实际时限取本项与总时限剩余时间的较小值；超时会终止本次生成。"
+      },
+      "text_timeout_seconds": {
+        "description": "日常说说单阶段文案时限（秒）",
+        "type": "int",
+        "default": 90,
+        "slider": { "min": 5, "max": 600, "step": 1 },
+        "hint": "自拍提示词和配文/审核各自获得一份独立预算。范围 5–600 秒，每阶段实际时限取本项与总时限剩余时间的较小值。"
       },
       "static_caption": {
         "description": "固定配文",

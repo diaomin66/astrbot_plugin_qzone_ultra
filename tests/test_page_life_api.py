@@ -11,7 +11,7 @@ import httpx
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftStore
-from qzone_bridge.errors import QzoneParseError, QzoneRequestError
+from qzone_bridge.errors import LifeGenerationError, QzoneParseError, QzoneRequestError
 from qzone_bridge.media import PostPayload
 from qzone_bridge.page_api import QzonePageApi
 from qzone_bridge.page_life import PageLifeError
@@ -98,6 +98,29 @@ def test_life_generation_account_change_saves_no_draft(tmp_path):
         await job.task
         result = await api._life_jobs.get(job.id, 123)
         assert result.state == "failed" and result.message == "登录账号已变化，草稿未保存。"
+        assert await api.draft_store.list_async() == []
+        await api.close()
+
+    asyncio.run(scenario())
+
+
+def test_life_generation_failure_retains_fixed_code_and_phase(tmp_path):
+    async def scenario():
+        controller = Controller()
+
+        async def generate(_progress):
+            raise LifeGenerationError("LIFE_IMAGE_TIMEOUT", "image")
+
+        api = _api(tmp_path, controller, generate)
+        response = await api.start_life_draft({"action": "generate_draft", "request_id": "timeout"})
+        job = await api._life_jobs.get(response["data"]["id"], 123)
+        await job.task
+        state = (await api.get_life_draft({"id": job.id}))["data"]
+        assert state["state"] == "failed"
+        assert state["generation_error"] == {
+            "code": "LIFE_IMAGE_TIMEOUT", "phase": "image",
+            "message": "日常说说配图生成超时，已停止且未发布",
+        }
         assert await api.draft_store.list_async() == []
         await api.close()
 

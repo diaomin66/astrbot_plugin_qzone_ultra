@@ -16,6 +16,11 @@ PAGE_LIFE_MAX_REQUEST_IDS_PER_JOB = 16
 PAGE_LIFE_PHASES = {"preparing", "context", "image", "caption", "saving"}
 PAGE_LIFE_STATES = {"running", "succeeded", "failed", "cancelled"}
 PAGE_LIFE_PUBLISH_STATES = {"ready", "sending", "published", "unknown"}
+LIFE_GENERATION_CODES = {
+    "LIFE_TOTAL_TIMEOUT", "LIFE_IMAGE_TIMEOUT", "LIFE_TEXT_TIMEOUT",
+    "LIFE_CALL_BUDGET_EXHAUSTED", "LIFE_PERSONA_FAILED", "LIFE_GENERATION_FAILED",
+}
+LIFE_GENERATION_PHASES = {"context", "image_prompt", "image", "caption", "generation"}
 
 DIAGNOSTIC_MESSAGES = {
     "INTERFACE_ERROR": "调用接口时发生错误",
@@ -92,6 +97,7 @@ class PageLifeJob:
     publish_diagnostic: dict[str, Any] | None = None
     preview_diagnostic: dict[str, Any] | None = None
     preview_diagnostic_key: str = field(default="", repr=False)
+    generation_error: dict[str, str] | None = None
 
 
 class PageLifeJobStore:
@@ -303,7 +309,10 @@ class PageLifeJobStore:
             self._prune_locked(job.updated_at)
             return True
 
-    async def fail(self, job_id: str, message: str = "日常草稿生成失败，请检查配置后重试。") -> bool:
+    async def fail(
+        self, job_id: str, message: str = "日常草稿生成失败，请检查配置后重试。",
+        *, code: str = "", phase: str = "",
+    ) -> bool:
         async with self._lock:
             job = self._jobs.get(job_id)
             if self._closed or job is None or job.state != "running":
@@ -311,6 +320,8 @@ class PageLifeJobStore:
             job.state = "failed"
             job.phase = ""
             job.message = message
+            if code in LIFE_GENERATION_CODES and phase in LIFE_GENERATION_PHASES:
+                job.generation_error = {"code": code, "phase": phase, "message": message}
             job.updated_at = self._clock()
             job.completed_at = job.updated_at
             if self._active_job_id == job_id:
@@ -429,6 +440,7 @@ class PageLifeJobStore:
             "publish_state": job.publish_state,
             "publish_diagnostic": public_diagnostic(job.publish_diagnostic),
             "preview_diagnostic": public_diagnostic(job.preview_diagnostic),
+            "generation_error": dict(job.generation_error) if job.generation_error else None,
         }
         if include_result and job.state == "succeeded":
             payload["content"] = job.content

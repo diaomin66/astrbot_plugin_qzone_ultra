@@ -10,9 +10,17 @@ QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令�
 
 Pages 中 Life 草稿载入、清空和确认发布使用插件页内确认框，以兼容 AstrBot 限制原生浏览器确认弹窗的 iframe。Life 发布在确认后会重新核对账号、草稿和编辑器快照；普通说说发布仍沿用原有交互。
 
-## 0.9.7 更新概览
+## 0.9.8 更新概览
 
-### Life 操作诊断
+### Life 生成分阶段时限（0.9.8）
+
+Life 日常说说配置中新增三个秒数预算：`generation_timeout_seconds`（默认 300，范围 30–1800）限制读取上下文、提示词、图片及配文生成的总时长；`image_timeout_seconds`（默认 180，范围 10–1200）覆盖一次 OmniDraw 生图及其所有配置重试/间隔；`text_timeout_seconds`（默认 90，范围 5–600）分别独立应用于自拍提示词和配文/审核，二者各获得一份预算。实际每阶段期限取阶段预算与总期限剩余时间的较小值。
+
+预算在每次任务开始时冻结。插件配置的总预算或阶段预算到期时，会取消当前生成阶段并停止本次 Life 任务，不会继续重试或以 `text_only` 发布；依赖自身抛出的超时异常不冒充本地预算到期，仍按原失败策略处理。总期限在草稿保存、QQ 发布、通知和预览前结束，故这些动作不受生成计时器取消。普通非 Life 文案仍为 90 秒，页面 AI 评论/回复仍为 45 秒。Python 运行时要求为 3.12 或更高版本（AstrBot >=4.16 的现有宿主要求）。
+
+超时日志和 WebUI 失败状态只显示固定错误类别、阶段和耗时，不含底层异常、URL、令牌或提示词。WebUI Life 任务的 15 分钟保留期只用于已结束任务；运行中的任务不因终态 TTL 被清理。
+
+### Life 操作诊断（0.9.7）
 
 Life 发布结果仍按原规则保守标记为“未确认”，系统不会因诊断信息自动重试或重置状态。0.9.7 起，保留中的任务状态会额外显示固定错误类别、处理阶段和短编号；图片预览诊断与发布结果分开显示，预览失败不代表发布失败原因。诊断不包含原始异常、媒体 URL、Cookie 或草稿正文。
 
@@ -37,7 +45,7 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 - 定时任务：复用 `trigger.publish_cron`，开启 `life_publish.enabled=true` 后优先走日常自拍链路。
 - 日程联动：建议搭配 [木有知大佬的 Life Scheduler](https://github.com/muyouzhi6/astrbot_plugin_life_scheduler) 使用，调用 `astrbot_plugin_life_scheduler.get_life_context()` 读取今日安排，让内容贴合当天场景。
 - OmniDraw 联动：强制使用 `return_result=true` 回收图片结果，不依赖 OmniDraw 自己下发消息，方便统一发布到 QQ 空间。
-- 失败策略：支持 `life_publish.image_retry_count`、`life_publish.failure_policy=skip/text_only`，生成失败时可跳过或退回文字发布。
+- 失败策略：支持 `life_publish.image_retry_count`、`life_publish.failure_policy=skip/text_only`；非超时错误按配置处理，任何阶段超时均停止本次生成，不回退文字发布。
 - 手动体验：管理员发送 `发日常说说` 可立即跑完整链路，并收到“完成文本 + 渲染图片”的直观反馈。
 
 ### Life 日程时间与图片画风
@@ -193,9 +201,12 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
 | `llm.persona_id` | 空 | 用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
 | `llm.context_umo` | 空 | 定时/Pages 草稿使用的 AstrBot 会话（如 `平台实例ID:GroupMessage:群号` 或 `平台实例ID:FriendMessage:QQ号`）；为空时仅在唯一 aiocqhttp 实例下由管理群/管理员推导，实例缺失或不唯一时使用全局默认上下文，不猜实例。显式 `persona_id` 仍只选择人格，`context_umo` 用于会话/配置上下文；真实消息始终使用消息自身会话 |
-| `llm.persona_consistency_check` | `true` | 有非空选中人格时，对清理/截断后的最终说说、新闻、评论、回复和自动配文执行严格复核；通常额外1次复核，需改写时最多2次，失败则跳过发送。关闭可维持旧行为。每个逻辑操作共享最多6次Provider调用和90秒预算 |
+| `llm.persona_consistency_check` | `true` | 有非空选中人格时，对清理/截断后的最终说说、新闻、评论、回复和自动配文执行严格复核；通常额外1次复核，需改写时最多2次，失败则跳过发送。关闭可维持旧行为。每个逻辑操作共享最多6次Provider调用；普通文本任务预算90秒，Life 使用单独的生成总时限和阶段时限 |
 | `life_publish.inherit_persona_visual` | `true` | Life 图像提示是否继承视觉资料；禁用或选中人格为空/禁用时不提取 |
 | `life_publish.persona_visual_prompt` | 空 | 管理员编写的外观/配饰/服装专用摘要（最多2400字符）；优先于自动片段提取 |
+| `life_publish.generation_timeout_seconds` | `300` | Life 生成总时限（30–1800 秒）；不含草稿保存、QQ 发布及通知 |
+| `life_publish.image_timeout_seconds` | `180` | OmniDraw 单次生图及全部重试的时限（10–1200 秒） |
+| `life_publish.text_timeout_seconds` | `90` | 自拍提示词、配文/复核各自独立使用的阶段时限（5–600 秒） |
 | `auto_reply.enabled` | `false` | 自说说新增评论自动回复开关；默认关闭 |
 | `auto_reply.poll_interval` | `120` | 自动回评轮询间隔（秒） |
 | `auto_reply.delay_min` / `auto_reply.delay_max` | `30` / `180` | 自动回评发送前随机等待范围（秒） |
@@ -275,7 +286,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - 选中人格默认可为 Life 图片提示提供来源文本中的外观、配饰和特征服装片段；不会把完整人格交给图片提示词。管理员填写 `life_publish.persona_visual_prompt` 后优先使用该视觉专用摘要；该摘要最多2400字符。关闭 `life_publish.inherit_persona_visual` 可禁用继承。自动提取由模型完成，片段校验不能证明语义筛选绝对正确；视觉摘要提供更精确控制，生成图片本身不会被插件视觉验收。
 - 默认启用人格复核后，普通最终文案为生成+复核共2次逻辑调用；如需一次修订则最多3次。非空 Persona、未填写视觉摘要且启用图片提示时，Life 通常为视觉提取1次 + 图片提示1次 + 文案生成/复核2次，共4次；文案需要修订时共5次。填写摘要省去视觉提取。关闭图片 LLM 时不会隐式调用视觉提取；自动配文关闭时仍使用管理员配置的静态文案。
 - 人格提示词注入和复核可改善一致性，但模型输出不保证完全遵循；插件不强制固定口头禅或句尾词。
-- 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
-- OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
+- 如果 Life Scheduler 或 OmniDraw 出现非超时错误，会按 `failure_policy` 处理。
+- OmniDraw 未返回图片或调用抛出非超时错误时，会按 `life_publish.image_retry_count` 重试；超时不重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。
 - 管理员可发送 `发日常说说` 立即跑完整链路并直接发布；该指令会沿用各项日程/LLM/OmniDraw 开关，但会强制发布，不受 `life_publish.mode=draft` 影响。

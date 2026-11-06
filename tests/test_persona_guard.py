@@ -4,7 +4,10 @@ import json
 import pytest
 
 from qzone_bridge.persona_guard import (
+    GenerationTimeoutError,
     PersonaConsistencyError,
+    current_scope,
+    generation_phase,
     generation_scope,
     invoke_provider,
     parse_review,
@@ -81,6 +84,122 @@ def test_nested_scopes_share_invocation_budget_and_deadline():
             assert outer.calls == 6
 
     asyncio.run(scenario())
+
+
+def test_native_generation_timeout_is_typed_and_cleans_context():
+    async def scenario():
+        with pytest.raises(GenerationTimeoutError) as exc:
+            async with generation_scope(timeout=0.01, kind="total", phase="context"):
+                await asyncio.sleep(1)
+        assert exc.value.code == "BUDGET_EXHAUSTED"
+        assert exc.value.kind == "total"
+        assert exc.value.phase == "context"
+        assert current_scope() is None
+
+    asyncio.run(scenario())
+
+
+def test_phase_timeout_does_not_reset_snapshot_or_rewrite_shared_scope():
+    from qzone_bridge.persona_guard import get_snapshot, set_snapshot
+
+    async def scenario():
+        async with generation_scope(timeout=1, kind="total") as scope:
+            before_calls = scope.calls
+            set_snapshot({"persona": "pinned"})
+            with pytest.raises(GenerationTimeoutError) as exc:
+                async with generation_phase(timeout=0.01, phase="image", kind="image"):
+                    set_snapshot({"persona": "newly pinned"})
+                    await asyncio.sleep(1)
+            assert (exc.value.kind, exc.value.phase) == ("image", "image")
+            assert current_scope() is scope
+            assert scope.calls == before_calls
+            assert get_snapshot() == {"persona": "newly pinned"}
+
+    asyncio.run(scenario())
+
+
+def test_external_cancellation_and_raw_provider_timeout_are_not_reclassified():
+    async def scenario():
+        async def cancelled():
+            async with generation_scope(timeout=1, kind="total"):
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled()
+        assert current_scope() is None
+
+        async def swallowed_external_cancel():
+            async with generation_scope(timeout=1):
+                asyncio.current_task().cancel()
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    return "late success"
+
+        with pytest.raises(asyncio.CancelledError):
+            await swallowed_external_cancel()
+        assert current_scope() is None
+        async with generation_scope(timeout=1):
+            async def raw_timeout():
+                raise TimeoutError("dependency detail")
+            with pytest.raises(TimeoutError, match="dependency detail"):
+                await invoke_provider(raw_timeout)
+
+    asyncio.run(scenario())
+
+
+def test_total_deadline_wins_when_phase_deadline_is_later_by_rounding():
+    async def scenario():
+        with pytest.raises(GenerationTimeoutError) as exc:
+            async with generation_scope(timeout=0.02, kind="total", phase="context") as scope:
+                remaining = scope.deadline - asyncio.get_running_loop().time()
+                async with generation_phase(timeout=remaining, phase="image", kind="image"):
+                    await asyncio.sleep(1)
+        assert exc.value.kind == "total"
+        assert exc.value.phase == "image"
+
+    asyncio.run(scenario())
+
+
+def test_external_cancel_competing_with_total_deadline_is_preserved():
+    async def scenario():
+        async def run():
+            async with generation_scope(timeout=0.03, kind="total", phase="context") as scope:
+                task = asyncio.current_task()
+                loop = asyncio.get_running_loop()
+                loop.call_at(scope.deadline, task.cancel)
+                remaining = scope.deadline - loop.time()
+                async with generation_phase(timeout=remaining, phase="image", kind="image"):
+                    await asyncio.sleep(1)
+
+        with pytest.raises(asyncio.CancelledError):
+            await run()
+        assert current_scope() is None
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_life_phases_keep_deadlines_isolated_and_restore_scope():
+    async def run(timeout):
+        async with generation_scope(timeout=1, kind="total") as scope:
+            before = scope.deadline
+            try:
+                async with generation_phase(timeout=timeout, phase="caption", kind="text"):
+                    await asyncio.sleep(0.06)
+                result = "complete"
+            except GenerationTimeoutError as exc:
+                result = (exc.kind, exc.phase)
+            assert current_scope() is scope and scope.deadline == before
+            return result
+
+    async def scenario():
+        return await asyncio.gather(run(0.02), run(0.20))
+
+    short, long = asyncio.run(scenario())
+    assert short == ("text", "caption")
+    assert long == "complete"
+    assert current_scope() is None
 
 
 def test_concurrent_generation_scopes_keep_independent_budgets_and_snapshots():

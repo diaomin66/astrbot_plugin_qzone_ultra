@@ -6,10 +6,15 @@ import asyncio
 import contextvars
 import json
 import re
-import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
+
+
+TimeoutKind = Literal["generic", "total", "image", "text"]
+TimeoutPhase = Literal["context", "image_prompt", "image", "caption", "generation"]
+_TIMEOUT_KINDS = {"generic", "total", "image", "text"}
+_TIMEOUT_PHASES = {"context", "image_prompt", "image", "caption", "generation"}
 
 
 class PersonaConsistencyError(RuntimeError):
@@ -20,15 +25,30 @@ class PersonaConsistencyError(RuntimeError):
         super().__init__(f"人格一致性检查失败（{self.code}）")
 
 
+class GenerationTimeoutError(PersonaConsistencyError):
+    """An owned asyncio deadline expired, with safe fixed classification."""
+
+    def __init__(self, *, kind: str = "generic", phase: str = "generation"):
+        self.kind: TimeoutKind = kind if kind in _TIMEOUT_KINDS else "generic"  # type: ignore[assignment]
+        self.phase: TimeoutPhase = phase if phase in _TIMEOUT_PHASES else "generation"  # type: ignore[assignment]
+        super().__init__("BUDGET_EXHAUSTED")
+
+
 @dataclass(slots=True)
 class GenerationScope:
     deadline: float
     max_calls: int = 6
     calls: int = 0
+    deadline_kind: TimeoutKind = "generic"
+    phase: TimeoutPhase = "generation"
+    last_phase: TimeoutPhase = "generation"
 
     def consume(self) -> None:
-        if self.calls >= self.max_calls or time.monotonic() >= self.deadline:
+        if self.calls >= self.max_calls:
             raise PersonaConsistencyError("BUDGET_EXHAUSTED")
+        loop = asyncio.get_running_loop()
+        if loop.time() >= self.deadline:
+            raise GenerationTimeoutError(kind=self.deadline_kind, phase=self.phase)
         self.calls += 1
 
 
@@ -37,39 +57,76 @@ _snapshot: contextvars.ContextVar[Any] = contextvars.ContextVar("qzone_generatio
 
 
 @asynccontextmanager
-async def generation_scope(*, timeout: float = 90.0):
+async def _deadline_context(scope: GenerationScope, *, phase: str | None = None):
+    """Translate only this timeout context's own cancellation into a typed error."""
+    timeout_cm = asyncio.timeout_at(scope.deadline)
+    task = asyncio.current_task()
+    cancellation_baseline = task.cancelling() if task is not None else 0
+    try:
+        async with timeout_cm:
+            yield
+    except TimeoutError:
+        if timeout_cm.expired():
+            raise GenerationTimeoutError(kind=scope.deadline_kind, phase=phase or scope.last_phase) from None
+        raise
+    else:
+        if task is not None and task.cancelling() > cancellation_baseline:
+            raise asyncio.CancelledError
+        if timeout_cm.expired() or asyncio.get_running_loop().time() >= scope.deadline:
+            raise GenerationTimeoutError(kind=scope.deadline_kind, phase=phase or scope.last_phase)
+
+
+@asynccontextmanager
+async def generation_scope(*, timeout: float = 90.0, kind: str = "generic", phase: str = "generation"):
     """Nest scopes without resetting the parent's call count or deadline."""
+    loop = asyncio.get_running_loop()
     parent = _scope.get()
-    deadline = min(parent.deadline, time.monotonic() + timeout) if parent else time.monotonic() + timeout
+    local_deadline = loop.time() + max(0.0, float(timeout))
+    deadline = min(parent.deadline, local_deadline) if parent else local_deadline
+    parent_wins = parent is not None and parent.deadline <= local_deadline
     scope = parent or GenerationScope(deadline=deadline)
-    previous_deadline = scope.deadline
+    previous = (scope.deadline, scope.deadline_kind, scope.phase)
     if parent:
         scope.deadline = deadline
+        if not parent_wins:
+            scope.deadline_kind = kind if kind in _TIMEOUT_KINDS else "generic"  # type: ignore[assignment]
+            scope.phase = phase if phase in _TIMEOUT_PHASES else "generation"  # type: ignore[assignment]
+    else:
+        scope.deadline_kind = kind if kind in _TIMEOUT_KINDS else "generic"  # type: ignore[assignment]
+        scope.phase = phase if phase in _TIMEOUT_PHASES else "generation"  # type: ignore[assignment]
+        scope.last_phase = scope.phase
     token = _scope.set(scope)
     snapshot_token = _snapshot.set(_snapshot.get())
-    task = asyncio.current_task()
-    timed_out = False
-
-    def cancel_at_deadline() -> None:
-        nonlocal timed_out
-        timed_out = True
-        if task is not None and not task.done():
-            task.cancel()
-
-    loop = asyncio.get_running_loop()
-    timer = loop.call_later(max(0.001, deadline - time.monotonic()), cancel_at_deadline)
     try:
-        yield scope
-    except asyncio.CancelledError:
-        if timed_out:
-            raise PersonaConsistencyError("BUDGET_EXHAUSTED") from None
-        raise
+        async with _deadline_context(scope):
+            yield scope
     finally:
-        timer.cancel()
         _snapshot.reset(snapshot_token)
         _scope.reset(token)
         if parent:
-            scope.deadline = previous_deadline
+            scope.deadline, scope.deadline_kind, scope.phase = previous
+
+
+@asynccontextmanager
+async def generation_phase(*, timeout: float, phase: str, kind: str):
+    """Temporarily tighten the active deadline without changing snapshot context."""
+    scope = _scope.get()
+    if scope is None:
+        raise RuntimeError("generation_phase requires an active generation scope")
+    loop = asyncio.get_running_loop()
+    local_deadline = loop.time() + max(0.0, float(timeout))
+    previous = (scope.deadline, scope.deadline_kind, scope.phase)
+    parent_wins = scope.deadline <= local_deadline
+    scope.deadline = min(scope.deadline, local_deadline)
+    scope.last_phase = phase if phase in _TIMEOUT_PHASES else "generation"  # type: ignore[assignment]
+    scope.phase = phase if phase in _TIMEOUT_PHASES else "generation"  # type: ignore[assignment]
+    if not parent_wins:
+        scope.deadline_kind = kind if kind in _TIMEOUT_KINDS else "generic"  # type: ignore[assignment]
+    try:
+        async with _deadline_context(scope, phase=phase):
+            yield scope
+    finally:
+        scope.deadline, scope.deadline_kind, scope.phase = previous
 
 
 def current_scope() -> GenerationScope | None:
@@ -88,16 +145,34 @@ async def invoke_provider(call: Callable[[], Awaitable[Any]], *, timeout: float 
     scope = current_scope()
     if scope is not None:
         scope.consume()
-        remaining = scope.deadline - time.monotonic()
+        remaining = scope.deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise PersonaConsistencyError("BUDGET_EXHAUSTED")
+            raise GenerationTimeoutError(kind=scope.deadline_kind, phase=scope.phase)
         timeout = min(timeout, remaining) if timeout is not None else remaining
     if timeout is None:
         return await call()
+    timeout_cm = asyncio.timeout(timeout)
+    task = asyncio.current_task()
+    cancellation_baseline = task.cancelling() if task is not None else 0
     try:
-        return await asyncio.wait_for(call(), timeout=max(0.001, timeout))
-    except asyncio.TimeoutError:
-        raise PersonaConsistencyError("BUDGET_EXHAUSTED") from None
+        async with timeout_cm:
+            result = await call()
+    except TimeoutError:
+        if timeout_cm.expired():
+            if scope is not None and scope.deadline <= asyncio.get_running_loop().time():
+                raise GenerationTimeoutError(kind=scope.deadline_kind, phase=scope.phase) from None
+            raise GenerationTimeoutError(kind="generic", phase="generation") from None
+        raise
+    if task is not None and task.cancelling() > cancellation_baseline:
+        raise asyncio.CancelledError
+    loop = asyncio.get_running_loop()
+    if timeout_cm.expired():
+        if scope is not None and scope.deadline <= loop.time():
+            raise GenerationTimeoutError(kind=scope.deadline_kind, phase=scope.phase)
+        raise GenerationTimeoutError(kind="generic", phase="generation")
+    if scope is not None and loop.time() >= scope.deadline:
+        raise GenerationTimeoutError(kind=scope.deadline_kind, phase=scope.phase)
+    return result
 
 
 def parse_review(value: str, *, max_rewrite: int = 2000) -> tuple[bool, str]:

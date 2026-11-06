@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 from urllib.parse import unquote_to_bytes, urlparse
 
-from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .errors import DaemonUnavailableError, LifeGenerationError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import (
     QZONE_IMAGE_SUFFIXES,
     QZONE_MAX_IMAGES,
@@ -431,6 +431,9 @@ class QzonePageApi:
             raise
         except PageLifeError as exc:
             await self._life_jobs.fail(job_id, exc.message)
+            await self._prune_life_media()
+        except LifeGenerationError as exc:
+            await self._life_jobs.fail(job_id, exc.message, code=exc.code, phase=exc.phase)
             await self._prune_life_media()
         except Exception:
             await self._life_jobs.fail(job_id, "日常草稿生成或保存失败，请检查配置后重试。")

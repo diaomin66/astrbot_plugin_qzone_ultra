@@ -36,7 +36,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110504
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110701
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -530,7 +530,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
         "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
         "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
         "qzone_bridge.page_api": {"QzonePageApi": ("start_life_draft", "get_life_draft", "life_draft_preview", "close")},
-        "qzone_bridge.page_life": {"PageLifeJobStore": ("admit", "begin_publish", "mark_published", "close")},
+        "qzone_bridge.page_life": {"PageLifeJobStore": ("admit", "begin_publish", "mark_published", "fail", "close")},
     }
     for module_name, classes in contract_methods.items():
         module = sys.modules.get(module_name)
@@ -562,8 +562,10 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
         "qzone_bridge.social": ("extract_nickname",),
         "qzone_bridge.source_policy": ("check_remote_media_url", "check_remote_media_redirect"),
         "qzone_bridge.persona_guard": (
-            "PersonaConsistencyError", "generation_scope", "parse_review", "parse_visual_projection"
+            "PersonaConsistencyError", "GenerationTimeoutError", "generation_scope", "generation_phase",
+            "parse_review", "parse_visual_projection"
         ),
+        "qzone_bridge.errors": ("LifeGenerationError",),
     }
     for module_name, attributes in contract_attributes.items():
         module = sys.modules.get(module_name)
@@ -621,6 +623,9 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "life_publish_aspect_ratio",
                 "life_publish_size",
                 "life_publish_extra_params",
+                "life_publish_generation_timeout_seconds",
+                "life_publish_image_timeout_seconds",
+                "life_publish_text_timeout_seconds",
                 "life_publish_static_caption",
                 "life_publish_image_prompt_template",
                 "life_publish_timezone",
@@ -703,6 +708,13 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             "QzoneLLM.generate_guarded_text": ("normalizer", "scope_timeout"),
             "QzoneLLM.generate_persona_visual_projection": ("allow_automatic",),
             "QzoneLLM.prepare_persona_snapshot": ("require_pinned_provider",),
+        },
+        "qzone_bridge.persona_guard": {
+            "generation_scope": ("timeout", "kind", "phase"),
+            "generation_phase": ("timeout", "phase", "kind"),
+        },
+        "qzone_bridge.page_life": {
+            "PageLifeJobStore.fail": ("code", "phase"),
         },
         "qzone_bridge.persona": {"resolve_persona_prompt": ("resolved_umo",)},
     }
@@ -800,9 +812,16 @@ from qzone_bridge.errors import (
     QzoneCookieAcquireError,
     QzoneNeedsRebind,
     QzoneParseError,
+    LifeGenerationError,
 )
 from qzone_bridge.llm import QzoneLLM
-from qzone_bridge.persona_guard import PersonaConsistencyError, generation_scope
+from qzone_bridge.persona_guard import (
+    GenerationTimeoutError,
+    PersonaConsistencyError,
+    current_scope,
+    generation_phase,
+    generation_scope,
+)
 from qzone_bridge.local_media import resolve_trusted_local_media_path
 from qzone_bridge.media import (
     MEDIA_BASE64_SOURCE_KEYS,
@@ -4441,6 +4460,8 @@ class QzoneStablePlugin(Star):
             "你是 QQ 空间说说文案助手。只输出最终可发布的简短中文说说，"
             "不要解释，不要输出 JSON/Markdown/标题，语气自然有生活感。"
         )
+        scope = current_scope()
+        scope_timeout = max(0.001, scope.deadline - asyncio.get_running_loop().time()) if scope else 90.0
         return await self._llm_adapter().generate_guarded_text(
             event,
             prompt,
@@ -4452,6 +4473,7 @@ class QzoneStablePlugin(Star):
             authoritative_facts=f"life_context={life_context}\nimage_prompt={image_prompt}\ntime_rules={time_rules}",
             format_contract="Nonempty concise Chinese QQ Zone caption; only final publishable text following the configured caption instructions.",
             fallback_text=static_caption,
+            scope_timeout=scope_timeout,
         )
 
     def _scheduled_plugin_event(self, *, prompt: str = "") -> Any:
@@ -4621,20 +4643,20 @@ class QzoneStablePlugin(Star):
                 last_result = result
                 if attempt_index < total_attempts:
                     logger.warning(
-                        "qzone life publish OmniDraw selfie returned no image attempt=%s/%s; retrying: %s",
+                        "qzone life publish OmniDraw selfie returned no image attempt=%s/%s; retrying",
                         attempt_index,
                         total_attempts,
-                        message,
                     )
+            except GenerationTimeoutError:
+                raise
             except Exception as exc:
                 last_exception = exc
                 if attempt_index >= total_attempts:
                     raise
                 logger.warning(
-                    "qzone life publish OmniDraw selfie failed attempt=%s/%s; retrying: %s",
+                    "qzone life publish OmniDraw selfie failed attempt=%s/%s; retrying",
                     attempt_index,
                     total_attempts,
-                    exc,
                 )
             if attempt_index < total_attempts:
                 await asyncio.sleep(min(0.5, 0.1 * attempt_index))
@@ -4702,10 +4724,9 @@ class QzoneStablePlugin(Star):
         force_publish: bool = False,
         notify_admin: bool = True,
     ) -> dict[str, Any] | None:
-        async with generation_scope():
-            prepared = await self._auto_life_publish_once_scoped(
-                event, force_publish=force_publish, notify_admin=notify_admin
-            )
+        prepared = await self._prepare_life_generation(
+            event, force_publish=force_publish, notify_admin=notify_admin
+        )
         if prepared is None:
             return None
         post, life_keys, omnidraw_success = prepared
@@ -4719,6 +4740,66 @@ class QzoneStablePlugin(Star):
         )
         return payload
 
+    @staticmethod
+    def _life_budget_snapshot(settings: Any) -> tuple[int, int, int]:
+        """Freeze operation budgets synchronously before any context/tool await."""
+        return (
+            int(getattr(settings, "life_publish_generation_timeout_seconds", 300)),
+            int(getattr(settings, "life_publish_image_timeout_seconds", 180)),
+            int(getattr(settings, "life_publish_text_timeout_seconds", 90)),
+        )
+
+    @staticmethod
+    def _life_generation_failure(exc: Exception) -> LifeGenerationError:
+        if isinstance(exc, GenerationTimeoutError):
+            if exc.kind == "total":
+                code = "LIFE_TOTAL_TIMEOUT"
+            elif exc.kind == "image":
+                code = "LIFE_IMAGE_TIMEOUT"
+            else:
+                code = "LIFE_TEXT_TIMEOUT"
+            return LifeGenerationError(code, exc.phase)
+        if isinstance(exc, PersonaConsistencyError) and exc.code == "BUDGET_EXHAUSTED":
+            return LifeGenerationError("LIFE_CALL_BUDGET_EXHAUSTED", "generation")
+        if isinstance(exc, PersonaConsistencyError):
+            return LifeGenerationError("LIFE_PERSONA_FAILED", "caption")
+        return LifeGenerationError("LIFE_GENERATION_FAILED", "generation")
+
+    async def _prepare_life_generation(
+        self,
+        event: AstrMessageEvent | None,
+        *,
+        force_publish: bool,
+        notify_admin: bool,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> tuple[PostPayload, list[str], bool] | None:
+        total_seconds, image_seconds, text_seconds = self._life_budget_snapshot(self.settings)
+        started = asyncio.get_running_loop().time()
+        try:
+            async with generation_scope(timeout=total_seconds, kind="total", phase="context"):
+                return await self._auto_life_publish_once_scoped(
+                    event,
+                    force_publish=force_publish,
+                    notify_admin=notify_admin,
+                    progress_callback=progress_callback,
+                    image_timeout_seconds=image_seconds,
+                    text_timeout_seconds=text_seconds,
+                )
+        except (GenerationTimeoutError, PersonaConsistencyError) as exc:
+            safe = self._life_generation_failure(exc)
+            logger.warning(
+                "qzone life generation stopped code=%s phase=%s elapsed_seconds=%.3f total_budget_seconds=%s",
+                safe.code, safe.phase, asyncio.get_running_loop().time() - started, total_seconds,
+            )
+            raise safe from None
+        except Exception:
+            safe = LifeGenerationError("LIFE_GENERATION_FAILED", "generation")
+            logger.warning(
+                "qzone life generation stopped code=%s phase=%s elapsed_seconds=%.3f total_budget_seconds=%s",
+                safe.code, safe.phase, asyncio.get_running_loop().time() - started, total_seconds,
+            )
+            raise safe from None
+
     async def _auto_life_publish_once_scoped(
         self,
         event: AstrMessageEvent | None = None,
@@ -4726,6 +4807,8 @@ class QzoneStablePlugin(Star):
         force_publish: bool = False,
         notify_admin: bool = True,
         progress_callback: Callable[[str], None] | None = None,
+        image_timeout_seconds: int = 180,
+        text_timeout_seconds: int = 90,
     ) -> tuple[PostPayload, list[str], bool] | None:
         def report(phase: str) -> None:
             if progress_callback is not None:
@@ -4759,9 +4842,9 @@ class QzoneStablePlugin(Star):
             life_data, life_context = await self._get_life_context()
             projection = project_life_context(life_data, operation_inputs.clock)
             life_context = projection.caption_context()
-        except Exception as exc:
+        except Exception:
             if getattr(self.settings, "life_publish_use_life_context", True):
-                logger.warning("qzone scheduled life publish skipped: life context failed: %s", exc)
+                logger.warning("qzone scheduled life publish skipped: life context failed")
                 if self.settings.life_publish_failure_policy != "text_only":
                     return
             life_context = projection.caption_context()
@@ -4772,32 +4855,39 @@ class QzoneStablePlugin(Star):
         image_flow_failed = False
         try:
             report("image")
-            image_prompt = await self._generate_life_image_prompt(
-                event, life_context, projection=projection,
-                style_prompt=operation_inputs.image_style_prompt,
-            )
+            async with generation_phase(timeout=text_timeout_seconds, phase="image_prompt", kind="text"):
+                image_prompt = await self._generate_life_image_prompt(
+                    event, life_context, projection=projection,
+                    style_prompt=operation_inputs.image_style_prompt,
+                )
             if not image_prompt.strip():
                 raise RuntimeError("LLM 未生成自拍提示词")
-            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
+            async with generation_phase(timeout=image_timeout_seconds, phase="image", kind="image"):
+                media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
             if not media:
                 raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
         except Exception as exc:
             image_flow_failed = True
             logger.warning("qzone scheduled life publish image flow failed")
+            if isinstance(exc, GenerationTimeoutError):
+                raise
             if isinstance(exc, PersonaConsistencyError) and exc.code == "BUDGET_EXHAUSTED":
-                return
+                raise
             if self.settings.life_publish_failure_policy != "text_only":
                 return
 
         try:
             report("caption")
-            caption = await self._generate_life_caption(
-                event, life_context=life_context, image_prompt=image_prompt, projection=projection
-            )
+            async with generation_phase(timeout=text_timeout_seconds, phase="caption", kind="text"):
+                caption = await self._generate_life_caption(
+                    event, life_context=life_context, image_prompt=image_prompt, projection=projection,
+                )
         except Exception as exc:
             logger.warning("qzone scheduled life publish caption failed")
+            if isinstance(exc, GenerationTimeoutError):
+                raise
             if isinstance(exc, PersonaConsistencyError):
-                return
+                raise
             if self.settings.life_publish_failure_policy != "text_only":
                 return
             caption = str(getattr(self.settings, "life_publish_static_caption", "") or "")
@@ -4840,10 +4930,9 @@ class QzoneStablePlugin(Star):
         }
 
     async def _generate_life_web_draft(self, progress_callback: Callable[[str], None]) -> PostPayload | None:
-        async with generation_scope():
-            prepared = await self._auto_life_publish_once_scoped(
-                None, force_publish=False, notify_admin=False, progress_callback=progress_callback
-            )
+        prepared = await self._prepare_life_generation(
+            None, force_publish=False, notify_admin=False, progress_callback=progress_callback
+        )
         return prepared[0] if prepared is not None else None
 
     @staticmethod
@@ -5907,14 +5996,14 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        except Exception as exc:
-            logger.warning("qzone manual life publish failed: %s", exc, exc_info=True)
-            yield self._command_result(event, f"日常说说发布失败：{exc}")
+        except Exception:
+            logger.warning("qzone manual life publish failed")
+            yield self._command_result(event, "日常说说操作失败，请检查插件日志。")
             return
         if not payload:
             yield self._command_result(
                 event,
-                "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
+                "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw 和 LLM 配置。",
             )
             return
         post = getattr(payload, "post", None)

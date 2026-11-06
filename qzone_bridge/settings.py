@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from .news import normalize_news_scopes
@@ -116,6 +117,25 @@ def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: in
     return number
 
 
+def _budget_seconds(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    """Parse a finite integer budget; malformed values use the safe default."""
+    if isinstance(value, bool) or value is None:
+        number = default
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        number = int(value) if math.isfinite(value) and value.is_integer() else default
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            number = int(text) if text and text.lstrip("+-").isdigit() else default
+        except (ValueError, OverflowError):
+            number = default
+    else:
+        number = default
+    return min(maximum, max(minimum, number))
+
+
 def _as_float(value: Any, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
     try:
         if isinstance(value, bool):
@@ -207,6 +227,9 @@ class PluginSettings:
     life_publish_size: str = ""
     life_publish_extra_params: str = ""
     life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
+    life_publish_generation_timeout_seconds: int = 300
+    life_publish_image_timeout_seconds: int = 180
+    life_publish_text_timeout_seconds: int = 90
     life_publish_timezone: str = "Asia/Shanghai"
     life_publish_image_style_prompt: str = DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT
     life_publish_static_caption: str = "今日份生活碎片。"
@@ -379,6 +402,15 @@ class PluginSettings:
                 DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
                 minimum=0,
                 maximum=5,
+            ),
+            life_publish_generation_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "generation_timeout_seconds", 300), 300, minimum=30, maximum=1800
+            ),
+            life_publish_image_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "image_timeout_seconds", 180), 180, minimum=10, maximum=1200
+            ),
+            life_publish_text_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "text_timeout_seconds", 90), 90, minimum=5, maximum=600
             ),
             life_publish_timezone=str(_nested(mapping, "life_publish", "timezone", "Asia/Shanghai")),
             life_publish_image_style_prompt=str(

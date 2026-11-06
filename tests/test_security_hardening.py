@@ -85,6 +85,405 @@ def _import_main_with_stubs(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("main")
 
 
+def test_main_life_pipeline_uses_fresh_image_and_caption_budgets(monkeypatch):
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+        def caption_time_rules(self): return "time rules"
+
+    class _Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *args: _Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: _Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: _Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "draft", "failure_policy": "skip",
+            "use_life_context": True, "use_llm_image_prompt": True,
+            "auto_caption": True, "static_caption": "static", "image_retry_count": 0,
+        },
+    })
+    plugin._life_budget_snapshot = lambda _settings: (4.0, 2.0, 1.0)
+
+    async def get_context():
+        return {"current": "fixture"}, "context"
+
+    async def prompt(event, *_args, **_kwargs):
+        await plugin.llm.prepare_persona_snapshot(event, prefer_current_provider=True)
+        await asyncio.sleep(0.01)
+        return "prompt"
+
+    async def image(*_args, **_kwargs):
+        await asyncio.sleep(1.2)  # longer than text cap, shorter than image cap
+        nonlocal current_provider
+        current_provider = replacement_provider
+        return [object()], {"success": True, "images": ["fixture"]}
+
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    class Manager:
+        async def resolve_selected_persona(self, **_kwargs):
+            return "p", {"prompt": "black hair"}, None, False
+        async def get_persona_v3_by_id(self, _pid):
+            return {"prompt": "black hair"}
+    class Provider:
+        def __init__(self, answer):
+            self.answer = answer
+            self.calls = []
+        async def text_chat(self, *, prompt, **_kwargs):
+            self.calls.append(prompt)
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return self.answer
+    provider = Provider("caption")
+    replacement_provider = Provider("should not be used")
+    current_provider = provider
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, _umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **_kwargs): return current_provider
+    plugin._context = Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
+    result = asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
+    assert result is not None
+    assert result[0].content == "caption"
+    assert result[0].media and result[2] is True
+    assert len(provider.calls) == 2 and replacement_provider.calls == []
+
+
+def test_life_pipeline_shares_six_provider_calls_across_prompt_and_caption(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+    from qzone_bridge.persona_guard import set_snapshot
+
+    main = _import_main_with_stubs(monkeypatch)
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="skip", life_publish_mode="draft",
+        life_publish_static_caption="static", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (5.0, 2.0, 2.0)
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, **_kwargs):
+            self.calls.append(prompt)
+            return "approved"
+    provider = Provider()
+    plugin.llm = main.QzoneLLM(object(), plugin.settings)
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(event, *_args, **_kwargs):
+        set_snapshot({"persona_prompt": "fixture", "provider_id": "", "provider": provider,
+                      "umo": None, "pin_provider": False})
+        for index in range(4):
+            await plugin.llm.generate_text(None, f"prompt-{index}", system_prompt="system", inherit_persona=False)
+        return "image prompt"
+    async def image(*_args, **_kwargs): return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        for index in range(3):
+            await plugin.llm.generate_text(None, f"caption-{index}", system_prompt="system", inherit_persona=False)
+        return "should not reach"
+    async def publish(*_args, **_kwargs):
+        pytest.fail("provider call-budget exhaustion must stop before publication")
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert exc.value.code == "LIFE_CALL_BUDGET_EXHAUSTED"
+    assert len(provider.calls) == 6
+
+
+def test_life_image_timeout_is_terminal_even_with_text_only_policy(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_image_retry_count=2, life_publish_static_caption="must-not-fallback",
+        life_publish_generation_timeout_seconds=300, life_publish_image_timeout_seconds=180,
+        life_publish_text_timeout_seconds=90,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (1.0, 0.03, 0.5)
+    async def get_context(): return {"current": "fixture"}, "context"
+    async def prompt(*_args, **_kwargs): return "prompt"
+    attempts, captions, publishes = [], [], []
+    async def image(*_args, **_kwargs):
+        attempts.append(1)
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            # A dependency that swallows timeout cancellation must not make a late image publishable.
+            return [object()], {"success": True}
+        return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        captions.append(1)
+        return "unexpected"
+    async def publish(*_args, **_kwargs):
+        publishes.append(1)
+        return {}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == ("LIFE_IMAGE_TIMEOUT", "image")
+    assert len(attempts) == 1 and captions == [] and publishes == []
+
+
+def test_life_pipeline_propagates_external_cancel_swallowed_by_image_dependency(monkeypatch):
+    from qzone_bridge.persona_guard import current_scope, get_snapshot, set_snapshot
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (10.0, 5.0, 5.0)
+    calls = {"caption": 0, "publish": 0}
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(*_args, **_kwargs):
+        set_snapshot({"pinned": "fixture"})
+        return "prompt"
+    async def image(*_args, **_kwargs):
+        task = asyncio.current_task()
+        asyncio.get_running_loop().call_soon(task.cancel)
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        calls["caption"] += 1
+        return "late"
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(plugin._auto_life_publish_once())
+    assert calls == {"caption": 0, "publish": 0}
+    assert current_scope() is None and get_snapshot() is None
+
+
+def test_life_generation_error_and_log_never_expose_dependency_sentinels(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+    records = []
+    class Recorder:
+        def warning(self, *args, **_kwargs): records.append(args)
+    monkeypatch.setattr(main, "logger", Recorder())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_generation_timeout_seconds=30,
+        life_publish_image_timeout_seconds=10,
+        life_publish_text_timeout_seconds=5,
+    )
+    async def fail_with_sensitive_detail(*_args, **_kwargs):
+        raise RuntimeError("TOKEN_SENTINEL https://host.invalid/a?key=x PROMPT_SENTINEL")
+    plugin._auto_life_publish_once_scoped = fail_with_sensitive_detail
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
+    serialized = repr(records) + str(exc.value) + repr(exc.value.__dict__)
+    for sentinel in ("TOKEN_SENTINEL", "host.invalid", "key=x", "PROMPT_SENTINEL"):
+        assert sentinel not in serialized
+    assert exc.value.code == "LIFE_GENERATION_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("stall_stage", "budgets", "expected"),
+    [
+        ("context", (0.03, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "context")),
+        ("image_prompt", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "image_prompt")),
+        ("image", (0.30, 0.03, 0.20), ("LIFE_IMAGE_TIMEOUT", "image")),
+        ("sync_image", (0.30, 0.03, 0.20), ("LIFE_IMAGE_TIMEOUT", "image")),
+        ("caption", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "caption")),
+        ("caption_swallow", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "caption")),
+        ("total_image", (0.03, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "image")),
+        ("total_caption", (0.10, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "caption")),
+    ],
+)
+def test_life_stage_and_total_deadlines_fail_closed(monkeypatch, stall_stage, budgets, expected):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden-fallback", life_publish_image_retry_count=2,
+    )
+    plugin._life_budget_snapshot = lambda _settings: budgets
+    calls = {"image": 0, "caption": 0, "publish": 0}
+
+    async def get_context():
+        if stall_stage == "context":
+            await asyncio.sleep(1)
+        return {"fixture": True}, "context"
+
+    async def image_prompt(*_args, **_kwargs):
+        if stall_stage == "image_prompt":
+            await asyncio.sleep(1)
+        return "prompt"
+
+    async def image(*_args, **_kwargs):
+        calls["image"] += 1
+        if stall_stage == "sync_image":
+            __import__("time").sleep(0.05)  # no event-loop turn for the native timer to fire
+        elif stall_stage in {"image", "total_image"}:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(0.02)
+        return [object()], {"success": True}
+
+    async def caption(*_args, **_kwargs):
+        calls["caption"] += 1
+        if stall_stage == "caption_swallow":
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return "late-caption"
+        if stall_stage in {"caption", "total_caption"}:
+            await asyncio.sleep(1)
+        return "unexpected-caption"
+
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = image_prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == expected
+    assert calls["publish"] == 0
+    if stall_stage in {"context", "image_prompt", "image", "sync_image", "total_image"}:
+        assert calls["caption"] == 0
+
+
+def test_total_deadline_during_caption_sync_provider_is_reported_as_caption(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+    from qzone_bridge.persona_guard import invoke_provider
+
+    main = _import_main_with_stubs(monkeypatch)
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (0.10, 1.0, 1.0)
+    calls = {"publish": 0}
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(*_args, **_kwargs): return "prompt"
+    async def image(*_args, **_kwargs): return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        async def synchronous_provider():
+            __import__("time").sleep(0.15)
+            return "late caption"
+        return await invoke_provider(synchronous_provider)
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == ("LIFE_TOTAL_TIMEOUT", "caption")
+    assert calls["publish"] == 0
+
+
 def test_main_import_recovers_from_stale_renderer_module(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -323,9 +722,9 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.7"
-    assert "version: 0.9.7" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110504
+    assert qzone_bridge.__version__ == "0.9.8"
+    assert "version: 0.9.8" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110701
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
@@ -368,6 +767,9 @@ def test_life_timezone_and_style_settings_defaults_and_explicit_empty_style() ->
         ("qzone_bridge.settings", "PluginSettings", "life_publish_inherit_persona_visual"),
         ("qzone_bridge.settings", "PluginSettings", "life_publish_persona_visual_prompt"),
         ("qzone_bridge.settings", "PluginSettings", "life_publish_timezone"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_generation_timeout_seconds"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_image_timeout_seconds"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_text_timeout_seconds"),
         ("qzone_bridge.settings", "PluginSettings", "life_publish_image_style_prompt"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_enabled"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_poll_interval"),
@@ -403,6 +805,27 @@ def test_bridge_cache_contract_rejects_each_missing_new_config_field(
     fields = dict(cls.__dataclass_fields__)
     fields.pop(missing_field)
     monkeypatch.setattr(cls, "__dataclass_fields__", fields)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(
+    ("module_name", "target", "stale"),
+    [
+        ("qzone_bridge.persona_guard", "generation_scope", lambda *, timeout=90: None),
+        ("qzone_bridge.persona_guard", "generation_phase", lambda *, timeout: None),
+        ("qzone_bridge.page_life", "PageLifeJobStore.fail", lambda self, job_id, message="": None),
+    ],
+)
+def test_bridge_cache_contract_rejects_stale_budget_and_life_failure_signatures(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, target: str, stale
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules[module_name]
+    parent, _, attribute = target.rpartition(".")
+    if parent:
+        monkeypatch.setattr(getattr(module, parent), attribute, stale)
+    else:
+        monkeypatch.setattr(module, target, stale)
     assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
 
 
@@ -8562,7 +8985,7 @@ def test_life_operation_freezes_clock_style_and_projection_before_scheduler_awai
     plugin._generate_life_image_prompt = image_prompt
     plugin._generate_life_selfie_media = media
     plugin._generate_life_caption = caption
-    prepared = asyncio.run(plugin._auto_life_publish_once_scoped())
+    prepared = asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
     projection = captured["image_projection"]
     assert prepared is not None
     assert projection is captured["caption_projection"]
@@ -8692,8 +9115,10 @@ def test_real_persona_guard_life_caption_failure_never_publishes_or_falls_back(
     async def selfie(event, prompt):
         return [object()], {"success": True, "images": []}
     plugin._generate_life_selfie_media = selfie
-    result = asyncio.run(plugin._auto_life_publish_once())
-    assert result is None
+    from qzone_bridge.errors import LifeGenerationError
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert exc.value.code == "LIFE_PERSONA_FAILED"
 
 
 def test_life_projection_failure_text_only_uses_separately_approved_caption(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -8826,7 +9251,7 @@ def test_life_publish_generation_scope_ends_before_publish_or_notify(monkeypatch
     main = _import_main_with_stubs(monkeypatch)
 
     @asynccontextmanager
-    async def short_scope():
+    async def short_scope(*_args, **_kwargs):
         async with generation_scope(timeout=0.01):
             yield
 
