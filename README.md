@@ -209,7 +209,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 开启后，`trigger.publish_cron` 触发时会先走这条链路：
 
 1. 调用 `astrbot_plugin_life_scheduler.get_life_context()` 获取今日日程
-2. 把日程交给 LLM 生成适合 OmniDraw 自拍模式的提示词
+2. 如果 OmniDraw 提供 `resolve_selfie_context()`，先根据当前活动和当天穿搭选择本次人设，再把选定的穿搭交给 LLM 生成自拍提示词
 3. 调用 OmniDraw 的 `generate_selfie(return_result=true)` 获取返回式图片
 4. 自动配文并发说说，或按配置写入草稿
 
@@ -227,6 +227,9 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 说明：
 
 - 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
+- 支持自动人设选择的 OmniDraw 会把选定的人设 ID 传入本次自拍；配图提示词和说说配文使用同一份穿搭上下文，不修改全局默认人设。先在 OmniDraw 的“自动自拍人设选择”中开启功能，并把工作服、睡衣等映射到已有的人设 ID。
+- Life Scheduler 提供 `current_activity` 和 `current_time` 时，两者会加入提示词上下文。模板应以当前活动、本次人设和本次穿搭为准，全天日程只作为背景。
+- 旧版 OmniDraw 没有选择接口时继续使用原自拍流程；选择接口出错时也会回退到原流程。
 - 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
 - OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。

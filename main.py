@@ -4148,6 +4148,14 @@ class QzoneStablePlugin(Star):
 
         lines: list[str] = []
         meta = life_data.get("meta") if isinstance(life_data.get("meta"), dict) else {}
+        for key, label in (
+            ("current_time", "当前时间"),
+            ("current_activity", "当前活动"),
+            ("selfie_persona", "本次形象"),
+        ):
+            value = str(life_data.get(key) or "").strip()
+            if value:
+                lines.append(f"{label}：{value}")
         style = str(meta.get("style") or life_data.get("outfit_style") or "").strip()
         outfit = str(life_data.get("outfit") or "").strip()
         schedule = str(life_data.get("schedule") or "").strip()
@@ -4388,6 +4396,8 @@ class QzoneStablePlugin(Star):
         self,
         event: AstrMessageEvent | None,
         image_prompt: str,
+        *,
+        persona_id: str = "",
     ) -> tuple[list[PostMedia], dict[str, Any]]:
         if not getattr(self.settings, "life_publish_use_omnidraw_selfie", True):
             return [], {"success": False, "message": "OmniDraw 自拍开关已关闭", "images": []}
@@ -4403,12 +4413,18 @@ class QzoneStablePlugin(Star):
         kwargs = {
             "action": image_prompt,
             "count": 1,
-            "aspect_ratio": str(getattr(self.settings, "life_publish_aspect_ratio", "") or ""),
+            "aspect_ratio": str(
+                getattr(self.settings, "life_publish_aspect_ratio", "") or ""
+            ),
             "size": str(getattr(self.settings, "life_publish_size", "") or ""),
-            "extra_params": str(getattr(self.settings, "life_publish_extra_params", "") or ""),
+            "extra_params": str(
+                getattr(self.settings, "life_publish_extra_params", "") or ""
+            ),
             "return_result": True,
             "refs": "",
         }
+        if persona_id:
+            kwargs["persona_id"] = persona_id
         max_retries = self._life_publish_image_retry_count(self.settings)
         total_attempts = max_retries + 1
         last_result: dict[str, Any] = {"success": False, "message": "", "images": []}
@@ -4534,6 +4550,23 @@ class QzoneStablePlugin(Star):
                     return
             life_context = "暂无今日生活日程。"
 
+        persona_id = ""
+        omni_plugin = self._omnidraw_plugin()
+        resolver = getattr(omni_plugin, "resolve_selfie_context", None)
+        if callable(resolver):
+            try:
+                request = str(getattr(event, "message_str", "") or "")
+                selection = await self._maybe_await(
+                    resolver(request, life_context=life_data)
+                )
+                persona_id = str(selection.get("persona_id") or "")
+                life_data = selection.get("life_context", life_data)
+                life_context = self._life_context_text(life_data)
+            except Exception as exc:  # noqa: BLE001 - Keep compatibility when an optional selector fails.
+                logger.warning(
+                    "qzone automatic selfie persona selection failed: %s", exc
+                )
+
         image_prompt = ""
         media: list[PostMedia] = []
         omnidraw_result: dict[str, Any] = {"success": False, "images": []}
@@ -4542,7 +4575,14 @@ class QzoneStablePlugin(Star):
             image_prompt = await self._generate_life_image_prompt(event, life_context)
             if not image_prompt.strip():
                 raise RuntimeError("LLM 未生成自拍提示词")
-            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
+            if persona_id:
+                media, omnidraw_result = await self._generate_life_selfie_media(
+                    event, image_prompt, persona_id=persona_id
+                )
+            else:
+                media, omnidraw_result = await self._generate_life_selfie_media(
+                    event, image_prompt
+                )
             if not media:
                 raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
         except Exception as exc:
