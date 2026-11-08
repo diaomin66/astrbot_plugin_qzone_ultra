@@ -525,7 +525,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
 
     contract_methods = {
         "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
-        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text",)},
+        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text", "describe_images")},
         "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
         "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
         "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
@@ -1608,7 +1608,7 @@ class QzoneStablePlugin(Star):
                 profile=profile,
                 result=payload,
                 width=int(getattr(settings, "render_result_width", 900) or 900),
-                remote_timeout=float(getattr(settings, "render_remote_timeout", 0.35) or 0.35),
+                remote_timeout=float(getattr(settings, "render_remote_timeout", 5.0) or 5.0),
             )
         except Exception as exc:
             logger.exception("qzone manual publish result render failed: %s", exc)
@@ -1924,7 +1924,7 @@ class QzoneStablePlugin(Star):
                     profile=profile,
                     result=payload,
                     width=int(getattr(self.settings, "render_result_width", 900) or 900),
-                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 0.35) or 0.35),
+                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 5.0) or 5.0),
                 )
             except Exception as exc:
                 logger.exception("qzone scheduled publish result render failed: %s", exc)
@@ -2852,8 +2852,14 @@ class QzoneStablePlugin(Star):
         for post in posts[:5]:
             index = post.local_id or 1
             lines.append(f"第 {index} 条：{truncate(post.summary or '(空)', 220)}")
-            if detail and post.images:
+            if post.images:
                 lines.append(f"图片：{len(post.images[:9])} 张")
+                lines.append("配图识别结果：")
+                description = await self._llm_adapter().describe_images(
+                    event, post.images
+                )
+                lines.append(description)
+                fallback += f"\n第 {index} 条的配图：\n{description}"
             if detail and post.comments:
                 lines.append("评论：")
                 for comment in post.comments[:5]:
@@ -2866,7 +2872,11 @@ class QzoneStablePlugin(Star):
             "保留“第 N 条”这种可见编号，方便用户继续说“评论第 N 条”或“赞第 N 条”。"
             "不要输出 JSON、Markdown 代码块、工具名、字段名、fid、hostuin、参数或内部流程。"
         )
-        payload = {"ok": True, "tool": "qzone_view_post", "result": {"message": fallback}}
+        payload = {
+            "ok": True,
+            "tool": "qzone_view_post",
+            "result": {"message": fallback},
+        }
         try:
             text = await self._llm_adapter().generate_text(
                 event,
@@ -2880,7 +2890,9 @@ class QzoneStablePlugin(Star):
             if self._llm_tool_reply_is_safe(text, payload):
                 return text
             if text:
-                logger.warning("discarded unsafe qzone llm view reply: %s", truncate(text, 300))
+                logger.warning(
+                    "discarded unsafe qzone llm view reply: %s", truncate(text, 300)
+                )
         return fallback
 
     @staticmethod
@@ -5469,11 +5481,15 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            posts = await self._posts_for_event(event, ("看说说", "查看说说"), with_detail=True)
+            posts = await self._posts_for_event(
+                event, ("看说说", "查看说说"), with_detail=True
+            )
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+        async for result in self._yield_post_card_results(
+            event, posts, self._format_posts(posts, detail=True)
+        ):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -5497,7 +5513,19 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+        if not any(post.images for post in posts):
+            async for result in self._yield_post_card_results(
+                event, posts, self._format_posts(posts, detail=True)
+            ):
+                yield result
+            return
+        text = await self._ask_llm_view_reply(
+            event, posts, detail=True, fallback=self._format_posts(posts, detail=True)
+        )
+        yield self._command_result(event, text)
+        async for result in self._yield_post_card_results(
+            event, posts, text, fallback_when_unrendered=False
+        ):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -6561,6 +6589,8 @@ class QzoneStablePlugin(Star):
     ):
         """获取 QQ 空间说说列表。
 
+        列表只含文字摘要。需要了解配图时，继续调用 qzone_view_post 或 qzone_detail_feed。
+
         Args:
             target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
             limit (number): 返回数量。
@@ -6591,7 +6621,9 @@ class QzoneStablePlugin(Star):
         return format_llm_feed_list(entries)
 
     @filter.llm_tool(name="qzone_detail_feed")
-    async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+    async def tool_detail_feed(
+        self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311
+    ):
         """获取说说详情。
 
         Args:
@@ -6611,7 +6643,11 @@ class QzoneStablePlugin(Star):
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
             return self._error_text(exc)
-        return self._render_detail(payload)
+        post = post_from_entry(FeedEntry(**payload["entry"]), detail=payload.get("raw"), local_id=1)
+        post.comments = self._post_service()._comments_from_detail(payload)
+        return await self._ask_llm_view_reply(
+            event, [post], detail=True, fallback=self._render_detail(payload)
+        )
 
     @filter.llm_tool(name="qzone_view_post")
     async def tool_view_post(
@@ -6624,7 +6660,7 @@ class QzoneStablePlugin(Star):
         fid: str = "",
         appid: int = 311,
     ):
-        """按自然选择器查看一条或多条 QQ 空间说说。
+        """按自然选择器查看一条或多条 QQ 空间说说，包含配图内容的识别描述。
 
         Args:
             target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
