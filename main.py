@@ -586,6 +586,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     contract_dataclass_fields = {
         "qzone_bridge.settings": {
             "PluginSettings": (
+                "random_comment_notify",
                 "news_cron",
                 "news_offset",
                 "news_provider_id",
@@ -5434,13 +5435,14 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
-            comment_text = content.strip()
-            await self._notify_event_post_card(
-                event,
-                post,
-                f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
-                comment_text=comment_text,
-            )
+            if getattr(self.settings, "random_comment_notify", True):
+                comment_text = content.strip()
+                await self._notify_event_post_card(
+                    event,
+                    post,
+                    f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                    comment_text=comment_text,
+                )
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 

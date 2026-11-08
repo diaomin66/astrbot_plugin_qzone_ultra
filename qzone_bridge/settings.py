@@ -168,6 +168,7 @@ class PluginSettings:
     comment_offset: int = 0
     comment_latest_count: int = 1
     read_prob: float = 0.0
+    random_comment_notify: bool = True
     send_admin: bool = False
     like_when_comment: bool = False
     life_publish_enabled: bool = False
@@ -299,6 +300,7 @@ class PluginSettings:
             ),
             comment_latest_count=_as_int(_nested(mapping, "trigger", "comment_latest_count", 1), 1, minimum=1),
             read_prob=_as_float(_nested(mapping, "trigger", "read_prob", 0.0), 0.0, minimum=0.0, maximum=1.0),
+            random_comment_notify=_as_bool(_nested(mapping, "trigger", "random_comment_notify", True), True),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
             life_publish_enabled=_as_bool(_nested(mapping, "life_publish", "enabled", False), False),
