@@ -4,7 +4,7 @@
 
 QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令、LLM 工具、Cookie 绑定、本地 daemon、图片/视频发布、说说渲染、投稿审核和自动评论能力。插件优先适配 OneBot v11 / aiocqhttp，也支持手动 Cookie 绑定后使用核心 QQ 空间功能。
 
-交流与反馈：**[点击加入 QQ 群 1081773675](https://qm.qq.com/q/Qr45Vz0a8o)**
+交流与反馈：687112925 QQ群
 
 ## 亮点：自动发布「会生活」的日常说说
 
