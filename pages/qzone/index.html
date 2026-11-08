@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>QQ空间Ultra</title>
-    <link rel="stylesheet" href="./style.css?v=20260618-page-polish" />
+    <link rel="stylesheet" href="./style.css?v=2026110504-diagnostics" />
   </head>
   <body>
     <div id="toastContainer" class="toast-container" aria-live="polite"></div>
@@ -48,6 +48,20 @@
         <form class="composer" id="publishForm">
           <textarea id="publishContent" rows="4" maxlength="1200" placeholder="写点什么，发到 QQ 空间"></textarea>
           <div class="media-strip" id="mediaStrip"></div>
+          <section class="life-draft-panel" aria-label="日常草稿">
+            <div class="life-draft-heading">
+              <button id="generateLifeDraft" class="ghost" type="button">生成日常草稿</button>
+              <span>只生成草稿，不会自动发布</span>
+            </div>
+            <p id="lifeDraftStatus" class="life-draft-status" role="status" aria-live="polite">可按需生成一份可编辑的日常草稿。</p>
+            <div id="lifeDraftResult" class="life-draft-result" hidden>
+              <div id="lifeDraftDiagnostics" class="life-draft-diagnostics" role="status" aria-live="polite" aria-label="日常草稿诊断信息"></div>
+              <textarea id="lifeDraftLongContent" class="life-draft-long-content" readonly aria-label="超长日常草稿，可复制后自行编辑" hidden></textarea>
+              <div id="lifeDraftPreview" class="life-draft-preview-list"></div>
+              <button id="loadLifeDraft" class="ghost" type="button">载入编辑器</button>
+              <button id="discardLifeDraft" class="ghost life-draft-discard" type="button" hidden>清空日常稿，重新编辑</button>
+            </div>
+          </section>
           <div class="composer-actions">
             <label class="upload-button">
               <input id="mediaInput" type="file" accept="image/*,video/*" multiple />
@@ -74,7 +88,7 @@
       </section>
 
       <div id="detailBackdrop" class="detail-backdrop"></div>
-      <aside class="detail" id="detailPane" aria-label="说说详情">
+      <aside class="detail" id="detailPane" aria-label="说说详情" aria-hidden="true">
         <button id="detailCloseBtn" class="detail-close-btn" aria-label="关闭详情" hidden><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
         <div class="detail-empty" id="detailEmpty">
           <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3; margin-bottom: 12px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
@@ -85,7 +99,19 @@
       </aside>
     </main>
 
+    <dialog id="actionConfirmDialog" class="action-confirm-dialog" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmMessage">
+      <div class="action-confirm-content">
+        <h2 id="actionConfirmTitle">请确认操作</h2>
+        <p id="actionConfirmMessage"></p>
+        <p id="actionConfirmFeedback" class="action-confirm-feedback" role="status" aria-live="polite"></p>
+        <div class="action-confirm-actions">
+          <button id="actionConfirmCancel" class="ghost" type="button">取消</button>
+          <button id="actionConfirmAccept" class="primary" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
     <script src="/api/plugin/page/bridge-sdk.js"></script>
-    <script type="module" src="./app.js?v=20260618-page-polish"></script>
+    <script type="module" src="./app.js?v=2026110504-diagnostics"></script>
   </body>
 </html>

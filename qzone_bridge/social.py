@@ -628,7 +628,7 @@ def comment_from_raw(raw: dict[str, Any], *, parent_id: str = "") -> QzoneCommen
         nickname=nickname,
         content=content,
         created_at=created_at,
-        parent_id=str(parent_id or raw.get("parentId") or raw.get("parent_tid") or ""),
+        parent_id=str(parent_id or raw.get("parent_id") or raw.get("parentId") or raw.get("parent_tid") or ""),
         raw=dict(raw),
     )
 

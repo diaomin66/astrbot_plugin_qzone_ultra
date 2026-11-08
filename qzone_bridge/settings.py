@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from .news import normalize_news_scopes
@@ -13,6 +14,17 @@ DEFAULT_USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
+DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT = ""
+DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE = (
+    "为人物生成自然的自拍或生活随手构图提示，结合有依据的当前场景，不推断未知活动或地点。\n\n"
+    "{life_context}"
+)
+DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT = (
+    "根据给定日期的生活日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
+    "自然、有生活感，不要解释。\n\n"
+    "日程上下文：\n{life_context}\n\n"
+    "自拍提示词：\n{image_prompt}"
+)
 
 
 def _as_mapping(config: Any) -> dict[str, Any]:
@@ -105,6 +117,25 @@ def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: in
     return number
 
 
+def _budget_seconds(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    """Parse a finite integer budget; malformed values use the safe default."""
+    if isinstance(value, bool) or value is None:
+        number = default
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        number = int(value) if math.isfinite(value) and value.is_integer() else default
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            number = int(text) if text and text.lstrip("+-").isdigit() else default
+        except (ValueError, OverflowError):
+            number = default
+    else:
+        number = default
+    return min(maximum, max(minimum, number))
+
+
 def _as_float(value: Any, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
     try:
         if isinstance(value, bool):
@@ -141,6 +172,19 @@ class PluginSettings:
     manage_group: int = 0
     pillowmd_style_dir: str = ""
     post_provider_id: str = ""
+    persona_id: str = ""
+    context_umo: str = ""
+    persona_consistency_check: bool = True
+    auto_reply_enabled: bool = False
+    auto_reply_poll_interval: int = 120
+    auto_reply_delay_min: int = 30
+    auto_reply_delay_max: int = 180
+    auto_reply_recent_posts: int = 5
+    auto_reply_max_per_run: int = 2
+    auto_reply_daily_limit: int = 20
+    auto_reply_skip_low_information: bool = True
+    auto_reply_probability: float = 0.8
+    auto_reply_ignore_users: list[str] = field(default_factory=list)
     post_prompt: str = "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。"
     comment_provider_id: str = ""
     comment_prompt: str = "生成一句简短、直接、贴题的评论，不要解释。"
@@ -173,6 +217,8 @@ class PluginSettings:
     life_publish_enabled: bool = False
     life_publish_use_life_context: bool = True
     life_publish_use_llm_image_prompt: bool = True
+    life_publish_inherit_persona_visual: bool = True
+    life_publish_persona_visual_prompt: str = ""
     life_publish_use_omnidraw_selfie: bool = True
     life_publish_auto_caption: bool = True
     life_publish_mode: str = "publish"
@@ -181,18 +227,14 @@ class PluginSettings:
     life_publish_size: str = ""
     life_publish_extra_params: str = ""
     life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
+    life_publish_generation_timeout_seconds: int = 300
+    life_publish_image_timeout_seconds: int = 180
+    life_publish_text_timeout_seconds: int = 90
+    life_publish_timezone: str = "Asia/Shanghai"
+    life_publish_image_style_prompt: str = DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT
     life_publish_static_caption: str = "今日份生活碎片。"
-    life_publish_image_prompt_template: str = (
-        "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。"
-        "画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\n\n"
-        "{life_context}"
-    )
-    life_publish_caption_prompt: str = (
-        "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
-        "自然、有生活感，不要解释。\n\n"
-        "日程上下文：\n{life_context}\n\n"
-        "自拍提示词：\n{image_prompt}"
-    )
+    life_publish_image_prompt_template: str = DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE
+    life_publish_caption_prompt: str = DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT
     news_scopes: list[str] = field(default_factory=lambda: ["china"])
     news_keywords: list[str] = field(default_factory=list)
     news_custom_rss_urls: list[str] = field(default_factory=list)
@@ -240,6 +282,19 @@ class PluginSettings:
             manage_group=_as_int(_pick(mapping, "manage_group", 0), 0, minimum=0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
+            persona_id=str(_nested(mapping, "llm", "persona_id", "") or "").strip(),
+            context_umo=str(_nested(mapping, "llm", "context_umo", "") or "").strip(),
+            persona_consistency_check=_as_bool(_nested(mapping, "llm", "persona_consistency_check", True), True),
+            auto_reply_enabled=_as_bool(_nested(mapping, "auto_reply", "enabled", False), False),
+            auto_reply_poll_interval=_as_int(_nested(mapping, "auto_reply", "poll_interval", 120), 120, minimum=30, maximum=3600),
+            auto_reply_delay_min=_as_int(_nested(mapping, "auto_reply", "delay_min", 30), 30, minimum=0, maximum=3600),
+            auto_reply_delay_max=_as_int(_nested(mapping, "auto_reply", "delay_max", 180), 180, minimum=0, maximum=3600),
+            auto_reply_recent_posts=_as_int(_nested(mapping, "auto_reply", "recent_posts", 5), 5, minimum=1, maximum=20),
+            auto_reply_max_per_run=_as_int(_nested(mapping, "auto_reply", "max_per_run", 2), 2, minimum=1, maximum=20),
+            auto_reply_daily_limit=_as_int(_nested(mapping, "auto_reply", "daily_limit", 20), 20, minimum=1, maximum=500),
+            auto_reply_skip_low_information=_as_bool(_nested(mapping, "auto_reply", "skip_low_information", True), True),
+            auto_reply_probability=_as_float(_nested(mapping, "auto_reply", "reply_probability", 0.8), 0.8, minimum=0.0, maximum=1.0),
+            auto_reply_ignore_users=[str(item).strip() for item in _as_list(_nested(mapping, "auto_reply", "ignore_users", [])) if str(item).strip()],
             post_prompt=str(_nested(mapping, "llm", "post_prompt", cls.post_prompt) or cls.post_prompt),
             comment_provider_id=str(_nested(mapping, "llm", "comment_provider_id", "") or ""),
             comment_prompt=str(_nested(mapping, "llm", "comment_prompt", cls.comment_prompt) or cls.comment_prompt),
@@ -310,6 +365,12 @@ class PluginSettings:
                 _nested(mapping, "life_publish", "use_llm_image_prompt", True),
                 True,
             ),
+            life_publish_inherit_persona_visual=_as_bool(
+                _nested(mapping, "life_publish", "inherit_persona_visual", True), True
+            ),
+            life_publish_persona_visual_prompt=str(
+                _nested(mapping, "life_publish", "persona_visual_prompt", "") or ""
+            ).strip(),
             life_publish_use_omnidraw_selfie=_as_bool(
                 _nested(mapping, "life_publish", "use_omnidraw_selfie", True),
                 True,
@@ -342,6 +403,24 @@ class PluginSettings:
                 minimum=0,
                 maximum=5,
             ),
+            life_publish_generation_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "generation_timeout_seconds", 300), 300, minimum=30, maximum=1800
+            ),
+            life_publish_image_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "image_timeout_seconds", 180), 180, minimum=10, maximum=1200
+            ),
+            life_publish_text_timeout_seconds=_budget_seconds(
+                _nested(mapping, "life_publish", "text_timeout_seconds", 90), 90, minimum=5, maximum=600
+            ),
+            life_publish_timezone=str(_nested(mapping, "life_publish", "timezone", "Asia/Shanghai")),
+            life_publish_image_style_prompt=str(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_style_prompt",
+                    DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT,
+                )
+            ).strip(),
             life_publish_static_caption=str(
                 _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
                 or cls.life_publish_static_caption
@@ -351,13 +430,13 @@ class PluginSettings:
                     mapping,
                     "life_publish",
                     "image_prompt_template",
-                    cls.life_publish_image_prompt_template,
+                    DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE,
                 )
-                or cls.life_publish_image_prompt_template
+                or DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE
             ),
             life_publish_caption_prompt=str(
-                _nested(mapping, "life_publish", "caption_prompt", cls.life_publish_caption_prompt)
-                or cls.life_publish_caption_prompt
+                _nested(mapping, "life_publish", "caption_prompt", DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT)
+                or DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT
             ),
             news_scopes=normalize_news_scopes(_nested(mapping, "news", "scopes", ["china"])),
             news_keywords=[str(item).strip() for item in _as_list(_nested(mapping, "news", "keywords", [])) if str(item).strip()],

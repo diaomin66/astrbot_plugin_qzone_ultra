@@ -256,6 +256,7 @@ class QzoneDaemonController:
         self._health_cache_data: tuple[int, str, dict[str, Any]] | None = None
         self._health_cache_ttl = 1.0
         self._incompatible_daemon: tuple[int, str] | None = None
+        self._offline_exit_receipt: tuple[int, int] | None = None
 
     def _runtime(self):
         state = self.store.read()
@@ -434,6 +435,7 @@ class QzoneDaemonController:
         self._invalidate_health_cache()
 
     def _spawn_daemon(self, port: int) -> subprocess.Popen:
+        self._offline_exit_receipt = None
         runtime = self._runtime()
         cmd = [
             sys.executable,
@@ -511,6 +513,7 @@ class QzoneDaemonController:
             return False
         ok = bool(payload.get("ok"))
         if ok:
+            self._offline_exit_receipt = None
             if not self._health_payload_is_compatible(payload):
                 if self._health_payload_is_qzone_daemon(payload):
                     self._incompatible_daemon = (resolved_port, resolved_secret)
@@ -667,6 +670,7 @@ class QzoneDaemonController:
                             self._cached_health_data(port, runtime.secret),
                         )
                     if self._process and self._process.poll() is not None:
+                        self._offline_exit_receipt = (int(self._process.pid or 0), int(port or 0))
                         break
                     await asyncio.sleep(0.5)
 
@@ -694,16 +698,25 @@ class QzoneDaemonController:
         json_body: dict[str, Any] | None = None,
         timeout: float | None = None,
         retry_on_timeout: bool = True,
+        retry_on_transport_error: bool = True,
     ) -> Any:
         last_exc: httpx.HTTPError | None = None
         response: httpx.Response | None = None
+        request_dispatched = False
         for attempt in range(2):
-            runtime = self._runtime()
-            if self.auto_start_daemon:
-                await self.ensure_running()
+            try:
                 runtime = self._runtime()
-            elif not await self._probe_health(runtime.daemon_port):
-                raise DaemonUnavailableError("daemon 未运行")
+                if self.auto_start_daemon:
+                    await self.ensure_running()
+                    runtime = self._runtime()
+                elif not await self._probe_health(runtime.daemon_port):
+                    raise DaemonUnavailableError("daemon 未运行", detail={"request_dispatched": False})
+            except Exception as exc:
+                if isinstance(exc, DaemonUnavailableError):
+                    detail = dict(exc.detail) if isinstance(exc.detail, dict) else {}
+                    detail["request_dispatched"] = request_dispatched
+                    raise DaemonUnavailableError(exc.message, detail=detail) from exc
+                raise
             try:
                 request_kwargs: dict[str, Any] = {
                     "headers": {SECRET_HEADER: runtime.secret},
@@ -712,20 +725,24 @@ class QzoneDaemonController:
                 }
                 if timeout is not None:
                     request_kwargs["timeout"] = max(float(timeout), float(self.request_timeout or 0.001))
+                request_dispatched = True
                 response = await self._client.request(method, f"{self._base_url(runtime.daemon_port)}{path}", **request_kwargs)
                 break
             except httpx.HTTPError as exc:
                 self._invalidate_health_cache()
                 last_exc = exc
                 detail = self._daemon_request_error_detail(exc, path=path, runtime=runtime, attempt=attempt + 1, timeout=timeout)
-                if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                detail["request_dispatched"] = True
+                if (isinstance(exc, httpx.TimeoutException) and not retry_on_timeout) or not retry_on_transport_error:
                     raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
                 if not self.auto_start_daemon or attempt > 0:
                     raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
         if response is None:
+            detail = self._daemon_request_error_detail(last_exc, path=path, runtime=self._runtime(), attempt=2, timeout=timeout)
+            detail["request_dispatched"] = request_dispatched
             raise DaemonUnavailableError(
                 "daemon 请求失败",
-                detail=self._daemon_request_error_detail(last_exc, path=path, runtime=self._runtime(), attempt=2, timeout=timeout),
+                detail=detail,
             )
         try:
             payload = response.json()
@@ -736,6 +753,7 @@ class QzoneDaemonController:
                     "status_code": response.status_code,
                     "content_type": response.headers.get("content-type", ""),
                     "body_preview": response.text[:500],
+                    "request_dispatched": True,
                 },
             ) from exc
         if not payload.get("ok", False):
@@ -756,6 +774,9 @@ class QzoneDaemonController:
                 raise QzoneParseError(message, detail=detail)
             if code == "QZONE_REQUEST":
                 raise QzoneRequestError(message, status_code=_detail_status_code(detail), detail=detail)
+            if not isinstance(detail, dict):
+                detail = {}
+            detail = {**detail, "request_dispatched": True}
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
 
@@ -809,14 +830,19 @@ class QzoneDaemonController:
         return f"{len(cookies)} 个 Cookie: " + ", ".join(found or ["未识别关键字段"])
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
-        return await self._request("POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source})
+        return await self._request(
+            "POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source},
+            retry_on_timeout=False, retry_on_transport_error=False,
+        )
 
     async def bind_cookie_local(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         """Bind cookies directly into the persistent store when the daemon is unavailable."""
 
         try:
             return await self.bind_cookie(cookie_text, uin=uin, source=source)
-        except DaemonUnavailableError:
+        except DaemonUnavailableError as exc:
+            if not await self._prove_local_fallback_offline(exc):
+                raise DaemonUnavailableError("绑定结果未确认，请先查询状态后再试。") from None
             cookies = parse_cookie_text(cookie_text)
             if not cookies:
                 raise QzoneParseError("Cookie 内容为空或无法解析")
@@ -840,18 +866,25 @@ class QzoneDaemonController:
                     needs_rebind=False,
                 )
 
-            self.store.update(update)
+            async with self._lock:
+                if not await self._offline_fallback_proof_valid():
+                    raise DaemonUnavailableError("服务状态未确认，请启动或查询 daemon 后再绑定。")
+                self.store.update(update)
             return await self.get_status()
 
     async def unbind(self) -> dict[str, Any]:
-        return await self._request("POST", "/unbind", json_body={})
+        return await self._request(
+            "POST", "/unbind", json_body={}, retry_on_timeout=False, retry_on_transport_error=False,
+        )
 
     async def unbind_local(self) -> dict[str, Any]:
         """Clear cookies even when the daemon is unavailable."""
 
         try:
             return await self.unbind()
-        except DaemonUnavailableError:
+        except DaemonUnavailableError as exc:
+            if not await self._prove_local_fallback_offline(exc):
+                raise DaemonUnavailableError("解绑结果未确认，请先查询状态后再试。") from None
             def update(state):
                 ensure_state_secret(state)
                 if not state.runtime.daemon_port:
@@ -868,8 +901,57 @@ class QzoneDaemonController:
                     needs_rebind=True,
                 )
 
-            self.store.update(update)
+            async with self._lock:
+                if not await self._offline_fallback_proof_valid():
+                    raise DaemonUnavailableError("服务状态未确认，请启动或查询 daemon 后再解绑。")
+                self.store.update(update)
             return await self.get_status()
+
+    async def _prove_local_fallback_offline(self, exc: DaemonUnavailableError) -> bool:
+        detail = getattr(exc, "detail", None)
+        if not isinstance(detail, dict) or detail.get("request_dispatched") is not False:
+            return False
+        async with self._lock:
+            return await self._offline_fallback_proof_valid()
+
+    async def _offline_fallback_proof_valid(self) -> bool:
+        runtime = self._runtime()
+        port = int(runtime.daemon_port or self.default_port or 0)
+        if not port:
+            return False
+        proof = self._offline_exit_receipt
+        process = self._process
+        if process is not None:
+            try:
+                pid = int(process.pid or 0)
+                returncode = process.poll()
+            except Exception:
+                return False
+            if pid <= 0 or returncode is None:
+                return False
+            self._offline_exit_receipt = (pid, port)
+            proof = self._offline_exit_receipt
+        if proof is None or proof[1] != port:
+            return False
+        persisted_pid = int(runtime.daemon_pid or 0)
+        if persisted_pid and persisted_pid != proof[0]:
+            return False
+        if await self._probe_health(port, secret=runtime.secret, use_cache=False):
+            return False
+        if not await _port_is_free_async(port):
+            return False
+        latest = self._runtime()
+        try:
+            process_still_exited = self._process is None or self._process.poll() is not None
+        except Exception:
+            return False
+        return (
+            latest.daemon_pid == runtime.daemon_pid
+            and latest.daemon_port == runtime.daemon_port
+            and latest.secret == runtime.secret
+            and self._offline_exit_receipt == proof
+            and process_still_exited
+        )
 
     async def list_feeds(
         self,
@@ -913,20 +995,25 @@ class QzoneDaemonController:
         sync_weibo: bool = False,
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
+        expected_login_uin: int | None = None,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         media_items = media or []
+        request_body = {
+            "content": content,
+            "sync_weibo": sync_weibo,
+            "media": media_items,
+            "content_sanitized": True,
+        }
+        if expected_login_uin is not None:
+            request_body["expected_login_uin"] = int(expected_login_uin)
         return await self._request(
             "POST",
             "/post",
-            json_body={
-                "content": content,
-                "sync_weibo": sync_weibo,
-                "media": media_items,
-                "content_sanitized": True,
-            },
+            json_body=request_body,
             timeout=self._publish_request_timeout(media_items),
             retry_on_timeout=False,
+            retry_on_transport_error=expected_login_uin is None,
         )
 
     async def verify_native_video_feed(
@@ -1069,15 +1156,26 @@ class QzoneDaemonController:
     async def _terminate_tracked_process(self) -> None:
         process = self._process
         self._process = None
-        if not process or process.poll() is not None:
+        if not process:
             return
-        process.terminate()
         try:
-            await asyncio.to_thread(process.wait, 3.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                await asyncio.to_thread(process.wait, 2.0)
+            pid = int(process.pid or 0)
+            port = int(self._runtime().daemon_port or self.default_port or 0)
+            returncode = process.poll()
+            if returncode is None:
+                process.terminate()
+                try:
+                    returncode = await asyncio.to_thread(process.wait, 3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        returncode = await asyncio.to_thread(process.wait, 2.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = None
+            if pid > 0 and returncode is not None:
+                self._offline_exit_receipt = (pid, port)
+        except Exception:
+            return
 
     async def _kill_plugin_port_owners(
         self,

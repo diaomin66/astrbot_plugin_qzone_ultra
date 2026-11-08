@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote
@@ -9,7 +10,7 @@ from urllib.parse import quote
 import httpx
 
 from .errors import QzoneParseError, QzoneRequestError
-from .source_policy import is_remote_media_url_allowed, resolve_remote_media_redirect
+from .source_policy import check_remote_media_redirect, check_remote_media_url
 
 
 PAGE_MEDIA_CHUNK_SIZE = 256 * 1024
@@ -31,7 +32,8 @@ async def open_page_media_stream(
     client: httpx.AsyncClient | None = None,
 ) -> tuple[AsyncIterator[bytes], int, dict[str, str]]:
     source = str(media.get("source") or "").strip()
-    if not is_remote_media_url_allowed(source):
+    policy = await asyncio.to_thread(check_remote_media_url, source)
+    if not policy.allowed:
         raise QzoneParseError("媒体地址无效或不安全，请刷新说说后重试。")
 
     owns_client = client is None
@@ -55,7 +57,11 @@ async def open_page_media_stream(
             response = await client.send(request, stream=True)
             if response.status_code not in {301, 302, 303, 307, 308}:
                 break
-            location = resolve_remote_media_redirect(current, response.headers.get("location", ""))
+            location, _redirect_check = await asyncio.to_thread(
+                check_remote_media_redirect,
+                current,
+                response.headers.get("location", ""),
+            )
             await response.aclose()
             response = None
             if not location:

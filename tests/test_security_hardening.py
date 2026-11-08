@@ -85,6 +85,405 @@ def _import_main_with_stubs(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("main")
 
 
+def test_main_life_pipeline_uses_fresh_image_and_caption_budgets(monkeypatch):
+    main = _import_main_with_stubs(monkeypatch)
+
+    class _Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+        def caption_time_rules(self): return "time rules"
+
+    class _Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *args: _Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: _Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: _Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "draft", "failure_policy": "skip",
+            "use_life_context": True, "use_llm_image_prompt": True,
+            "auto_caption": True, "static_caption": "static", "image_retry_count": 0,
+        },
+    })
+    plugin._life_budget_snapshot = lambda _settings: (4.0, 2.0, 1.0)
+
+    async def get_context():
+        return {"current": "fixture"}, "context"
+
+    async def prompt(event, *_args, **_kwargs):
+        await plugin.llm.prepare_persona_snapshot(event, prefer_current_provider=True)
+        await asyncio.sleep(0.01)
+        return "prompt"
+
+    async def image(*_args, **_kwargs):
+        await asyncio.sleep(1.2)  # longer than text cap, shorter than image cap
+        nonlocal current_provider
+        current_provider = replacement_provider
+        return [object()], {"success": True, "images": ["fixture"]}
+
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    class Manager:
+        async def resolve_selected_persona(self, **_kwargs):
+            return "p", {"prompt": "black hair"}, None, False
+        async def get_persona_v3_by_id(self, _pid):
+            return {"prompt": "black hair"}
+    class Provider:
+        def __init__(self, answer):
+            self.answer = answer
+            self.calls = []
+        async def text_chat(self, *, prompt, **_kwargs):
+            self.calls.append(prompt)
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return self.answer
+    provider = Provider("caption")
+    replacement_provider = Provider("should not be used")
+    current_provider = provider
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, _umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **_kwargs): return current_provider
+    plugin._context = Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
+    result = asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
+    assert result is not None
+    assert result[0].content == "caption"
+    assert result[0].media and result[2] is True
+    assert len(provider.calls) == 2 and replacement_provider.calls == []
+
+
+def test_life_pipeline_shares_six_provider_calls_across_prompt_and_caption(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+    from qzone_bridge.persona_guard import set_snapshot
+
+    main = _import_main_with_stubs(monkeypatch)
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="skip", life_publish_mode="draft",
+        life_publish_static_caption="static", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (5.0, 2.0, 2.0)
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, **_kwargs):
+            self.calls.append(prompt)
+            return "approved"
+    provider = Provider()
+    plugin.llm = main.QzoneLLM(object(), plugin.settings)
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(event, *_args, **_kwargs):
+        set_snapshot({"persona_prompt": "fixture", "provider_id": "", "provider": provider,
+                      "umo": None, "pin_provider": False})
+        for index in range(4):
+            await plugin.llm.generate_text(None, f"prompt-{index}", system_prompt="system", inherit_persona=False)
+        return "image prompt"
+    async def image(*_args, **_kwargs): return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        for index in range(3):
+            await plugin.llm.generate_text(None, f"caption-{index}", system_prompt="system", inherit_persona=False)
+        return "should not reach"
+    async def publish(*_args, **_kwargs):
+        pytest.fail("provider call-budget exhaustion must stop before publication")
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert exc.value.code == "LIFE_CALL_BUDGET_EXHAUSTED"
+    assert len(provider.calls) == 6
+
+
+def test_life_image_timeout_is_terminal_even_with_text_only_policy(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_image_retry_count=2, life_publish_static_caption="must-not-fallback",
+        life_publish_generation_timeout_seconds=300, life_publish_image_timeout_seconds=180,
+        life_publish_text_timeout_seconds=90,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (1.0, 0.03, 0.5)
+    async def get_context(): return {"current": "fixture"}, "context"
+    async def prompt(*_args, **_kwargs): return "prompt"
+    attempts, captions, publishes = [], [], []
+    async def image(*_args, **_kwargs):
+        attempts.append(1)
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            # A dependency that swallows timeout cancellation must not make a late image publishable.
+            return [object()], {"success": True}
+        return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        captions.append(1)
+        return "unexpected"
+    async def publish(*_args, **_kwargs):
+        publishes.append(1)
+        return {}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == ("LIFE_IMAGE_TIMEOUT", "image")
+    assert len(attempts) == 1 and captions == [] and publishes == []
+
+
+def test_life_pipeline_propagates_external_cancel_swallowed_by_image_dependency(monkeypatch):
+    from qzone_bridge.persona_guard import current_scope, get_snapshot, set_snapshot
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (10.0, 5.0, 5.0)
+    calls = {"caption": 0, "publish": 0}
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(*_args, **_kwargs):
+        set_snapshot({"pinned": "fixture"})
+        return "prompt"
+    async def image(*_args, **_kwargs):
+        task = asyncio.current_task()
+        asyncio.get_running_loop().call_soon(task.cancel)
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        calls["caption"] += 1
+        return "late"
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(plugin._auto_life_publish_once())
+    assert calls == {"caption": 0, "publish": 0}
+    assert current_scope() is None and get_snapshot() is None
+
+
+def test_life_generation_error_and_log_never_expose_dependency_sentinels(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+    records = []
+    class Recorder:
+        def warning(self, *args, **_kwargs): records.append(args)
+    monkeypatch.setattr(main, "logger", Recorder())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_generation_timeout_seconds=30,
+        life_publish_image_timeout_seconds=10,
+        life_publish_text_timeout_seconds=5,
+    )
+    async def fail_with_sensitive_detail(*_args, **_kwargs):
+        raise RuntimeError("TOKEN_SENTINEL https://host.invalid/a?key=x PROMPT_SENTINEL")
+    plugin._auto_life_publish_once_scoped = fail_with_sensitive_detail
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
+    serialized = repr(records) + str(exc.value) + repr(exc.value.__dict__)
+    for sentinel in ("TOKEN_SENTINEL", "host.invalid", "key=x", "PROMPT_SENTINEL"):
+        assert sentinel not in serialized
+    assert exc.value.code == "LIFE_GENERATION_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("stall_stage", "budgets", "expected"),
+    [
+        ("context", (0.03, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "context")),
+        ("image_prompt", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "image_prompt")),
+        ("image", (0.30, 0.03, 0.20), ("LIFE_IMAGE_TIMEOUT", "image")),
+        ("sync_image", (0.30, 0.03, 0.20), ("LIFE_IMAGE_TIMEOUT", "image")),
+        ("caption", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "caption")),
+        ("caption_swallow", (0.30, 0.20, 0.03), ("LIFE_TEXT_TIMEOUT", "caption")),
+        ("total_image", (0.03, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "image")),
+        ("total_caption", (0.10, 0.20, 0.20), ("LIFE_TOTAL_TIMEOUT", "caption")),
+    ],
+)
+def test_life_stage_and_total_deadlines_fail_closed(monkeypatch, stall_stage, budgets, expected):
+    from qzone_bridge.errors import LifeGenerationError
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden-fallback", life_publish_image_retry_count=2,
+    )
+    plugin._life_budget_snapshot = lambda _settings: budgets
+    calls = {"image": 0, "caption": 0, "publish": 0}
+
+    async def get_context():
+        if stall_stage == "context":
+            await asyncio.sleep(1)
+        return {"fixture": True}, "context"
+
+    async def image_prompt(*_args, **_kwargs):
+        if stall_stage == "image_prompt":
+            await asyncio.sleep(1)
+        return "prompt"
+
+    async def image(*_args, **_kwargs):
+        calls["image"] += 1
+        if stall_stage == "sync_image":
+            __import__("time").sleep(0.05)  # no event-loop turn for the native timer to fire
+        elif stall_stage in {"image", "total_image"}:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(0.02)
+        return [object()], {"success": True}
+
+    async def caption(*_args, **_kwargs):
+        calls["caption"] += 1
+        if stall_stage == "caption_swallow":
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return "late-caption"
+        if stall_stage in {"caption", "total_caption"}:
+            await asyncio.sleep(1)
+        return "unexpected-caption"
+
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = image_prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == expected
+    assert calls["publish"] == 0
+    if stall_stage in {"context", "image_prompt", "image", "sync_image", "total_image"}:
+        assert calls["caption"] == 0
+
+
+def test_total_deadline_during_caption_sync_provider_is_reported_as_caption(monkeypatch):
+    from qzone_bridge.errors import LifeGenerationError
+    from qzone_bridge.persona_guard import invoke_provider
+
+    main = _import_main_with_stubs(monkeypatch)
+    class Projection:
+        current_plan = None
+        def caption_context(self): return "context"
+    class Inputs:
+        clock = object()
+        image_style_prompt = ""
+    monkeypatch.setattr(main, "capture_life_inputs", lambda *_args: Inputs())
+    monkeypatch.setattr(main, "unknown_life_context", lambda *_args: Projection())
+    monkeypatch.setattr(main, "project_life_context", lambda *_args: Projection())
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = types.SimpleNamespace(
+        life_publish_timezone="UTC", life_publish_image_style_prompt="",
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_failure_policy="text_only", life_publish_mode="draft",
+        life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
+    )
+    plugin._life_budget_snapshot = lambda _settings: (0.10, 1.0, 1.0)
+    calls = {"publish": 0}
+    async def get_context(): return {"fixture": True}, "context"
+    async def prompt(*_args, **_kwargs): return "prompt"
+    async def image(*_args, **_kwargs): return [object()], {"success": True}
+    async def caption(*_args, **_kwargs):
+        async def synchronous_provider():
+            __import__("time").sleep(0.15)
+            return "late caption"
+        return await invoke_provider(synchronous_provider)
+    async def publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        return {"published": True}
+    plugin._get_life_context = get_context
+    plugin._generate_life_image_prompt = prompt
+    plugin._generate_life_selfie_media = image
+    plugin._generate_life_caption = caption
+    plugin._publish_or_draft_scheduled_post = publish
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert (exc.value.code, exc.value.phase) == ("LIFE_TOTAL_TIMEOUT", "caption")
+    assert calls["publish"] == 0
+
+
 def test_main_import_recovers_from_stale_renderer_module(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -235,6 +634,247 @@ def test_main_import_recovers_from_stale_page_api_constructor(monkeypatch: pytes
         sys.modules.pop("main", None)
 
 
+@pytest.mark.parametrize(
+    "missing_parameter",
+    ("ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker"),
+)
+def test_bridge_cache_contract_rejects_each_missing_page_api_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_parameter: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.page_api as page_api
+
+    required = [
+        "controller", "post_service_factory", "settings", "preload_scheduler",
+        "ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker",
+    ]
+    required.remove(missing_parameter)
+    namespace: dict[str, object] = {}
+    exec(f"def __init__(self, *, {', '.join(required)}): pass", namespace)
+    old_class = type("CachedQzonePageApi", (), {"__init__": namespace["__init__"]})
+    monkeypatch.setattr(page_api, "QzonePageApi", old_class)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_missing_llm_persona_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+
+    def stale_generate_text(self, event, prompt, *, provider_id="", system_prompt="", prefer_current_provider=False):
+        return ""
+
+    monkeypatch.setattr(llm.QzoneLLM, "generate_text", stale_generate_text)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ("generate_guarded_text", "generate_persona_visual_projection", "prepare_persona_snapshot"),
+)
+def test_bridge_cache_contract_rejects_missing_persona_guard_helper(
+    monkeypatch: pytest.MonkeyPatch, target_name: str
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+
+    monkeypatch.delattr(llm.QzoneLLM, target_name, raising=False)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_stale_persona_guard_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.persona_guard as guard
+
+    monkeypatch.delattr(guard, "parse_visual_projection")
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(
+    "target, stale",
+    [
+        ("resolver", lambda self, context, settings, event: ""),
+        ("projection", lambda self, event, *, provider_id="": ""),
+        ("snapshot", lambda self, event, *, provider_id="", prefer_current_provider=False: {}),
+        ("guarded", lambda self, event, prompt, *, provider_id="", system_prompt="", prefer_current_provider=False: ""),
+    ],
+)
+def test_bridge_cache_contract_rejects_each_stale_persona_signature(
+    monkeypatch: pytest.MonkeyPatch, target: str, stale
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+    import qzone_bridge.persona as persona
+
+    if target == "resolver":
+        monkeypatch.setattr(persona, "resolve_persona_prompt", stale)
+    elif target == "projection":
+        monkeypatch.setattr(llm.QzoneLLM, "generate_persona_visual_projection", stale)
+    elif target == "snapshot":
+        monkeypatch.setattr(llm.QzoneLLM, "prepare_persona_snapshot", stale)
+    else:
+        monkeypatch.setattr(llm.QzoneLLM, "generate_guarded_text", stale)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge
+
+    main = _import_main_with_stubs(monkeypatch)
+    metadata = Path("metadata.yaml").read_text(encoding="utf-8")
+    assert qzone_bridge.__version__ == "0.9.8"
+    assert "version: 0.9.8" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110701
+    assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
+
+
+@pytest.mark.parametrize("attribute", ["capture_life_inputs", "project_life_context", "unknown_life_context"])
+def test_bridge_cache_contract_rejects_missing_life_context_helper(monkeypatch: pytest.MonkeyPatch, attribute: str) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules["qzone_bridge.life_context"]
+    monkeypatch.setattr(module, attribute, None)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_stale_life_context_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules["qzone_bridge.life_context"]
+    monkeypatch.setattr(module, "capture_life_inputs", lambda: None)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_life_timezone_and_style_settings_defaults_and_explicit_empty_style() -> None:
+    defaults = PluginSettings.from_mapping({})
+    assert defaults.life_publish_timezone == "Asia/Shanghai"
+    assert defaults.life_publish_image_style_prompt == ""
+    schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+    assert schema["life_publish"]["items"]["image_style_prompt"]["default"] == defaults.life_publish_image_style_prompt
+    assert "真实手机自拍" not in defaults.life_publish_image_prompt_template
+    assert "给定日期" in defaults.life_publish_caption_prompt
+    explicit = PluginSettings.from_mapping({"life_publish": {"timezone": "UTC+08:00", "image_style_prompt": ""}})
+    assert explicit.life_publish_timezone == "UTC+08:00"
+    assert explicit.life_publish_image_style_prompt == ""
+    configured = PluginSettings.from_mapping({"life_publish": {"image_style_prompt": "CUSTOM_STYLE"}})
+    assert configured.life_publish_image_style_prompt == "CUSTOM_STYLE"
+
+
+@pytest.mark.parametrize(
+    "module_name,class_name,missing_field",
+    [
+        ("qzone_bridge.settings", "PluginSettings", "persona_id"),
+        ("qzone_bridge.settings", "PluginSettings", "context_umo"),
+        ("qzone_bridge.settings", "PluginSettings", "persona_consistency_check"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_inherit_persona_visual"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_persona_visual_prompt"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_timezone"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_generation_timeout_seconds"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_image_timeout_seconds"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_text_timeout_seconds"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_image_style_prompt"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_enabled"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_poll_interval"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_min"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_max"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_recent_posts"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_max_per_run"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_daily_limit"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_skip_low_information"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_probability"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_ignore_users"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "enabled"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "poll_interval"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "delay_min"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "delay_max"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "recent_posts"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "max_per_run"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "daily_limit"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "skip_low_information"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "reply_probability"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "ignore_users"),
+    ],
+)
+def test_bridge_cache_contract_rejects_each_missing_new_config_field(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    class_name: str,
+    missing_field: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules[module_name]
+    cls = getattr(module, class_name)
+    fields = dict(cls.__dataclass_fields__)
+    fields.pop(missing_field)
+    monkeypatch.setattr(cls, "__dataclass_fields__", fields)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(
+    ("module_name", "target", "stale"),
+    [
+        ("qzone_bridge.persona_guard", "generation_scope", lambda *, timeout=90: None),
+        ("qzone_bridge.persona_guard", "generation_phase", lambda *, timeout: None),
+        ("qzone_bridge.page_life", "PageLifeJobStore.fail", lambda self, job_id, message="": None),
+    ],
+)
+def test_bridge_cache_contract_rejects_stale_budget_and_life_failure_signatures(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, target: str, stale
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules[module_name]
+    parent, _, attribute = target.rpartition(".")
+    if parent:
+        monkeypatch.setattr(getattr(module, parent), attribute, stale)
+    else:
+        monkeypatch.setattr(module, target, stale)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_main_bootstrap_refreshes_stale_page_api_and_wires_full_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    saved_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.page_api as page_api
+
+    class CachedQzonePageApi:
+        def __init__(self, *, controller, post_service_factory, settings, preload_scheduler=None):
+            self.controller = controller
+
+    try:
+        monkeypatch.setattr(page_api, "QzonePageApi", CachedQzonePageApi)
+        main = _import_main_with_stubs(monkeypatch)
+        assert main.QzonePageApi is not CachedQzonePageApi
+        signature = inspect.signature(main.QzonePageApi.__init__).parameters
+        for parameter in ("ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker"):
+            assert parameter in signature
+
+        class Controller:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr(main, "QzoneDaemonController", Controller)
+        monkeypatch.setattr(main, "_standard_data_dir", lambda root: tmp_path)
+        monkeypatch.setattr(main, "_read_plugin_name", lambda root: "test-plugin")
+        monkeypatch.setattr(main, "preload_static_render_assets", lambda: None)
+        monkeypatch.setattr(main.QzoneStablePlugin, "_capture_onebot_client_from_context", lambda self: None)
+        monkeypatch.setattr(main.QzoneStablePlugin, "_register_page_web_apis", lambda self: None)
+
+        plugin = main.QzoneStablePlugin(object(), config={})
+        assert plugin.page_api.ai_comment_generator is not None
+        assert plugin.page_api.ai_reply_generator is not None
+        assert plugin.page_api.reply_lock is plugin.auto_reply_service.reply_lock
+        assert plugin.page_api.manual_reply_marker == plugin.auto_reply_service.mark_manual_reply
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_recovers_from_stale_llm_without_news_generator(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -295,6 +935,8 @@ def test_main_import_recovers_from_stale_settings_without_required_fields(
         "life_publish_extra_params",
         "life_publish_static_caption",
         "life_publish_image_prompt_template",
+        "life_publish_timezone",
+        "life_publish_image_style_prompt",
         "life_publish_caption_prompt",
     }
     fields.discard(missing_field)
@@ -1019,7 +1661,7 @@ def test_remote_media_response_cookies_do_not_pollute_qzone_session(monkeypatch:
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         data, _, _ = asyncio.run(client._load_image_source({"kind": "image", "source": "https://example.test/a.png"}))
@@ -1050,7 +1692,7 @@ def test_remote_media_download_rejects_oversized_content_length(monkeypatch: pyt
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         with pytest.raises(QzoneParseError) as error:
@@ -1079,7 +1721,7 @@ def test_remote_media_download_rejects_stream_that_exceeds_limit(monkeypatch: py
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         with pytest.raises(QzoneParseError) as error:
@@ -1092,8 +1734,6 @@ def test_remote_media_download_rejects_stream_that_exceeds_limit(monkeypatch: py
 def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not source_policy.is_remote_media_url_allowed("http://127.0.0.1/a.png")
     assert not source_policy.is_remote_media_url_allowed("http://localhost/a.png")
-
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1105,7 +1745,6 @@ def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytes
 def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1120,7 +1759,6 @@ def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
 def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1137,7 +1775,6 @@ def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
 def test_remote_media_policy_allows_qq_multimedia_download_even_with_private_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1154,7 +1791,6 @@ def test_remote_media_policy_allows_qq_multimedia_download_even_with_private_dns
 def test_remote_media_policy_allows_trusted_qq_media_domain_with_mixed_public_and_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1174,7 +1810,6 @@ def test_remote_media_policy_allows_trusted_qq_media_domain_with_mixed_public_an
 def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1187,7 +1822,6 @@ def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
 def test_remote_media_policy_blocks_trusted_domain_with_private_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1195,6 +1829,327 @@ def test_remote_media_policy_blocks_trusted_domain_with_private_dns(
     )
 
     assert not source_policy.is_remote_media_url_allowed("https://qpic.cn/a.png")
+
+
+@pytest.mark.parametrize(
+    "source,dns_answer,expected_code",
+    [
+        ("not-a-url", None, "INVALID_URL"),
+        ("https://[broken/path", None, "INVALID_URL"),
+        ("https://media.example.test:bad/a.png", None, "INVALID_URL"),
+        ("https://media.example.test:70000/a.png", None, "INVALID_URL"),
+        ("http://localhost/a.png", None, "UNSAFE_HOST"),
+        ("https://media.example.test/a.png", "198.18.1.179", "UNSAFE_DNS"),
+        ("https://media.example.test/a.png", "10.0.0.5", "UNSAFE_DNS"),
+        ("https://media.example.test/a.png", "93.184.216.34", "ALLOWED"),
+    ],
+)
+def test_remote_media_diagnostic_codes_for_url_and_dns_branches(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    dns_answer: str | None,
+    expected_code: str,
+) -> None:
+    if dns_answer is not None:
+        monkeypatch.setattr(
+            source_policy.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", (dns_answer, 0))],
+        )
+    result = source_policy.check_remote_media_url(source)
+    assert result.code == expected_code
+    assert result.allowed is (expected_code == "ALLOWED")
+
+
+def test_remote_media_diagnostic_dns_failure_empty_and_mixed_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(source_policy.socket.gaierror("SENSITIVE_RESOLVER_MARKER")),
+    )
+    failed = source_policy.check_remote_media_url("https://failure.example.test/path?token=SENSITIVE_URL_MARKER")
+    assert (failed.code, failed.host) == ("DNS_LOOKUP_FAILED", "failure.example.test")
+    assert "SENSITIVE" not in repr(failed)
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lambda *args, **kwargs: [])
+    empty = source_policy.check_remote_media_url("https://empty.example.test/path")
+    assert empty.code == "DNS_LOOKUP_FAILED"
+
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0)),
+            (source_policy.socket.AF_INET, 0, 0, "", ("10.0.0.5", 0)),
+        ],
+    )
+    mixed = source_policy.check_remote_media_url("https://mixed.example.test/path")
+    assert mixed.code == "UNSAFE_DNS"
+
+
+def test_remote_media_diagnostic_performs_one_dns_lookup_and_keeps_exact_qq_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda host, *args, **kwargs: calls.append(host)
+        or [(source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
+    )
+    allowed = source_policy.check_remote_media_url("https://media.example.test/a.png")
+    assert allowed.code == "ALLOWED" and calls == ["media.example.test"]
+    calls.clear()
+    qq = source_policy.check_remote_media_url("https://multimedia.nt.qq.com.cn/download/image")
+    assert qq.code == "ALLOWED" and qq.host == "multimedia.nt.qq.com.cn" and calls == []
+
+
+def test_remote_media_redirect_diagnostic_rejects_private_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    target, result = source_policy.check_remote_media_redirect(
+        "https://media.example.test/base", "http://127.0.0.1/private.png?token=SENSITIVE_MARKER"
+    )
+    assert target == ""
+    assert result.code == "UNSAFE_HOST" and result.host == "127.0.0.1"
+    assert "SENSITIVE" not in repr(result)
+
+
+def test_client_malformed_remote_url_error_is_fixed_and_sanitized() -> None:
+    client = QzoneClient(SessionState(uin=12345))
+    source = "https://[broken/path?token=SENSITIVE_MARKER"
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail == {"reason": "INVALID_URL", "host": ""}
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+    finally:
+        asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("source", [
+    "https://media.example.test:bad/image.png?token=SENSITIVE_MARKER",
+    "https://media.example.test:70000/image.png?token=SENSITIVE_MARKER",
+])
+def test_client_invalid_port_is_rejected_before_dns_or_http(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    dns_calls = []
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lambda *a, **kw: dns_calls.append(a))
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *a, **kw: requests.append((a, kw)))
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail["reason"] == "INVALID_URL"
+        assert error.value.detail["host"] == "media.example.test"
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+        assert dns_calls == [] and requests == []
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_dns_failure_sanitizes_resolver_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("SENSITIVE_RESOLVER_MARKER")),
+    )
+    client = QzoneClient(SessionState(uin=12345))
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({
+                "kind": "image",
+                "source": "https://failure.example.test/image?token=SENSITIVE_URL_MARKER",
+            }))
+        assert error.value.detail == {"reason": "DNS_LOOKUP_FAILED", "host": "failure.example.test"}
+        assert "域名解析失败" in str(error.value)
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_recovers_from_fake_dns_and_diagnostics_hide_url_and_resolver_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answer = {"ip": "198.18.1.179", "calls": 0}
+    def lookup(host, *args, **kwargs):
+        answer["calls"] += 1
+        return [(source_policy.socket.AF_INET, 0, 0, "", (answer["ip"], 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"mock-image"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append((args, kwargs)) or _Stream())
+    source = "https://media.example.test/image.png?token=SENSITIVE_URL_MARKER"
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail == {"reason": "UNSAFE_DNS", "host": "media.example.test"}
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+        assert "跳转" not in str(error.value)
+        assert requests == []
+
+        answer["ip"] = "93.184.216.34"
+        loaded = asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert loaded[0] == b"mock-image"
+        assert len(requests) == 1 and answer["calls"] == 2
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_recovers_from_dns_error_to_public_without_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"failure": True, "calls": 0}
+
+    def lookup(host, *args, **kwargs):
+        state["calls"] += 1
+        if state["failure"]:
+            raise source_policy.socket.gaierror("SENSITIVE_RESOLVER_MARKER")
+        return [(source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"recovered"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(1) or _Stream())
+    media = {"kind": "image", "source": "https://recovered.example.test/image.png"}
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source(media))
+        assert error.value.detail == {"reason": "DNS_LOOKUP_FAILED", "host": "recovered.example.test"}
+        assert requests == []
+        state["failure"] = False
+        assert asyncio.run(client._load_image_source(media))[0] == b"recovered"
+        assert len(requests) == 1 and state["calls"] == 2
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_revalidates_dns_before_returning_cached_image_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    answer = {"ip": "93.184.216.34", "calls": 0}
+    def lookup(host, *args, **kwargs):
+        answer["calls"] += 1
+        return [(source_policy.socket.AF_INET, 0, 0, "", (answer["ip"], 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"cached-image"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(1) or _Stream())
+    media = {"kind": "image", "source": "https://media.example.test/cached.png"}
+    try:
+        assert asyncio.run(client._load_image_source(media))[0] == b"cached-image"
+        answer["ip"] = "10.0.0.5"
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source(media))
+        assert error.value.detail == {"reason": "UNSAFE_DNS", "host": "media.example.test"}
+        assert len(requests) == 1
+        answer["ip"] = "93.184.216.34"
+        assert asyncio.run(client._load_image_source(media))[0] == b"cached-image"
+        assert len(requests) == 1 and answer["calls"] == 3
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_redirect_dns_validation_runs_off_event_loop_and_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    loop_thread = threading.get_ident()
+    dns_threads = []
+    dns_hosts = []
+    def lookup(host, *args, **kwargs):
+        dns_threads.append(threading.get_ident())
+        dns_hosts.append(host)
+        address = "10.0.0.5" if host == "private.example.test" else "93.184.216.34"
+        return [(source_policy.socket.AF_INET, 0, 0, "", (address, 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 302
+        headers = {"location": "http://private.example.test/private.png?token=SENSITIVE_MARKER"}
+
+        async def aiter_bytes(self):
+            return
+            yield b""
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(args[1]) or _Stream())
+    async def run():
+        with pytest.raises(QzoneParseError) as error:
+            await client._load_image_source({"kind": "image", "source": "https://media.example.test/original.png"})
+        return error.value
+    try:
+        error = asyncio.run(run())
+        assert error.detail == {"reason": "UNSAFE_DNS", "host": "private.example.test"}
+        assert "跳转" in str(error)
+        assert "DNS 结果不是公网地址" in str(error)
+        assert "SENSITIVE" not in str(error) + repr(error.detail)
+        assert len(requests) == 1 and all("private.example.test" not in url for url in requests)
+        assert dns_hosts == ["media.example.test", "private.example.test"]
+        assert dns_threads and all(thread_id != loop_thread for thread_id in dns_threads)
+    finally:
+        asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("missing_helper", ["check_remote_media_url", "check_remote_media_redirect"])
+def test_bridge_contract_requires_remote_media_diagnostic_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_helper: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    monkeypatch.delattr(source_policy, missing_helper)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
 
 
 def test_base64_upload_sources_do_not_apply_plugin_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1252,6 +2207,273 @@ def test_daemon_secret_is_not_passed_in_argv(tmp_path, monkeypatch: pytest.Monke
     assert "--secret" not in cmd
     assert isinstance(env, dict)
     assert env.get("QZONE_BRIDGE_SECRET")
+
+
+def test_guarded_life_publish_holds_live_account_target_until_send_finishes(tmp_path: Path) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneNeedsRebind
+
+    store = StateStore(tmp_path)
+    store.write(BridgeState(session=SessionState(uin=123, cookies={"uin": "o123", "p_skey": "a"}, needs_rebind=False)))
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+    service.warmup = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def fake_publish(**kwargs):
+            calls.append(kwargs)
+            entered.set()
+            await release.wait()
+            return {"fid": "f1"}
+
+        service._publish_post_impl = fake_publish  # type: ignore[method-assign]
+        publishing = asyncio.create_task(service.publish_post(content="x", expected_login_uin=123))
+        await entered.wait()
+        binding = asyncio.create_task(service.bind_cookie("uin=o456; p_uin=o456; p_skey=b", source="manual"))
+        await asyncio.sleep(0)
+        assert service.state.session.uin == 123 and not binding.done()
+        release.set()
+        assert await publishing == {"fid": "f1"}
+        await binding
+        assert service.state.session.uin == 456 and len(calls) == 1
+        service.state.session.uin = 123
+        service.state.session.needs_rebind = False
+        service.client.update_session(SessionState(uin=456, cookies={"uin": "o456", "p_skey": "b"}, needs_rebind=False))
+        with pytest.raises(QzoneNeedsRebind):
+            await service.publish_post(content="x", expected_login_uin=123)
+        assert len(calls) == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(service.client.close())
+
+
+def test_guarded_publish_has_no_replay_and_ordinary_publish_contract_remains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    store = StateStore(tmp_path)
+    store.write(BridgeState(session=SessionState(uin=123, cookies={"uin": "o123", "p_skey": "a"}, needs_rebind=False)))
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+
+    async def scenario():
+        calls = []
+
+        async def fake_publish(**kwargs):
+            calls.append(kwargs)
+            return {"fid": "f1"}
+
+        service._publish_post_impl = fake_publish  # type: ignore[method-assign]
+        assert await service.publish_post(content="ordinary") == {"fid": "f1"}
+        assert await service.publish_post(content="life", expected_login_uin=123) == {"fid": "f1"}
+        assert len(calls) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(service.client.close())
+
+
+def test_guarded_controller_publish_does_not_retry_transport_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    controller.store.write(state)
+    calls = []
+
+    async def healthy(_port):
+        return True
+
+    async def fail_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise httpx.ConnectError("connection dropped after request dispatch")
+
+    monkeypatch.setattr(controller, "_probe_health", healthy)
+    monkeypatch.setattr(controller._client, "request", fail_request)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.publish_post(content="life", expected_login_uin=123)
+        assert len(calls) == 1
+        calls.clear()
+        controller.auto_start_daemon = True
+
+        async def ensure_running():
+            return 8765
+
+        monkeypatch.setattr(controller, "ensure_running", ensure_running)
+        with pytest.raises(DaemonUnavailableError):
+            await controller._request("POST", "/post", json_body={}, retry_on_transport_error=True)
+        assert len(calls) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+@pytest.mark.parametrize("operation", ["bind", "unbind"])
+def test_local_bind_fallback_requires_positive_owned_exit_and_stable_offline_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = 321
+    if operation == "unbind":
+        state.session = SessionState(uin=123, cookies={"uin": "o123", "p_skey": "old"}, needs_rebind=False)
+    controller.store.write(state)
+
+    class ExitedProcess:
+        pid = 321
+
+        def poll(self):
+            return 0
+
+    controller._process = ExitedProcess()  # type: ignore[assignment]
+
+    async def health(_port, **_kwargs):
+        return False
+
+    async def free(_port):
+        return True
+
+    async def predispatch_error(*_args, **_kwargs):
+        raise DaemonUnavailableError("preflight", detail={"request_dispatched": False})
+
+    monkeypatch.setattr(controller, "bind_cookie" if operation == "bind" else "unbind", predispatch_error)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        if operation == "bind":
+            result = await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test", source="manual")
+            assert result["login_uin"] == 456
+            assert controller.store.read().session.uin == 456
+        else:
+            result = await controller.unbind_local()
+            assert result["login_uin"] == 0 and result["needs_rebind"]
+            assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+@pytest.mark.parametrize("dispatched,live,port_free,persisted_pid", [
+    (True, False, True, 321),
+    (False, True, True, 321),
+    (False, False, False, 321),
+    (False, False, True, 999),
+])
+def test_local_bind_fallback_rejects_unknown_or_unproven_daemon_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatched: bool, live: bool, port_free: bool, persisted_pid: int,
+) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = persisted_pid
+    controller.store.write(state)
+
+    class FakeProcess:
+        pid = 321
+
+        def poll(self):
+            return None if live else 0
+
+    controller._process = FakeProcess()  # type: ignore[assignment]
+
+    async def health(_port, **_kwargs):
+        return live
+
+    async def free(_port):
+        return port_free
+
+    async def failed_rpc(*_args, **_kwargs):
+        raise DaemonUnavailableError("rpc result", detail={"request_dispatched": dispatched})
+
+    monkeypatch.setattr(controller, "bind_cookie", failed_rpc)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test", source="manual")
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+def test_local_bind_fallback_rejects_missing_exit_receipt_when_persisted_pid_is_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = 0
+    controller.store.write(state)
+
+    async def predispatch_error(*_args, **_kwargs):
+        raise DaemonUnavailableError("preflight", detail={"request_dispatched": False})
+
+    async def health(_port, **_kwargs):
+        return False
+
+    async def free(_port):
+        return True
+
+    monkeypatch.setattr(controller, "bind_cookie", predispatch_error)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test")
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+def test_dispatched_bind_timeout_never_uses_local_fallback_and_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    controller.store.write(state)
+    calls = []
+
+    async def health(_port):
+        return True
+
+    async def timeout(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise httpx.ReadTimeout("response lost after dispatch")
+
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr(controller._client, "request", timeout)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError, match="绑定结果未确认"):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test")
+        assert len(calls) == 1
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
 
 
 def test_daemon_spawn_passes_current_version(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1345,6 +2567,11 @@ def test_ensure_running_restarts_incompatible_daemon(tmp_path, monkeypatch: pyte
 
     def mark_runtime_stale(state):
         state.runtime.version = "0.3.2"
+        state.session = SessionState(
+            uin=12345,
+            cookies={"uin": "o12345", "p_skey": "preserved-pskey"},
+            source="onebot",
+        )
 
     controller.store.update(mark_runtime_stale)
     runtime = controller._runtime()
@@ -1408,6 +2635,10 @@ def test_ensure_running_restarts_incompatible_daemon(tmp_path, monkeypatch: pyte
     assert calls["spawn"] == [runtime.daemon_port]
     assert status["daemon_state"] == "ready"
     assert status["daemon_version"] == qzone_bridge.__version__
+    preserved = controller.store.read().session
+    assert preserved.uin == 12345
+    assert preserved.cookies["p_skey"] == "preserved-pskey"
+    assert preserved.source == "onebot"
 
 
 def test_ensure_running_does_not_shutdown_foreign_health_service(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7232,6 +8463,7 @@ def test_generate_original_news_post_text_retries_copy_like_output(
 ) -> None:
     main = _import_main_with_stubs(monkeypatch)
     plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings()
     item = main.NewsItem(title="航天员返回地球后最想洗头", source="羊城晚报", item_id="news-1")
     responses = ["航天员返回地球后最想洗头", "回到地面后，最想念的也许就是那些日常小事。"]
 
@@ -7239,6 +8471,10 @@ def test_generate_original_news_post_text_retries_copy_like_output(
         return responses.pop(0)
 
     plugin._generate_news_post_text = fake_generate
+    class _LLM:
+        async def prepare_persona_snapshot(self, *args, **kwargs):
+            return {"persona_prompt": "", "provider_id": ""}
+    plugin._llm_adapter = lambda: _LLM()
 
     text = asyncio.run(plugin._generate_original_news_post_text(None, [item]))
 
@@ -7299,11 +8535,11 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
     async def fake_ready(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         captured["life_context"] = life_context
         return "坐在咖啡厅窗边看书，白色毛衣和牛仔裙，手机自拍"
 
-    async def fake_caption(event, *, life_context, image_prompt):
+    async def fake_caption(event, *, life_context, image_prompt, **kwargs):
         captured["caption_args"] = (life_context, image_prompt)
         return "下午在咖啡香里偷一点安静。"
 
@@ -7410,12 +8646,12 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     async def fake_daemon(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         captured["prompt_event"] = event
         captured["life_context"] = life_context
         return "傍晚散步时的自然手机自拍"
 
-    async def fake_caption(event, *, life_context, image_prompt):
+    async def fake_caption(event, *, life_context, image_prompt, **kwargs):
         captured["caption_event"] = event
         return "晚风刚刚好。"
 
@@ -7620,9 +8856,16 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
         def exception(self, *args, **kwargs): ...
 
     class _LLM:
+        async def prepare_persona_snapshot(self, event, **kwargs):
+            return {"persona_prompt": "", "provider_id": ""}
+
+        async def generate_persona_visual_projection(self, event, **kwargs):
+            return "左耳佩戴银色耳环"
+
         async def generate_text(self, event, prompt, **kwargs):
             captured["event"] = event
             captured["prompt"] = prompt
+            captured["system_prompt"] = kwargs.get("system_prompt", "")
             return ""
 
     plugin = object.__new__(main.QzoneStablePlugin)
@@ -7630,6 +8873,7 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
         {
             "life_publish": {
                 "image_prompt_template": "根据日程生成自拍：\n{life_context}",
+                "image_style_prompt": "CUSTOM_STYLE",
             }
         }
     )
@@ -7638,12 +8882,394 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
 
     prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今日穿搭：浅色卫衣\n今日日程：傍晚散步"))
 
-    assert "真实手机自拍" in prompt
-    assert "浅色卫衣" in prompt
-    assert "傍晚散步" in prompt
+    assert "人物近景" in prompt
+    assert "浅色卫衣" not in prompt
+    assert "傍晚散步" not in prompt
+    assert "来源日期：未知" in prompt
+    assert "<画风约束>" in prompt
+    assert "CUSTOM_STYLE" in captured["prompt"]
+    assert "日系二次元厚涂插画" not in captured["prompt"]
+    assert prompt.count("<视觉参考>") == 1
     assert captured["prompt"].startswith("根据日程生成自拍")
     assert captured["event"] is not None
-    assert captured["warnings"] == []
+    assert "不得从过去或未来日程推断" in captured["system_prompt"]
+
+    echoed = plugin._assemble_life_image_prompt(
+        "黑发，今天穿浅色卫衣。黑发。<视觉参考>\n黑发\n</视觉参考>", "黑发"
+    )
+    assert echoed.count("<视觉参考>") == 1
+    assert "黑发，今天穿浅色卫衣。黑发。" in echoed  # ordinary generated words are preserved
+    assert "浅色卫衣" in echoed
+    negative = "今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。"
+    assembled = plugin._assemble_life_image_prompt(negative, "白衬衫")
+    assert assembled.startswith(negative)
+    assert assembled.count("<视觉参考>") == 1
+    assert "不穿白衬衫" in assembled
+    assert "当前穿着和姿势未知" in assembled
+
+
+@pytest.mark.parametrize("style_settings", [{}, {"image_style_prompt": ""}], ids=["omitted", "explicit-empty"])
+def test_life_image_prompt_static_mode_skips_persona_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, style_settings: dict[str, str]
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({
+        "life_publish": {
+            **style_settings,
+            "use_llm_image_prompt": False,
+            "inherit_persona_visual": False,
+            "image_prompt_template": "静态模板：{life_context}",
+        }
+    })
+    plugin.llm = main.QzoneLLM(None, plugin.settings)
+    prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今天散步"))
+    assert prompt.startswith("静态模板：")
+    assert "今天散步" not in prompt  # direct helper lacks a frozen dated projection
+    assert "来源日期：未知" in prompt
+    assert "<画风约束>" not in prompt
+    assert "日系二次元厚涂插画" not in prompt
+
+
+def test_life_operation_freezes_clock_style_and_projection_before_scheduler_await(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from datetime import timezone
+
+    import qzone_bridge.life_context as life_context_module
+
+    main = _import_main_with_stubs(monkeypatch)
+    frozen_utc = datetime(2026, 11, 5, 12, 30, tzinfo=timezone.utc)
+    real_capture = life_context_module.capture_life_inputs
+    monkeypatch.setattr(main, "capture_life_inputs", lambda zone, style: real_capture(zone, style, utc_now=frozen_utc))
+    captured = {}
+
+    class Life:
+        async def get_life_context(self):
+            plugin.settings.life_publish_timezone = "UTC"
+            plugin.settings.life_publish_image_style_prompt = "MUTATED_STYLE"
+            return {
+                "date": "2026-11-05",
+                "timeline": [{"time": "20:00-22:00", "content": "回家后休息"}],
+            }
+
+    class Metadata:
+        def __init__(self, star_cls): self.star_cls = star_cls
+
+    class Context:
+        def get_registered_star(self, name):
+            return Metadata(Life()) if name == "astrbot_plugin_life_scheduler" else None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"enabled": True, "image_style_prompt": "FROZEN_STYLE"}})
+    plugin._context = Context()
+    plugin.data_dir = tmp_path
+
+    async def image_prompt(event, life_context, *, projection, style_prompt):
+        captured["image_projection"] = projection
+        captured["style"] = style_prompt
+        captured["image_context"] = life_context
+        return main.QzoneStablePlugin._assemble_life_image_prompt(
+            "自拍构图", "", temporal_context=projection.image_context(),
+            style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None,
+        )
+
+    async def media(event, prompt):
+        return [main.PostMedia(kind="image", source="fixture.png", trusted_local=True)], {"success": True}
+
+    async def caption(event, *, life_context, image_prompt, projection):
+        captured["caption_projection"] = projection
+        captured["caption_context"] = life_context
+        captured["image_action"] = image_prompt
+        return "caption"
+
+    plugin._generate_life_image_prompt = image_prompt
+    plugin._generate_life_selfie_media = media
+    plugin._generate_life_caption = caption
+    prepared = asyncio.run(plugin._prepare_life_generation(None, force_publish=False, notify_admin=False))
+    projection = captured["image_projection"]
+    assert prepared is not None
+    assert projection is captured["caption_projection"]
+    assert projection.timezone_label == "Asia/Shanghai"
+    assert projection.local_now.strftime("%Y-%m-%d %H:%M") == "2026-11-05 20:30"
+    assert projection.current_plan is not None
+    assert captured["style"] == "FROZEN_STYLE"
+    assert "FROZEN_STYLE" in captured["image_action"]
+    assert "MUTATED_STYLE" not in captured["image_action"]
+    assert "2026-11-05 20:30" in captured["caption_context"]
+
+
+def test_invalid_life_timezone_stops_before_scheduler_provider_or_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    from qzone_bridge.life_context import LifeTimezoneError
+
+    called = {"scheduler": 0, "provider": 0, "send": 0}
+
+    class Context:
+        def get_registered_star(self, _name):
+            called["scheduler"] += 1
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"timezone": "Mars/Olympus"}})
+    plugin._context = Context()
+    async def provider(*args, **kwargs):
+        called["provider"] += 1
+    async def send(*args, **kwargs):
+        called["send"] += 1
+    plugin._generate_life_image_prompt = provider
+    plugin._generate_life_caption = provider
+    plugin._publish_or_draft_scheduled_post = send
+    with pytest.raises(LifeTimezoneError):
+        asyncio.run(plugin._auto_life_publish_once_scoped())
+    assert called == {"scheduler": 0, "provider": 0, "send": 0}
+
+
+def test_custom_life_templates_without_placeholders_receive_same_temporal_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import timezone
+
+    import qzone_bridge.life_context as life_context_module
+
+    main = _import_main_with_stubs(monkeypatch)
+    projection = life_context_module.project_life_context(
+        {"date": "2026-11-05", "timeline": [{"time": "20:00-22:00", "content": "回家后休息"}]},
+        life_context_module.capture_life_inputs(
+            "Asia/Shanghai", "FROZEN_STYLE",
+            utc_now=datetime(2026, 11, 5, 12, 30, tzinfo=timezone.utc),
+        ).clock,
+    )
+    captured = {}
+
+    class LLM:
+        async def prepare_persona_snapshot(self, event, **kwargs):
+            return {}
+        async def generate_persona_visual_projection(self, event, **kwargs):
+            return ""
+        async def generate_text(self, event, prompt, **kwargs):
+            captured["image_prompt"] = prompt
+            return "自拍构图"
+        async def generate_guarded_text(self, event, prompt, **kwargs):
+            captured["caption_prompt"] = prompt
+            captured["task_context"] = kwargs["task_context"]
+            captured["authoritative_facts"] = kwargs["authoritative_facts"]
+            return "caption"
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {
+        "image_prompt_template": "自定义图片模板，不含变量。",
+        "caption_prompt": "自定义配文模板，不含变量。",
+        "image_style_prompt": "FROZEN_STYLE",
+    }})
+    plugin._context = types.SimpleNamespace()
+    plugin._llm_adapter = lambda: LLM()
+    action = asyncio.run(plugin._generate_life_image_prompt(None, "ignored", projection=projection))
+    asyncio.run(plugin._generate_life_caption(None, life_context="ignored", image_prompt=action, projection=projection))
+    stamp = "2026-11-05 20:30"
+    assert stamp in captured["image_prompt"] and "来源日期：2026-11-05（本地当天）" in captured["image_prompt"]
+    assert "FROZEN_STYLE" in captured["image_prompt"]
+    assert stamp in captured["caption_prompt"] and projection.caption_time_rules() in captured["caption_prompt"]
+    assert stamp in captured["task_context"] and projection.caption_time_rules() in captured["task_context"]
+    assert stamp in captured["authoritative_facts"] and projection.caption_time_rules() in captured["authoritative_facts"]
+
+
+@pytest.mark.parametrize("failure_policy", ["skip", "text_only"])
+def test_real_persona_guard_life_caption_failure_never_publishes_or_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_policy: str
+) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "publish", "failure_policy": failure_policy,
+            "use_life_context": False, "use_llm_image_prompt": False,
+            "inherit_persona_visual": False, "auto_caption": True,
+            "static_caption": "STATIC_FALLBACK_MUST_NOT_PUBLISH",
+            "image_prompt_template": "A selfie in the current setting.",
+        },
+    })
+    class Manager:
+        async def resolve_selected_persona(self, **kwargs):
+            return "p", {"prompt": "black hair"}, None, False
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair"}
+    class Provider:
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            if prompt.startswith("Review whether"):
+                return '{"accepted":false,"rewrite":"SENSITIVE_REWRITE"}'
+            return "SENSITIVE_LIFE_CAPTION"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    plugin.controller = type("Controller", (), {"publish_post": lambda self, **kwargs: pytest.fail("must not publish")})()
+
+    async def selfie(event, prompt):
+        return [object()], {"success": True, "images": []}
+    plugin._generate_life_selfie_media = selfie
+    from qzone_bridge.errors import LifeGenerationError
+    with pytest.raises(LifeGenerationError) as exc:
+        asyncio.run(plugin._auto_life_publish_once())
+    assert exc.value.code == "LIFE_PERSONA_FAILED"
+
+
+def test_life_projection_failure_text_only_uses_separately_approved_caption(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "draft", "failure_policy": "text_only",
+            "use_life_context": False, "use_llm_image_prompt": True,
+            "inherit_persona_visual": True, "auto_caption": True,
+        },
+    })
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair, silver earrings"}
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append(prompt)
+            if prompt.startswith("Extract only directly stated visual traits"):
+                return "malformed projection"
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return "approved caption"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    captured = []
+    async def store(post, **kwargs):
+        captured.append((post, kwargs))
+        return {"draft": True}
+    plugin._publish_or_draft_scheduled_post = store
+    result = asyncio.run(plugin._auto_life_publish_once())
+    assert result == {"draft": True}
+    assert len(captured) == 1
+    assert captured[0][0].content == "approved caption"
+    assert captured[0][0].media == []
+    assert len(provider.calls) == 3  # invalid projection, caption, approval review
+
+
+def test_real_life_guard_publishes_approved_caption_with_validated_visual_reference(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "publish", "failure_policy": "skip",
+            "use_life_context": False, "use_llm_image_prompt": True,
+            "inherit_persona_visual": True, "auto_caption": True,
+            "image_retry_count": 0,
+        },
+    })
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair, silver earrings"}
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append((prompt, system_prompt))
+            if "You extract only source-grounded visual fragments" in system_prompt:
+                return json.dumps({"appearance": ["black hair"], "accessories": ["silver earrings"], "clothing": []})
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            if "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手" in system_prompt:
+                return "Today at a cafe, a casual selfie."
+            return "Approved Life caption."
+    provider = Provider()
+    class Metadata:
+        def __init__(self, plugin): self.star_cls = plugin
+    class OmniDraw:
+        async def generate_selfie(self, *, action, return_result=False, **kwargs):
+            captured["action"] = action
+            return {"success": True, "images": [{"file_path": str(image_path)}]}
+    image_path = tmp_path / "fixture.png"
+    image_path.write_bytes(b"fixture")
+    omnidraw = OmniDraw()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+        def get_registered_star(self, name):
+            return Metadata(omnidraw) if name == "astrbot_plugin_omnidraw" else None
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    captured = {}
+    async def publish(post, **kwargs):
+        captured["post"] = post
+        return {"published": True}
+    plugin._publish_or_draft_scheduled_post = publish
+    assert asyncio.run(plugin._auto_life_publish_once()) == {"published": True}
+    assert captured["post"].content == "Approved Life caption."
+    assert len(captured["post"].media) == 1
+    assert "<视觉参考>" in captured["action"] and captured["action"].count("<视觉参考>") == 1
+    assert "black hair" in captured["action"] and "silver earrings" in captured["action"]
+    assert "当前穿着和姿势未知" in captured["action"]
+    assert len(provider.calls) == 4
+
+
+def test_life_visual_assembly_preserves_negation_and_deduplicates_only_owned_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    text = "今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。<视觉参考>旧内容</视觉参考>"
+    result = main.QzoneStablePlugin._assemble_life_image_prompt(text, "白衬衫")
+    assert result.startswith("今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。")
+    assert result.count("<视觉参考>") == 1
+    assert "当前穿着和姿势未知" in result
+
+
+def test_life_publish_generation_scope_ends_before_publish_or_notify(monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import asynccontextmanager
+
+    from qzone_bridge.persona_guard import current_scope, generation_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    @asynccontextmanager
+    async def short_scope(*_args, **_kwargs):
+        async with generation_scope(timeout=0.01):
+            yield
+
+    monkeypatch.setattr(main, "generation_scope", short_scope)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = type("Settings", (), {"life_publish_mode": "publish"})()
+    post = main.PostPayload(content="caption", media=[])
+    async def prepared(*args, **kwargs):
+        assert current_scope() is not None
+        return post, [], False
+    plugin._auto_life_publish_once_scoped = prepared
+    async def publish(*args, **kwargs):
+        assert current_scope() is None
+        await asyncio.sleep(0.02)
+        return {"published": True}
+    plugin._publish_or_draft_scheduled_post = publish
+    result = asyncio.run(plugin._auto_life_publish_once())
+    assert result == {"published": True}
 
 
 def test_life_selfie_media_prefers_generate_selfie_return_result_method(
@@ -7880,7 +9506,7 @@ def test_auto_life_publish_skip_policy_does_not_publish_when_omnidraw_missing(
     async def fake_ready(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         return "在家看书的自拍"
 
     plugin = object.__new__(main.QzoneStablePlugin)
@@ -8523,6 +10149,117 @@ def test_auto_comment_pipeline_runs_judgment_reasoning_and_execution() -> None:
     assert calls[0][0] == "judge-provider"
     assert calls[1][0] == "reason-provider"
     assert calls[2] == ("execute", "friendly classmate tone")
+
+
+def test_configured_auto_comment_guard_rejection_does_not_fall_back_to_legacy_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.persona_guard import PersonaConsistencyError, current_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(persona_id="p")
+    settings.comment_pipeline_enabled = True
+    settings.comment_judgment_provider_id = "judge"
+    settings.comment_reasoning_provider_id = "reason"
+    settings.comment_execution_provider_id = "execute"
+    class Manager:
+        async def resolve_selected_persona(self, **kwargs):
+            return "p", {"prompt": "persona"}, None, False
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "persona"}
+    class Provider:
+        def __init__(self):
+            self.prompts = []
+            self.scope_counts = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.prompts.append(prompt)
+            self.scope_counts.append(current_scope().calls)
+            if prompt.startswith("You are judging"):
+                return '{"action":"comment","reason":"ordinary"}'
+            if prompt.startswith("Plan one natural"):
+                return "Friendly tone."
+            if prompt.startswith("Review whether"):
+                return '{"accepted":false,"rewrite":"untrusted correction"}'
+            return "unchecked legacy fallback"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_provider_by_id(self, _provider_id): return provider
+        async def get_using_provider(self, **kwargs): return provider
+        async def llm_generate(self, **kwargs): return "unchecked legacy fallback"
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin._generate_comment_text = lambda event, post: pytest.fail("must not invoke legacy fallback")
+    post = QzonePost(hostuin=123, fid="fid", summary="A normal day", nickname="Friend")
+    with pytest.raises(PersonaConsistencyError) as exc:
+        asyncio.run(plugin._generate_auto_comment_pipeline(post))
+    assert exc.value.code == "REVIEW_FAILED"
+    assert len(provider.prompts) == 5
+    assert provider.scope_counts == [1, 2, 3, 4, 5]
+    assert not any("unchecked legacy fallback" in prompt for prompt in provider.prompts)
+
+
+def test_news_originality_retry_reuses_single_guarded_scope_and_stays_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.persona_guard import current_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(persona_id="p", news_prompt="Write a news post.")
+    title = "A headline that is copied verbatim"
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "persona"}
+    class Provider:
+        def __init__(self):
+            self.calls = []
+            self.scope_counts = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append(prompt)
+            self.scope_counts.append(current_scope().calls)
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return title
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    item = main.NewsItem(title=title, source="fixture")
+    assert asyncio.run(plugin._generate_original_news_post_text(None, [item])) == ""
+    assert len(provider.calls) == 4  # two generated candidates and their reviews in one 6-call scope
+    assert provider.scope_counts == [1, 2, 3, 4]
+
+
+def test_news_nonrequired_snapshot_preserves_legacy_current_provider_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(news_prompt="Write a news post.")
+    title = "A headline that is copied verbatim"
+    calls = []
+    class Context:
+        async def get_current_chat_provider_id(self, **kwargs): return "legacy-current"
+        async def llm_generate(self, *, prompt, system_prompt="", **kwargs):
+            calls.append(kwargs.get("chat_provider_id"))
+            if "chat_provider_id" in kwargs:
+                raise TypeError("legacy API has no provider selector")
+            return title
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    assert asyncio.run(plugin._generate_original_news_post_text(None, [main.NewsItem(title=title)])) == ""
+    assert calls == ["legacy-current", None, "legacy-current", None]
 
 
 def test_auto_comment_pipeline_skips_sensitive_context_before_execution() -> None:
