@@ -257,7 +257,7 @@ def test_main_import_recovers_from_stale_llm_without_news_generator(monkeypatch:
         sys.modules.pop("main", None)
 
 
-@pytest.mark.parametrize("missing_field", ["news_cron", "life_publish_enabled"])
+@pytest.mark.parametrize("missing_field", ["news_cron", "life_publish_enabled", "random_comment_notify"])
 def test_main_import_recovers_from_stale_settings_without_required_fields(
     monkeypatch: pytest.MonkeyPatch,
     missing_field: str,
@@ -270,6 +270,7 @@ def test_main_import_recovers_from_stale_settings_without_required_fields(
     import qzone_bridge.settings as settings_module
 
     fields = {
+        "random_comment_notify",
         "news_cron",
         "news_offset",
         "news_provider_id",
@@ -314,6 +315,7 @@ def test_main_import_recovers_from_stale_settings_without_required_fields(
         assert main.PluginSettings is not _OldPluginSettings
         assert "news_cron" in getattr(main.PluginSettings, "__dataclass_fields__", {})
         assert "life_publish_enabled" in getattr(main.PluginSettings, "__dataclass_fields__", {})
+        assert "random_comment_notify" in getattr(main.PluginSettings, "__dataclass_fields__", {})
     finally:
         for name in list(sys.modules):
             if name == "qzone_bridge" or name.startswith("qzone_bridge."):

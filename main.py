@@ -526,7 +526,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
 
     contract_methods = {
         "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
-        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text",)},
+        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text", "describe_images")},
         "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
         "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
         "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
@@ -587,6 +587,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     contract_dataclass_fields = {
         "qzone_bridge.settings": {
             "PluginSettings": (
+                "random_comment_notify",
                 "news_cron",
                 "news_offset",
                 "news_provider_id",
@@ -1635,7 +1636,7 @@ class QzoneStablePlugin(Star):
                 profile=profile,
                 result=payload,
                 width=int(getattr(settings, "render_result_width", 900) or 900),
-                remote_timeout=float(getattr(settings, "render_remote_timeout", 0.35) or 0.35),
+                remote_timeout=float(getattr(settings, "render_remote_timeout", 5.0) or 5.0),
             )
         except Exception as exc:
             logger.exception("qzone manual publish result render failed: %s", exc)
@@ -1951,7 +1952,7 @@ class QzoneStablePlugin(Star):
                     profile=profile,
                     result=payload,
                     width=int(getattr(self.settings, "render_result_width", 900) or 900),
-                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 0.35) or 0.35),
+                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 5.0) or 5.0),
                 )
             except Exception as exc:
                 logger.exception("qzone scheduled publish result render failed: %s", exc)
@@ -2879,8 +2880,14 @@ class QzoneStablePlugin(Star):
         for post in posts[:5]:
             index = post.local_id or 1
             lines.append(f"第 {index} 条：{truncate(post.summary or '(空)', 220)}")
-            if detail and post.images:
+            if post.images:
                 lines.append(f"图片：{len(post.images[:9])} 张")
+                lines.append("配图识别结果：")
+                description = await self._llm_adapter().describe_images(
+                    event, post.images
+                )
+                lines.append(description)
+                fallback += f"\n第 {index} 条的配图：\n{description}"
             if detail and post.comments:
                 lines.append("评论：")
                 for comment in post.comments[:5]:
@@ -2893,7 +2900,11 @@ class QzoneStablePlugin(Star):
             "保留“第 N 条”这种可见编号，方便用户继续说“评论第 N 条”或“赞第 N 条”。"
             "不要输出 JSON、Markdown 代码块、工具名、字段名、fid、hostuin、参数或内部流程。"
         )
-        payload = {"ok": True, "tool": "qzone_view_post", "result": {"message": fallback}}
+        payload = {
+            "ok": True,
+            "tool": "qzone_view_post",
+            "result": {"message": fallback},
+        }
         try:
             text = await self._llm_adapter().generate_text(
                 event,
@@ -2907,7 +2918,9 @@ class QzoneStablePlugin(Star):
             if self._llm_tool_reply_is_safe(text, payload):
                 return text
             if text:
-                logger.warning("discarded unsafe qzone llm view reply: %s", truncate(text, 300))
+                logger.warning(
+                    "discarded unsafe qzone llm view reply: %s", truncate(text, 300)
+                )
         return fallback
 
     @staticmethod
@@ -4163,6 +4176,14 @@ class QzoneStablePlugin(Star):
 
         lines: list[str] = []
         meta = life_data.get("meta") if isinstance(life_data.get("meta"), dict) else {}
+        for key, label in (
+            ("current_time", "当前时间"),
+            ("current_activity", "当前活动"),
+            ("selfie_persona", "本次形象"),
+        ):
+            value = str(life_data.get(key) or "").strip()
+            if value:
+                lines.append(f"{label}：{value}")
         style = str(meta.get("style") or life_data.get("outfit_style") or "").strip()
         outfit = str(life_data.get("outfit") or "").strip()
         schedule = str(life_data.get("schedule") or "").strip()
@@ -4403,6 +4424,8 @@ class QzoneStablePlugin(Star):
         self,
         event: AstrMessageEvent | None,
         image_prompt: str,
+        *,
+        persona_id: str = "",
     ) -> tuple[list[PostMedia], dict[str, Any]]:
         if not getattr(self.settings, "life_publish_use_omnidraw_selfie", True):
             return [], {"success": False, "message": "OmniDraw 自拍开关已关闭", "images": []}
@@ -4418,12 +4441,18 @@ class QzoneStablePlugin(Star):
         kwargs = {
             "action": image_prompt,
             "count": 1,
-            "aspect_ratio": str(getattr(self.settings, "life_publish_aspect_ratio", "") or ""),
+            "aspect_ratio": str(
+                getattr(self.settings, "life_publish_aspect_ratio", "") or ""
+            ),
             "size": str(getattr(self.settings, "life_publish_size", "") or ""),
-            "extra_params": str(getattr(self.settings, "life_publish_extra_params", "") or ""),
+            "extra_params": str(
+                getattr(self.settings, "life_publish_extra_params", "") or ""
+            ),
             "return_result": True,
             "refs": "",
         }
+        if persona_id:
+            kwargs["persona_id"] = persona_id
         max_retries = self._life_publish_image_retry_count(self.settings)
         total_attempts = max_retries + 1
         last_result: dict[str, Any] = {"success": False, "message": "", "images": []}
@@ -4549,6 +4578,23 @@ class QzoneStablePlugin(Star):
                     return
             life_context = "暂无今日生活日程。"
 
+        persona_id = ""
+        omni_plugin = self._omnidraw_plugin()
+        resolver = getattr(omni_plugin, "resolve_selfie_context", None)
+        if callable(resolver):
+            try:
+                request = str(getattr(event, "message_str", "") or "")
+                selection = await self._maybe_await(
+                    resolver(request, life_context=life_data)
+                )
+                persona_id = str(selection.get("persona_id") or "")
+                life_data = selection.get("life_context", life_data)
+                life_context = self._life_context_text(life_data)
+            except Exception as exc:  # noqa: BLE001 - Keep compatibility when an optional selector fails.
+                logger.warning(
+                    "qzone automatic selfie persona selection failed: %s", exc
+                )
+
         image_prompt = ""
         media: list[PostMedia] = []
         omnidraw_result: dict[str, Any] = {"success": False, "images": []}
@@ -4557,7 +4603,14 @@ class QzoneStablePlugin(Star):
             image_prompt = await self._generate_life_image_prompt(event, life_context)
             if not image_prompt.strip():
                 raise RuntimeError("LLM 未生成自拍提示词")
-            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
+            if persona_id:
+                media, omnidraw_result = await self._generate_life_selfie_media(
+                    event, image_prompt, persona_id=persona_id
+                )
+            else:
+                media, omnidraw_result = await self._generate_life_selfie_media(
+                    event, image_prompt
+                )
             if not media:
                 raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
         except Exception as exc:
@@ -5462,13 +5515,14 @@ class QzoneStablePlugin(Star):
             await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
                 await self._post_service().like_post(post)
-            comment_text = content.strip()
-            await self._notify_event_post_card(
-                event,
-                post,
-                f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
-                comment_text=comment_text,
-            )
+            if getattr(self.settings, "random_comment_notify", True):
+                comment_text = content.strip()
+                await self._notify_event_post_card(
+                    event,
+                    post,
+                    f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                    comment_text=comment_text,
+                )
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 
@@ -5495,11 +5549,15 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            posts = await self._posts_for_event(event, ("看说说", "查看说说"), with_detail=True)
+            posts = await self._posts_for_event(
+                event, ("看说说", "查看说说"), with_detail=True
+            )
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+        async for result in self._yield_post_card_results(
+            event, posts, self._format_posts(posts, detail=True)
+        ):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -5523,7 +5581,19 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+        if not any(post.images for post in posts):
+            async for result in self._yield_post_card_results(
+                event, posts, self._format_posts(posts, detail=True)
+            ):
+                yield result
+            return
+        text = await self._ask_llm_view_reply(
+            event, posts, detail=True, fallback=self._format_posts(posts, detail=True)
+        )
+        yield self._command_result(event, text)
+        async for result in self._yield_post_card_results(
+            event, posts, text, fallback_when_unrendered=False
+        ):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -6587,6 +6657,8 @@ class QzoneStablePlugin(Star):
     ):
         """获取 QQ 空间说说列表。
 
+        列表只含文字摘要。需要了解配图时，继续调用 qzone_view_post 或 qzone_detail_feed。
+
         Args:
             target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
             limit (number): 返回数量。
@@ -6617,7 +6689,9 @@ class QzoneStablePlugin(Star):
         return format_llm_feed_list(entries)
 
     @filter.llm_tool(name="qzone_detail_feed")
-    async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+    async def tool_detail_feed(
+        self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311
+    ):
         """获取说说详情。
 
         Args:
@@ -6637,7 +6711,11 @@ class QzoneStablePlugin(Star):
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
             return self._error_text(exc)
-        return self._render_detail(payload)
+        post = post_from_entry(FeedEntry(**payload["entry"]), detail=payload.get("raw"), local_id=1)
+        post.comments = self._post_service()._comments_from_detail(payload)
+        return await self._ask_llm_view_reply(
+            event, [post], detail=True, fallback=self._render_detail(payload)
+        )
 
     @filter.llm_tool(name="qzone_view_post")
     async def tool_view_post(
@@ -6650,7 +6728,7 @@ class QzoneStablePlugin(Star):
         fid: str = "",
         appid: int = 311,
     ):
-        """按自然选择器查看一条或多条 QQ 空间说说。
+        """按自然选择器查看一条或多条 QQ 空间说说，包含配图内容的识别描述。
 
         Args:
             target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。

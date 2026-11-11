@@ -225,11 +225,17 @@
           "step": 0.01
         }
       },
+      "random_comment_notify": {
+        "description": "随机评论后反馈当前聊天",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，消息随机触发的自动评论会向原群或私聊发送结果卡片；关闭后静默评论，仍按配置执行点赞。"
+      },
       "send_admin": {
         "description": "自动任务后反馈管理员",
         "type": "bool",
         "default": false,
-        "hint": "开启后，定时发布、定时评论会向管理群或管理员私聊发送结果和 QQ 空间风格渲染图；收到消息概率触发的自动评论会发回当前会话。"
+        "hint": "开启后，定时发布、定时评论会向管理群或管理员私聊发送结果和 QQ 空间风格渲染图。随机评论的聊天反馈由 trigger.random_comment_notify 控制。"
       },
       "like_when_comment": {
         "description": "评论时同时点赞",
@@ -550,10 +556,10 @@
     "hint": "看/读/评/赞说说时单次最多渲染的说说卡片数量，避免范围过大拖慢响应。"
   },
   "render_remote_timeout": {
-    "description": "发布结果图远程资源超时",
+    "description": "说说卡片远程资源超时",
     "type": "float",
-    "default": 0.35,
-    "hint": "发布结果图远程头像或图片预览的单资源超时。",
+    "default": 5.0,
+    "hint": "查看说说及发布结果卡片的远程头像或图片预览单资源超时。",
     "slider": {
       "min": 0.05,
       "max": 10,

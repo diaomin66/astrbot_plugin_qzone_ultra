@@ -136,7 +136,7 @@ class PluginSettings:
     render_publish_result: bool = True
     render_result_width: int = 900
     render_feed_card_limit: int = 5
-    render_remote_timeout: float = 0.35
+    render_remote_timeout: float = 5.0
     native_video_publish: bool = True
     manage_group: int = 0
     pillowmd_style_dir: str = ""
@@ -168,6 +168,7 @@ class PluginSettings:
     comment_offset: int = 0
     comment_latest_count: int = 1
     read_prob: float = 0.0
+    random_comment_notify: bool = True
     send_admin: bool = False
     like_when_comment: bool = False
     life_publish_enabled: bool = False
@@ -235,7 +236,7 @@ class PluginSettings:
             render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
             render_result_width=_as_int(_pick(mapping, "render_result_width", 900), 900, minimum=320, maximum=2400),
             render_feed_card_limit=_as_int(_pick(mapping, "render_feed_card_limit", 5), 5, minimum=1),
-            render_remote_timeout=_as_float(_pick(mapping, "render_remote_timeout", 0.35), 0.35, minimum=0.05),
+            render_remote_timeout=_as_float(_pick(mapping, "render_remote_timeout", 5.0), 5.0, minimum=0.05),
             native_video_publish=_as_bool(_pick(mapping, "native_video_publish", True), True),
             manage_group=_as_int(_pick(mapping, "manage_group", 0), 0, minimum=0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
@@ -299,6 +300,7 @@ class PluginSettings:
             ),
             comment_latest_count=_as_int(_nested(mapping, "trigger", "comment_latest_count", 1), 1, minimum=1),
             read_prob=_as_float(_nested(mapping, "trigger", "read_prob", 0.0), 0.0, minimum=0.0, maximum=1.0),
+            random_comment_notify=_as_bool(_nested(mapping, "trigger", "random_comment_notify", True), True),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
             life_publish_enabled=_as_bool(_nested(mapping, "life_publish", "enabled", False), False),

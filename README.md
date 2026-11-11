@@ -4,7 +4,7 @@
 
 QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令、LLM 工具、Cookie 绑定、本地 daemon、图片/视频发布、说说渲染、投稿审核和自动评论能力。插件优先适配 OneBot v11 / aiocqhttp，也支持手动 Cookie 绑定后使用核心 QQ 空间功能。
 
-交流与反馈：**[点击加入 QQ 群 1081773675](https://qm.qq.com/q/Qr45Vz0a8o)**
+交流与反馈：687112925 QQ群
 
 ## 亮点：自动发布「会生活」的日常说说
 
@@ -31,7 +31,7 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 - 看说说、读说说、评论说说、点赞说说和自动评论反馈可复用同款 QQ 空间风格说说卡片渲染。
 - 表白墙投稿、匿名投稿、撤稿、看稿、过稿、拒稿。
 - 定时自动发说说、自动评论好友最新动态，并记录已处理动态，避免重复打扰；其中自动发说说可联动 Life Scheduler + OmniDraw，把今日行程生成自拍图和日常文案后自动发布。
-- 收到消息概率触发自动评论时，会在当前触发会话返回包含原说说和自己评论的 QQ 空间风格渲染图。
+- 收到消息概率触发自动评论时，默认在当前触发会话返回包含原说说和自己评论的 QQ 空间风格渲染图；可通过 `trigger.random_comment_notify=false` 关闭聊天反馈。
 - Google News RSS 新闻说说：可按数量获取候选新闻并排序缓存，也可选择序号让 LLM 写成原创短评后立即发布或定时发布。
 - 可选 pillowmd 风格渲染；渲染失败时自动回退文本。
 - LLM tool 结果会转成自然语言回复，避免向用户暴露 raw JSON、fid、cursor 等内部字段。
@@ -167,7 +167,8 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `trigger.comment_latest_count` | `1` | 每次定时自动评论从好友最新动态中处理的未评论说说条数 |
 
 | `trigger.read_prob` | `0.0` | 收到消息时概率触发读说说和自动评论 |
-| `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；收到消息概率触发的自动评论会发回当前会话 |
+| `trigger.random_comment_notify` | `true` | 消息随机触发自动评论后，向原群或私聊发送结果卡片；关闭后静默评论，仍按配置执行点赞 |
+| `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；随机评论的聊天反馈由 `trigger.random_comment_notify` 控制 |
 | `news.scopes` | `["china"]` | 新闻范围，可填 `china`、`world`、`mixed`，也支持 `中国`、`国际`、`混合` |
 | `news.keywords` | 空 | 额外 Google News RSS 搜索关键词列表 |
 | `news.custom_rss_urls` | 空 | 自定义 Google News RSS 地址列表，仅允许 `https://news.google.com/rss...` |
@@ -208,7 +209,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 开启后，`trigger.publish_cron` 触发时会先走这条链路：
 
 1. 调用 `astrbot_plugin_life_scheduler.get_life_context()` 获取今日日程
-2. 把日程交给 LLM 生成适合 OmniDraw 自拍模式的提示词
+2. 如果 OmniDraw 提供 `resolve_selfie_context()`，先根据当前活动和当天穿搭选择本次人设，再把选定的穿搭交给 LLM 生成自拍提示词
 3. 调用 OmniDraw 的 `generate_selfie(return_result=true)` 获取返回式图片
 4. 自动配文并发说说，或按配置写入草稿
 
@@ -226,6 +227,9 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 说明：
 
 - 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
+- 支持自动人设选择的 OmniDraw 会把选定的人设 ID 传入本次自拍；配图提示词和说说配文使用同一份穿搭上下文，不修改全局默认人设。先在 OmniDraw 的“自动自拍人设选择”中开启功能，并把工作服、睡衣等映射到已有的人设 ID。
+- Life Scheduler 提供 `current_activity` 和 `current_time` 时，两者会加入提示词上下文。模板应以当前活动、本次人设和本次穿搭为准，全天日程只作为背景。
+- 旧版 OmniDraw 没有选择接口时继续使用原自拍流程；选择接口出错时也会回退到原流程。
 - 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
 - OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。
