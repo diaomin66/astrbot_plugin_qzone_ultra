@@ -671,10 +671,11 @@ def test_initialize_schedules_auto_bind_without_waiting(monkeypatch: pytest.Monk
         plugin._start_scheduled_tasks = lambda: None
         plugin._capture_onebot_client_from_context = lambda: bot
 
-        async def fake_bootstrap(trigger, event=None):
+        async def fake_bootstrap(trigger, event=None, *, force_refresh=False):
             nonlocal started
             started = True
             assert trigger == "initialize"
+            assert force_refresh is False
             await blocker.wait()
             return True
 
@@ -709,10 +710,11 @@ def test_astrbot_loaded_schedules_auto_bind_without_waiting(monkeypatch: pytest.
         plugin._start_scheduled_tasks = lambda: None
         plugin._capture_onebot_client_from_context = lambda: bot
 
-        async def fake_bootstrap(trigger, event=None):
+        async def fake_bootstrap(trigger, event=None, *, force_refresh=False):
             nonlocal started
             started = True
             assert trigger == "astrbot load"
+            assert force_refresh is False
             await blocker.wait()
             return True
 

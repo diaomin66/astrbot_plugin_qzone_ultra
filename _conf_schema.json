@@ -218,7 +218,12 @@
         "description": "消息触发读说说概率",
         "type": "float",
         "default": 0,
-        "hint": "收到 OneBot 消息时，按概率查看发送者空间并自动评论；0 表示关闭。"
+        "hint": "收到 OneBot 消息时，按概率查看发送者空间并自动评论；0 表示关闭。",
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.01
+        }
       },
       "random_comment_notify": {
         "description": "随机评论后反馈当前聊天",
@@ -278,13 +283,21 @@
         "description": "发布模式",
         "type": "string",
         "default": "publish",
-        "hint": "publish=直接发说说；draft=只生成待审核草稿。"
+        "hint": "publish=直接发说说；draft=只生成待审核草稿。",
+        "options": [
+          "publish",
+          "draft"
+        ]
       },
       "failure_policy": {
         "description": "失败策略",
         "type": "string",
         "default": "skip",
-        "hint": "skip=日程/提示词/生图失败则跳过；text_only=生图失败时允许只发文字/存文字草稿。"
+        "hint": "skip=日程/提示词/生图失败则跳过；text_only=生图失败时允许只发文字/存文字草稿。",
+        "options": [
+          "skip",
+          "text_only"
+        ]
       },
       "aspect_ratio": {
         "description": "OmniDraw 自拍宽高比",
@@ -308,7 +321,12 @@
         "description": "OmniDraw 生图失败重试次数",
         "type": "int",
         "default": 1,
-        "hint": "自动/手动日常说说调用 generate_selfie(return_result=true) 未返回图片或抛错时的额外重试次数，0=不重试，最大 5。"
+        "hint": "自动/手动日常说说调用 generate_selfie(return_result=true) 未返回图片或抛错时的额外重试次数，0=不重试，最大 5。",
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        }
       },
       "static_caption": {
         "description": "固定配文",
@@ -429,31 +447,56 @@
     "description": "本地守护进程保活间隔",
     "type": "int",
     "default": 120,
-    "hint": "本地守护进程保活间隔，单位秒。"
+    "hint": "本地守护进程保活间隔，单位秒。",
+    "slider": {
+      "min": 5,
+      "max": 3600,
+      "step": 5
+    }
   },
   "request_timeout": {
     "description": "请求超时时间",
     "type": "float",
     "default": 15,
-    "hint": "向 QQ 空间和本地守护进程发请求的超时时间。"
+    "hint": "向 QQ 空间和本地守护进程发请求的超时时间。",
+    "slider": {
+      "min": 0.1,
+      "max": 120,
+      "step": 0.1
+    }
   },
   "start_timeout": {
     "description": "本地守护进程启动等待时间",
     "type": "float",
     "default": 20,
-    "hint": "等待本地守护进程启动成功的最长时间。"
+    "hint": "等待本地守护进程启动成功的最长时间。",
+    "slider": {
+      "min": 0.1,
+      "max": 120,
+      "step": 0.1
+    }
   },
   "public_feed_limit": {
     "description": "默认说说拉取数量",
     "type": "int",
     "default": 5,
-    "hint": "未指定条数时默认拉取的说说数量。"
+    "hint": "未指定条数时默认拉取的说说数量。",
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 1
+    }
   },
   "max_feed_limit": {
     "description": "单次最多拉取说说数量",
     "type": "int",
     "default": 20,
-    "hint": "单次最多允许拉取的说说数量。"
+    "hint": "单次最多允许拉取的说说数量。",
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 1
+    }
   },
   "auto_start_daemon": {
     "description": "自动启动本地守护进程",
@@ -495,7 +538,12 @@
     "description": "发布结果图宽度",
     "type": "int",
     "default": 900,
-    "hint": "发布结果渲染图宽度。"
+    "hint": "发布结果渲染图宽度。",
+    "slider": {
+      "min": 320,
+      "max": 2400,
+      "step": 10
+    }
   },
   "render_feed_card_limit": {
     "description": "说说卡片渲染数量上限",
@@ -511,6 +559,11 @@
     "description": "说说卡片远程资源超时",
     "type": "float",
     "default": 5.0,
-    "hint": "查看说说及发布结果卡片的远程头像或图片预览单资源超时。"
+    "hint": "查看说说及发布结果卡片的远程头像或图片预览单资源超时。",
+    "slider": {
+      "min": 0.05,
+      "max": 10,
+      "step": 0.05
+    }
   }
 }

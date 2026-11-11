@@ -1,4 +1,4 @@
-﻿const bridge = window.AstrBotPluginPage;
+const bridge = window.AstrBotPluginPage;
 const BRIDGE_READY_TIMEOUT_MS = 5000;
 const BRIDGE_REQUEST_TIMEOUT_MS = 60000;
 const DETAIL_DRAWER_BREAKPOINT = 1200;
@@ -1821,7 +1821,159 @@ async function uploadFiles(files) {
   renderMedia();
 }
 
-function bindEvents() {
+function settingsValueAt(target, path) {
+  return path.reduce((current, key) => current && typeof current === "object" ? current[key] : undefined, target);
+}
+
+function settingsSetAt(target, path, value) {
+  let current = target;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const key = path[index];
+    if (!current[key] || typeof current[key] !== "object") current[key] = {};
+    current = current[key];
+  }
+  current[path[path.length - 1]] = value;
+}
+
+function settingInput(field, value, path) {
+  const type = field.type || "string";
+  const key = path.join(".");
+  let input;
+  if (type === "bool") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(value);
+  } else if (Array.isArray(field.options)) {
+    input = document.createElement("select");
+    for (const option of field.options) {
+      const node = document.createElement("option");
+      node.value = String(option);
+      node.textContent = String(option);
+      node.selected = String(value ?? "") === node.value;
+      input.append(node);
+    }
+  } else if (type === "text" || type === "list" || type === "dict") {
+    input = document.createElement("textarea");
+    input.rows = type === "text" ? 4 : 3;
+    input.value = type === "list" ? (Array.isArray(value) ? value.join("\n") : "") : (type === "dict" ? JSON.stringify(value || {}, null, 2) : String(value ?? ""));
+  } else {
+    input = document.createElement("input");
+    input.type = type === "int" || type === "float" ? "number" : (path[path.length - 1] === "cookies_str" ? "password" : "text");
+    input.value = path[path.length - 1] === "cookies_str" ? "" : String(value ?? "");
+    if (field.slider) {
+      input.min = String(field.slider.min);
+      input.max = String(field.slider.max);
+      input.step = String(field.slider.step || 1);
+    }
+    if (path[path.length - 1] === "cookies_str") input.placeholder = "已隐藏；留空即保留原 Cookie";
+  }
+  input.className = "settings-control";
+  input.dataset.path = key;
+  input.dataset.type = type;
+  input.dataset.secret = path[path.length - 1] === "cookies_str" ? "true" : "false";
+  return input;
+}
+
+function renderSettingsGroup(schema, values, path = []) {
+  const group = document.createElement("details");
+  group.className = "settings-group";
+  group.open = path.length < 2;
+  const summary = document.createElement("summary");
+  summary.textContent = schema.description || (path[path.length - 1] || "通用设置");
+  group.append(summary);
+  const body = document.createElement("div");
+  body.className = "settings-group-body";
+  for (const [key, field] of Object.entries(schema.items || {})) {
+    const fieldPath = [...path, key];
+    if (field.type === "object" && field.items) {
+      body.append(renderSettingsGroup(field, values, fieldPath));
+      continue;
+    }
+    const row = document.createElement("label");
+    row.className = "settings-row";
+    row.dataset.search = `${field.description || key} ${field.hint || ""} ${key}`.toLowerCase();
+    const heading = document.createElement("span");
+    heading.className = "settings-label";
+    heading.textContent = field.description || key;
+    const hint = document.createElement("small");
+    hint.textContent = field.hint || "";
+    const control = settingInput(field, settingsValueAt(values, fieldPath), fieldPath);
+    if (field.type === "bool") {
+      const toggle = document.createElement("span");
+      toggle.className = "settings-toggle";
+      toggle.append(control, document.createElement("i"));
+      row.append(heading, hint, toggle);
+    } else {
+      row.append(heading, hint, control);
+    }
+    body.append(row);
+  }
+  group.append(body);
+  return group;
+}
+
+function readSettingsForm(dialog, current) {
+  const result = structuredClone(current || {});
+  for (const input of dialog.querySelectorAll(".settings-control")) {
+    if (input.dataset.secret === "true" && !input.value.trim()) continue;
+    let value;
+    try {
+      if (input.dataset.type === "bool") value = input.checked;
+      else if (input.dataset.type === "int") value = Number.parseInt(input.value, 10);
+      else if (input.dataset.type === "float") value = Number.parseFloat(input.value);
+      else if (input.dataset.type === "list") value = input.value.split(/[\n,]/).map(item => item.trim()).filter(Boolean);
+      else if (input.dataset.type === "dict") value = input.value.trim() ? JSON.parse(input.value) : {};
+      else value = input.value;
+      if (typeof value === "number" && Number.isNaN(value)) throw new Error("请输入有效数字");
+      settingsSetAt(result, input.dataset.path.split("."), value);
+    } catch (error) {
+      throw new Error(`“${input.closest(".settings-row")?.querySelector(".settings-label")?.textContent || "参数"}”无效：${error.message}`);
+    }
+  }
+  return result;
+}
+
+async function openSettings() {
+  try {
+    const data = await apiGet("settings");
+    document.getElementById("qzoneSettingsDialog")?.remove();
+    const dialog = document.createElement("div");
+    dialog.id = "qzoneSettingsDialog";
+    dialog.className = "settings-dialog";
+    dialog.innerHTML = `<section class="settings-panel" role="dialog" aria-modal="true" aria-label="QQ空间Ultra 设置"><header><div><h2>⚙ QQ空间 Ultra 设置</h2><p>按分组修改参数。Cookie 不会显示，留空会保留原值。</p></div><button type="button" class="settings-close" aria-label="关闭">×</button></header><div class="settings-toolbar"><input type="search" placeholder="搜索参数，例如：概率、定时、Cookie" aria-label="搜索设置"><span>保存后请在 AstrBot 中重载插件</span></div><main class="settings-form"></main><footer><p class="settings-status" aria-live="polite"></p><button type="button" class="settings-cancel">取消</button><button type="button" class="settings-save">保存设置</button></footer></section>`;
+    const form = dialog.querySelector(".settings-form");
+    for (const [key, group] of Object.entries(data.schema || {})) {
+      if (group.type === "object" && group.items) form.append(renderSettingsGroup(group, data.config || {}, [key]));
+      else {
+        const wrapper = { description: "通用设置", items: { [key]: group } };
+        form.append(renderSettingsGroup(wrapper, data.config || {}, []));
+      }
+    }
+    const close = () => dialog.remove();
+    dialog.querySelector(".settings-close").onclick = close;
+    dialog.querySelector(".settings-cancel").onclick = close;
+    dialog.addEventListener("click", event => { if (event.target === dialog) close(); });
+    dialog.querySelector("input[type=search]").oninput = event => {
+      const query = event.target.value.trim().toLowerCase();
+      for (const row of dialog.querySelectorAll(".settings-row")) row.hidden = Boolean(query) && !row.dataset.search.includes(query);
+      for (const group of dialog.querySelectorAll(".settings-group")) {
+        const shown = [...group.querySelectorAll(":scope > .settings-group-body > .settings-row, :scope > .settings-group-body > .settings-group")].some(item => !item.hidden && (item.querySelectorAll?.(".settings-row:not([hidden])").length || item.classList.contains("settings-row")));
+        if (query && shown) group.open = true;
+      }
+    };
+    dialog.querySelector(".settings-save").onclick = async () => {
+      const status = dialog.querySelector(".settings-status");
+      try {
+        const config = readSettingsForm(dialog, data.config);
+        status.textContent = "正在保存…";
+        await apiPost("settings", { config });
+        status.textContent = "已保存。请在 AstrBot 中重载插件后生效。";
+      } catch (error) { status.textContent = "保存失败：" + error.message; }
+    };
+    document.body.append(dialog);
+  } catch (error) { setNotice("设置加载失败：" + error.message, "error"); }
+}function bindEvents() {
+  document.getElementById("settingsButton")?.addEventListener("click", openSettings);
   for (const tab of el.tabs) {
     tab.addEventListener("click", async () => {
       state.scope = tab.dataset.scope;
